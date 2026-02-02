@@ -121,7 +121,7 @@ else
     -e GEMINI_API_KEY="${KODKOD_GEMINI_API_KEY:-${GEMINI_API_KEY:-}}" \
     -e GOOGLE_API_KEY="${KODKOD_GOOGLE_API_KEY:-${GOOGLE_API_KEY:-}}" \
     -e JAVA_HOME="/opt/sdkman/candidates/java/${JAVA_FULL_VERSION}" \
-    -e JAVA_TOOL_OPTIONS="-Duser.home=/workspace" \
+    -e JAVA_TOOL_OPTIONS="-Duser.home=/home/kodkod" \
     -e GRADLE_USER_HOME="/.kodkod/gradle" \
     -e MAVEN_HOME="/.kodkod/m2" \
     -e NPM_CONFIG_CACHE="/.kodkod/npm" \

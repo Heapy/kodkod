@@ -32,6 +32,9 @@ RUN dnf update -y && \
         tmux \
         zip \
         findutils \
+        vim-minimal \
+        procps-ng \
+        less \
         && \
     dnf clean all
 
@@ -114,6 +117,13 @@ RUN echo '# Basic tmux configuration' > /etc/tmux.conf && \
     echo 'set -g prefix C-a' >> /etc/tmux.conf && \
     echo 'bind C-a send-prefix' >> /etc/tmux.conf
 
+# Allow non-root users to add themselves to passwd/group at runtime
+RUN chmod 666 /etc/passwd /etc/group
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
 WORKDIR /workspace
 
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/bin/bash"]

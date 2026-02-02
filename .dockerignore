@@ -1,2 +1,3 @@
 # Exclude everything
 *
+!entrypoint.sh
