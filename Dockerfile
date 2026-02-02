@@ -3,7 +3,11 @@
 
 FROM amazonlinux:2023
 
-ENV SDKMAN_DIR="/root/.sdkman" \
+LABEL org.opencontainers.image.source="https://github.com/umputun/kodkod" \
+      org.opencontainers.image.description="AI Agent Development Environment — Amazon Linux 2023 with JDK, Gradle, Kotlin, Node.js, and AI CLI tools" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+ENV SDKMAN_DIR="/opt/sdkman" \
     RIPGREP_VERSION=15.1.0 \
     FD_VERSION=10.3.0 \
     NODE_VERSION=24 \
@@ -37,8 +41,10 @@ RUN curl -s "https://get.sdkman.io" | bash && \
         sdk install java 21.0.10-librca && \
         sdk install java 17.0.18-librca && \
         sdk install java 25.0.2-librca && \
+        sdk default java 25.0.2-librca && \
         sdk install gradle 9.3.1 && \
-        sdk install kotlin 2.3.0"
+        sdk install kotlin 2.3.0" && \
+    chmod -R 755 $SDKMAN_DIR
 
 ENV JAVA_HOME="$SDKMAN_DIR/candidates/java/current" \
     GRADLE_HOME="$SDKMAN_DIR/candidates/gradle/current" \
@@ -89,7 +95,9 @@ RUN ARCH=$(uname -m) && \
 # Create cache directories under /.kodkod (mounted from ~/.kodkod on host)
 RUN mkdir -p /.kodkod/m2 /.kodkod/gradle /.kodkod/npm /.kodkod/pip /.kodkod/uv \
              /.kodkod/config/claude /.kodkod/config/codex /.kodkod/config/gemini-cli && \
-    chmod -R 777 /.kodkod
+    chmod -R 755 /.kodkod && \
+    chmod -R 777 /.kodkod/m2 /.kodkod/gradle /.kodkod/npm /.kodkod/pip /.kodkod/uv \
+                  /.kodkod/config/claude /.kodkod/config/codex /.kodkod/config/gemini-cli
 
 # Set up bash aliases for AI CLI tools
 RUN echo '# AI CLI tool aliases' >> /etc/bashrc && \

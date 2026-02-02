@@ -1,4 +1,4 @@
-name: "Build and Push Docker Image"
+name: "Build and Push Multi-JDK Docker Image"
 
 on:
   push:
@@ -48,3 +48,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          load: ${{ github.event_name == 'pull_request' }}
+
+      - name: "Smoke tests"
+        run: |
+          set -euo pipefail
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
+          for cmd in "java -version" "gradle --version" "node --version" "rg --version" "fd --version"; do
+            echo "==> $cmd"
+            docker run --rm "$image" bash -c "source /opt/sdkman/bin/sdkman-init.sh && $cmd"
+          done
