@@ -60,7 +60,22 @@ kodkod --recreate
 
 # Recreate with different JDK version
 kodkod --recreate --jdk=21
+
+# Use locally built image instead of ghcr.io
+kodkod --local
 ```
+
+### Defaults via .env
+
+You can create a `.env` file in the same directory as `run.sh` to set default values:
+
+```bash
+# .env
+KODKOD_JDK_VERSION=21       # Default JDK version (17, 21, or 25). Default: 25
+KODKOD_LOCAL=true            # Use local "kodkod:latest" image instead of ghcr.io. Default: false
+```
+
+Command-line flags always override `.env` defaults. For example, `kodkod --jdk=17` will use JDK 17 even if `KODKOD_JDK_VERSION=21` is set in `.env`.
 
 ## Persistent Container Management
 
@@ -238,7 +253,7 @@ The container includes bash aliases for enhanced AI agent development:
 
 ```bash
 # Claude runs with sandbox disabled by default
-alias claude="claude --dangerously-disable-sandbox"
+alias claude="claude --dangerously-skip-permissions"
 
 # Codex runs with safety checks disabled
 alias codex="codex --no-safety"

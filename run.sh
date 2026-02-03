@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 set -e
 
+# === Load .env defaults ===
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/.env"
+fi
+
 # === Configuration ===
-DEFAULT_JDK_VERSION=25
+DEFAULT_JDK_VERSION="${KODKOD_JDK_VERSION:-25}"
 JDK_VERSION=$DEFAULT_JDK_VERSION
 RECREATE_FLAG=false
+LOCAL_FLAG="${KODKOD_LOCAL:-false}"
 
 # === Parse Arguments ===
 while [[ $# -gt 0 ]]; do
@@ -13,16 +21,21 @@ while [[ $# -gt 0 ]]; do
       JDK_VERSION="${1#*=}"
       shift
       ;;
+    --local)
+      LOCAL_FLAG=true
+      shift
+      ;;
     --recreate)
       RECREATE_FLAG=true
       shift
       ;;
     --help)
-      echo "Usage: kodkod [--jdk=17|21|25] [--recreate]"
+      echo "Usage: kodkod [--jdk=17|21|25] [--recreate] [--local]"
       echo ""
       echo "Options:"
       echo "  --jdk=VERSION    Use specific JDK version (17, 21, or 25). Default: 25"
       echo "  --recreate       Stop and remove existing container, then create new one"
+      echo "  --local          Use local 'kodkod:latest' image instead of ghcr.io"
       echo "  --help           Show this help message"
       echo ""
       echo "Examples:"
@@ -30,11 +43,12 @@ while [[ $# -gt 0 ]]; do
       echo "  kodkod --jdk=21           # Create or reuse container with JDK 21"
       echo "  kodkod --recreate         # Recreate container with default JDK"
       echo "  kodkod --recreate --jdk=17  # Recreate container with JDK 17"
+      echo "  kodkod --local            # Use locally built image"
       exit 0
       ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: kodkod [--jdk=17|21|25] [--recreate]"
+      echo "Usage: kodkod [--jdk=17|21|25] [--recreate] [--local]"
       echo "Run 'kodkod --help' for more information"
       exit 1
       ;;
@@ -60,7 +74,11 @@ DIR_NAME=$(basename "$PWD" | tr -cd '[:alnum:]-_' | tr '[:upper:]' '[:lower:]')
 DIR_PATH=$(pwd)
 PATH_HASH=$(echo -n "$DIR_PATH" | shasum -a 256 | cut -c1-5)
 CONTAINER_NAME="kodkod-${DIR_NAME}-${PATH_HASH}"
-IMAGE_TAG="ghcr.io/heapy/kodkod:latest"
+if [ "$LOCAL_FLAG" = true ]; then
+  IMAGE_TAG="kodkod:latest"
+else
+  IMAGE_TAG="ghcr.io/heapy/kodkod:latest"
+fi
 
 # === Detect Host User ===
 HOST_UID=$(id -u)
