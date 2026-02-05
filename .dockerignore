@@ -1,3 +1,5 @@
 # Exclude everything
 *
 !entrypoint.sh
+!.bashrc
+!tmux.conf
