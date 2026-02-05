@@ -2,10 +2,15 @@
 set -e
 
 # === Load .env defaults ===
+# Script directory .env first, then call directory .env (call path takes precedence)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/.env" ]; then
   # shellcheck disable=SC1091
   source "$SCRIPT_DIR/.env"
+fi
+if [ -f "$PWD/.env" ] && [ "$PWD/.env" != "$SCRIPT_DIR/.env" ]; then
+  # shellcheck disable=SC1091
+  source "$PWD/.env"
 fi
 
 # === Configuration ===
