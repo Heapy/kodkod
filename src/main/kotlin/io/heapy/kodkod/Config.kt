@@ -43,7 +43,10 @@ data class Config(
                 updateMonitorAll = bool("KODKOD_UPDATE_MONITOR_ALL", false),
                 updateCleanup = bool("KODKOD_UPDATE_CLEANUP", true),
                 registryAuth = get("KODKOD_REGISTRY_AUTH")?.takeIf { it.isNotBlank() },
-            )
+            ).also {
+                require(it.autohealInterval > 0) { "KODKOD_AUTOHEAL_INTERVAL must be > 0 (got ${it.autohealInterval})" }
+                require(it.updateInterval > 0) { "KODKOD_UPDATE_INTERVAL must be > 0 (got ${it.updateInterval})" }
+            }
         }
     }
 }

@@ -21,6 +21,9 @@ LABEL org.opencontainers.image.title="kodkod" \
       org.opencontainers.image.source="https://github.com/Heapy/kodkod" \
       org.opencontainers.image.licenses="Apache-2.0"
 
+# Lets a running kodkod recognise its own container and never act on itself (see SELF_LABEL).
+LABEL io.heapy.kodkod.self="true"
+
 WORKDIR /app
 COPY --from=build /app/build/install/kodkod/ ./
 

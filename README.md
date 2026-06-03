@@ -49,6 +49,7 @@ Labels live under a namespace (default `kodkod`, configurable via `KODKOD_LABEL_
 | `kodkod.autoheal.enable` | `false` | Restart this container when it becomes `unhealthy`.                                         |
 | `kodkod.update.enable`   | `false` | Pull its image tag and recreate the container when the image changes.                       |
 | `kodkod.stop.timeout`    | —       | Per-container stop timeout (seconds) for restart/recreate. Overrides `KODKOD_STOP_TIMEOUT`. |
+| `kodkod.depends-on`      | —       | Comma-separated container/service names this one depends on, for update ordering. Only needed outside compose — compose stacks are ordered automatically (see below). |
 
 When `*_MONITOR_ALL` is enabled (see below) the relevant feature applies to **all** containers and the label flips to an opt-**out** (`...enable=false` to exclude).
 
@@ -79,10 +80,33 @@ For each container marked for updates, kodkod:
 1. reads its image reference (e.g. `nginx:1.27`) — containers pinned to a digest (`image@sha256:...`) are skipped;
 2. pulls that repo/tag from the registry;
 3. compares the freshly-pulled image id with the container's current image id;
-4. if they differ, **recreates** the container from its existing configuration against the new image:
-   stop → rename old → create new (same `Config` + `HostConfig` + networks) → start → remove old.
+4. if they differ, **recreates** the container against the new image:
+   stop → rename old → create new → reconnect networks → start → remove old.
 
-If create or start fails, kodkod rolls back to the original container. The kodkod container never updates or restarts **itself**.
+When rebuilding the new container, kodkod starts from the running container's configuration but
+**subtracts the old image's defaults** (env, entrypoint, cmd, healthcheck, …), keeping only the
+settings you actually overrode. This way a new image that changes its own defaults is genuinely
+adopted instead of being masked by the old image's baked-in values. The full `HostConfig`, volumes,
+labels and every attached network are preserved. If anything fails after the container is stopped,
+kodkod rolls back to the original, running container.
+
+### Ordering & dependencies
+
+kodkod updates the whole monitored set together so it can respect dependencies:
+
+- containers are **stopped in reverse dependency order** and brought back in **forward order**;
+- a container that **depends on an updated one is restarted too**, even if its own image didn't change
+  (so links and `network_mode: container:` references re-point to the new container);
+- `network_mode: container:<id>` is rewritten to the target's **name** so it survives that container
+  being recreated.
+
+Dependencies are detected automatically from Docker Compose's own `com.docker.compose.depends_on`
+labels. Outside compose, declare them with the `kodkod.depends-on` label, classic `--link`, or
+`network_mode: container:`.
+
+The kodkod container never updates or restarts **itself** — it recognises its own container by the
+`io.heapy.kodkod.self` label baked into the image (independent of `HOSTNAME`, so a custom `hostname:`
+won't fool it).
 
 ## Build from source
 

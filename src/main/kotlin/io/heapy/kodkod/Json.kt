@@ -8,7 +8,16 @@ import kotlinx.serialization.json.jsonPrimitive
 /** Values that are treated as a truthy label/env value. */
 val TRUTHY = setOf("true", "1", "yes", "on")
 
+/**
+ * Label baked into kodkod's own image (see Dockerfile) so it never restarts or updates itself,
+ * regardless of `HOSTNAME`. Deliberately *not* under [Config.labelNamespace] — it identifies the
+ * binary, not a user opt-in.
+ */
+const val SELF_LABEL = "io.heapy.kodkod.self"
+
 val EMPTY_OBJECT = JsonObject(emptyMap())
+
+val EMPTY_ARRAY = JsonArray(emptyList())
 
 /** Convenience accessors over the loosely-typed JSON we get back from the Docker Engine API. */
 fun JsonObject.str(key: String): String? = this[key]?.jsonPrimitive?.contentOrNull

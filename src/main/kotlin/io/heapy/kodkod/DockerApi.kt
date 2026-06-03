@@ -8,6 +8,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import java.io.ByteArrayOutputStream
 import java.net.StandardProtocolFamily
@@ -66,6 +67,22 @@ class DockerApi(private val socketPath: String) {
         ok(request("DELETE", "/containers/${enc(id)}?force=$force&v=false"), 404)
     }
 
+    /** `POST /networks/{id}/connect` — attach an already-created container to another network. */
+    fun connectNetwork(network: String, containerId: String, endpoint: JsonObject) {
+        val body = buildJsonObject {
+            put("Container", containerId)
+            put("EndpointConfig", endpoint)
+        }
+        ok(
+            request(
+                method = "POST",
+                path = "/networks/${enc(network)}/connect",
+                body = body.toString().toByteArray(StandardCharsets.UTF_8),
+                headers = mapOf("Content-Type" to "application/json"),
+            ),
+        )
+    }
+
     fun create(name: String, body: JsonObject): String {
         val response = request(
             method = "POST",
@@ -120,7 +137,7 @@ class DockerApi(private val socketPath: String) {
 
     // --- Transport: HTTP/1.1 over a unix domain socket ------------------------------------
 
-    private class HttpResponse(val status: Int, val body: ByteArray) {
+    internal class HttpResponse(val status: Int, val body: ByteArray) {
         val bodyText: String get() = String(body, StandardCharsets.UTF_8)
     }
 
@@ -179,7 +196,7 @@ class DockerApi(private val socketPath: String) {
         }
     }
 
-    private fun parse(raw: ByteArray): HttpResponse {
+    internal fun parse(raw: ByteArray): HttpResponse {
         val separator = indexOf(raw, CRLF_CRLF, 0)
         if (separator < 0) throw DockerException(-1, "malformed http response (no header terminator)")
 
@@ -200,7 +217,7 @@ class DockerApi(private val socketPath: String) {
         return HttpResponse(status, if (chunked) dechunk(body) else body)
     }
 
-    private fun dechunk(data: ByteArray): ByteArray {
+    internal fun dechunk(data: ByteArray): ByteArray {
         val out = ByteArrayOutputStream()
         var pos = 0
         while (pos < data.size) {
@@ -218,7 +235,7 @@ class DockerApi(private val socketPath: String) {
         return out.toByteArray()
     }
 
-    private fun indexOf(haystack: ByteArray, needle: ByteArray, from: Int): Int {
+    internal fun indexOf(haystack: ByteArray, needle: ByteArray, from: Int): Int {
         outer@ for (i in from..haystack.size - needle.size) {
             for (j in needle.indices) if (haystack[i + j] != needle[j]) continue@outer
             return i
