@@ -1,3 +1,8 @@
 .idea
 .DS_Store
 .env
+
+# Gradle / build output
+.gradle
+.kotlin
+build
