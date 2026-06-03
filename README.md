@@ -4,363 +4,109 @@
 
 # Kodkod
 
-Containerize AI agents using Docker to run full-accept mode without compromising security.
+A tiny **docker-compose companion** that does two things and nothing else:
 
-## Features
+1. **Restarts unhealthy containers** — like [`docker-autoheal`](https://github.com/tmknight/docker-autoheal), it watches container health and restarts containers that go `unhealthy`.
+2. **Auto-updates containers** — like Watchtower, it pulls the image tag a container runs and recreates the container (preserving its config, env, labels and networks) when a newer image is published.
 
-A complete AI agent development environment with:
+Both jobs talk **directly to the Docker Engine API over the unix socket** — no `docker` CLI, no compose CLI, no extra tooling in the image. It is written in Kotlin with a single runtime dependency (a JSON library) and ships as a small Liberica JRE Alpine image.
 
-- **Multi-JDK Support**: JDK 17, 21, and 25
-- **Build Tools**: Gradle 9.3.1, Kotlin 2.3.0
-- **Languages**: Python 3, Node.js 24
-- **System Tools**: jq, curl, ripgrep, git, fd, uv
-- **AI CLI Tools**: claude-code, codex, gemini-cli, ralphex
-- **Base Image**: Amazon Corretto (AWS-supported OpenJDK)
-- **Runtime User Mapping**: Run as host user for proper file permissions
+Everything is **opt-in per container via labels**, so kodkod only ever touches the containers you mark.
 
-## Quick Start
+## Quick start
 
-### Build the Docker Image
+Add kodkod to your `docker-compose.yml` and label the services you want it to manage:
 
-Build a single image that contains all JDK versions (17, 21, and 25):
+```yaml
+services:
+  app:
+    image: ghcr.io/you/app:latest
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      retries: 3
+    labels:
+      kodkod.autoheal.enable: "true"   # restart this container when it goes unhealthy
+      kodkod.update.enable: "true"     # recreate it when ghcr.io/you/app:latest changes
 
-```bash
-docker build -t kodkod:latest .
+  kodkod:
+    image: ghcr.io/heapy/kodkod:latest
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # optional: match host time in logs
+      - /etc/localtime:/etc/localtime:ro
 ```
 
-The image includes all JDK versions managed by SDKMAN. You select which version to use at runtime with the `--jdk` flag.
+> **Autoheal requires a `HEALTHCHECK`** on the target image/service — kodkod can only restart what Docker reports as `unhealthy`. See the [Docker docs](https://docs.docker.com/reference/dockerfile/#healthcheck).
 
-### Setup the Kodkod Alias
+## Labels
 
-Add the `kodkod` alias to your shell for easy access:
+Labels live under a namespace (default `kodkod`, configurable via `KODKOD_LABEL_NAMESPACE`).
 
-```bash
-# Automatic setup (recommended)
-./setup-alias.sh
+| Label                    | Default | Description                                                                                 |
+|--------------------------|---------|---------------------------------------------------------------------------------------------|
+| `kodkod.autoheal.enable` | `false` | Restart this container when it becomes `unhealthy`.                                         |
+| `kodkod.update.enable`   | `false` | Pull its image tag and recreate the container when the image changes.                       |
+| `kodkod.stop.timeout`    | —       | Per-container stop timeout (seconds) for restart/recreate. Overrides `KODKOD_STOP_TIMEOUT`. |
 
-# Or add manually to ~/.bashrc or ~/.zshrc:
-alias kodkod='/path/to/kodkod/run.sh'
+When `*_MONITOR_ALL` is enabled (see below) the relevant feature applies to **all** containers and the label flips to an opt-**out** (`...enable=false` to exclude).
 
-# Then reload your shell
-source ~/.bashrc  # or ~/.zshrc
-```
+## Configuration
 
-### Using Kodkod
+All configuration is via environment variables:
 
-```bash
-# Create or attach to container (default JDK 25)
-kodkod
+| Variable                       | Default                  | Description                                                            |
+|--------------------------------|--------------------------|------------------------------------------------------------------------|
+| `KODKOD_DOCKER_SOCKET`         | `/var/run/docker.sock`   | Path to the Docker Engine unix socket.                                 |
+| `KODKOD_LABEL_NAMESPACE`       | `kodkod`                 | Prefix for all labels (e.g. `kodkod.autoheal.enable`).                 |
+| `KODKOD_STOP_TIMEOUT`          | `10`                     | Default stop timeout (seconds) for restart/recreate.                   |
+| `KODKOD_AUTOHEAL_ENABLED`      | `true`                   | Enable the autoheal loop.                                              |
+| `KODKOD_AUTOHEAL_INTERVAL`     | `30`                     | Seconds between unhealthy-container checks.                            |
+| `KODKOD_AUTOHEAL_START_PERIOD` | `0`                      | Seconds to wait before the first autoheal check.                      |
+| `KODKOD_AUTOHEAL_MONITOR_ALL`  | `false`                  | Heal **all** containers with a healthcheck (label becomes opt-out).    |
+| `KODKOD_UPDATE_ENABLED`        | `true`                   | Enable the auto-update loop.                                           |
+| `KODKOD_UPDATE_INTERVAL`       | `3600`                   | Seconds between image-update checks.                                   |
+| `KODKOD_UPDATE_START_PERIOD`   | `0`                      | Seconds to wait before the first update check.                        |
+| `KODKOD_UPDATE_MONITOR_ALL`    | `false`                  | Update **all** running containers (label becomes opt-out).            |
+| `KODKOD_UPDATE_CLEANUP`        | `true`                   | Remove the previous image after a successful update (best-effort).     |
+| `KODKOD_REGISTRY_AUTH`         | —                        | Base64 `X-Registry-Auth` value for pulling from private registries.    |
 
-# Use specific JDK version
-kodkod --jdk=21
-kodkod --jdk=17
+## How updates work
 
-# Recreate container from scratch
-kodkod --recreate
+For each container marked for updates, kodkod:
 
-# Recreate with different JDK version
-kodkod --recreate --jdk=21
+1. reads its image reference (e.g. `nginx:1.27`) — containers pinned to a digest (`image@sha256:...`) are skipped;
+2. pulls that repo/tag from the registry;
+3. compares the freshly-pulled image id with the container's current image id;
+4. if they differ, **recreates** the container from its existing configuration against the new image:
+   stop → rename old → create new (same `Config` + `HostConfig` + networks) → start → remove old.
 
-# Use locally built image instead of ghcr.io
-kodkod --local
-```
+If create or start fails, kodkod rolls back to the original container. The kodkod container never updates or restarts **itself**.
 
-### Defaults via .env
+## Build from source
 
-You can create a `.env` file in the same directory as `run.sh` to set default values:
-
-```bash
-# .env
-KODKOD_JDK_VERSION=21       # Default JDK version (17, 21, or 25). Default: 25
-KODKOD_LOCAL=true            # Use local "kodkod:latest" image instead of ghcr.io. Default: false
-```
-
-Command-line flags always override `.env` defaults. For example, `kodkod --jdk=17` will use JDK 17 even if `KODKOD_JDK_VERSION=21` is set in `.env`.
-
-## Persistent Container Management
-
-Kodkod creates one persistent container per project directory. This allows you to maintain long-running development sessions without losing state.
-
-### How It Works
-
-- **One container per project**: Each project directory gets its own container
-- **Container naming**: `kodkod-<dirname>-<hash>` where:
-  - `dirname` = sanitized basename of current directory
-  - `hash` = first 5 characters of SHA256 hash of full path
-- **State preservation**: Containers persist across sessions
-- **Fast startup**: Reusing containers is much faster than creating new ones
-
-Example: Working in `/Users/tim/dev/kodkod` creates container named `kodkod-kodkod-a1b2c`
-
-### Container Behavior
-
-**First run in a directory:**
-- Creates a new container with the specified JDK version
-- Starts and attaches to it
-
-**Subsequent runs:**
-- If container is stopped: Starts it and attaches
-- If container is running: Attaches to it (exec into it)
-- If container doesn't exist: Creates a new one
-
-**With --recreate flag:**
-- Stops and removes existing container
-- Creates a fresh container
-
-### Multiple Sessions with tmux
-
-Each container has tmux installed for running multiple Claude sessions simultaneously:
+Requires JDK 25+ (the Gradle 9.5.1 wrapper and Kotlin 2.4.0 are pinned):
 
 ```bash
-# Start kodkod container
-kodkod
+./gradlew installDist          # build/install/kodkod/bin/kodkod
+./gradlew build                # compile + checks
 
-# Inside container, start tmux
-tmux
-
-# tmux Quick Reference (prefix key: Ctrl-a):
-# Ctrl-a c      - Create new window
-# Ctrl-a n      - Next window
-# Ctrl-a p      - Previous window
-# Ctrl-a 0-9    - Switch to window number
-# Ctrl-a %      - Split pane vertically
-# Ctrl-a "      - Split pane horizontally
-# Ctrl-a arrow  - Switch between panes
-# Ctrl-a d      - Detach from session (container keeps running)
-# tmux attach   - Reattach to session
-
-# Example: Run different Claude commands in different windows/panes
-# Window 1: claude code .
-# Window 2: claude chat
-# Window 3: gradle build --watch
+docker build -t kodkod .       # build the Liberica JRE image
 ```
 
-**Why tmux over multiple containers?**
-- Lighter weight (one container vs multiple)
-- Shared filesystem state - all sessions see changes instantly
-- Easy session management with keyboard shortcuts
-- Container state persists even when detached
+## Security notes
 
-### Managing Containers
+- kodkod needs read/write access to the Docker socket to inspect, restart and recreate containers — this is effectively root on the host, so run it only where you trust the workloads.
+- Mount the socket and run nothing else in the container; the image contains only a JRE and kodkod.
+- Keep `KODKOD_*_MONITOR_ALL=false` (the default) and use per-container labels to keep the blast radius small.
 
-```bash
-# List all kodkod containers
-docker ps -a --filter name=kodkod-
+## Credits
 
-# Stop a container
-docker stop kodkod-myproject-a1b2c
-
-# Remove a container
-docker rm kodkod-myproject-a1b2c
-
-# Remove all stopped kodkod containers
-docker container prune --filter label=kodkod
-
-# View container labels
-docker inspect kodkod-myproject-a1b2c --format '{{.Config.Labels}}'
-```
-
-## JDK Version Management with SDKMAN
-
-Kodkod uses a single Docker image containing all JDK versions (17, 21, and 25) managed by SDKMAN. When you specify a JDK version with the `--jdk` flag, the container is configured to use that specific version by setting the `JAVA_HOME` environment variable.
-
-### How It Works
-
-- **Single Image**: One image contains all three JDK versions installed in `/opt/sdkman/candidates/java/`
-- **Runtime Selection**: The `--jdk` flag sets `JAVA_HOME` to point to the requested version
-- **No Rebuild Needed**: Switch between JDK versions without rebuilding the image
-- **Container Labels**: Each container is labeled with its JDK version for easy identification
-
-### JDK Versions Included
-
-- **JDK 17**: 17.0.18-librca
-- **JDK 21**: 21.0.10-librca
-- **JDK 25**: 25.0.2-librca (default)
-
-### Switching JDK Versions
-
-To use a different JDK version for an existing project:
-
-```bash
-# Recreate the container with a different JDK version
-kodkod --recreate --jdk=21
-```
-
-The JDK version is set at container creation time and persists for that container. To change versions, recreate the container with the `--recreate` flag.
-
-## Volume Mounts and Caching
-
-The container supports mounting cache directories for faster dependency resolution:
-
-All caches and configs are stored under a single `~/.kodkod` directory on the host, mounted to `/.kodkod` in the container:
-
-- `~/.kodkod/m2` - Maven dependency cache
-- `~/.kodkod/gradle` - Gradle dependency cache
-- `~/.kodkod/npm` - Node.js package cache
-- `~/.kodkod/pip` - Python pip cache
-- `~/.kodkod/uv` - uv package cache
-- `~/.kodkod/config/claude` - Claude Code config
-- `~/.kodkod/config/codex` - Codex config
-- `~/.kodkod/config/gemini-cli` - Gemini CLI config
-
-### Project Source
-- `.` → `/workspace` - Working directory for your code
-
-## API Keys Configuration
-
-### Option 1: Export Environment Variables
-
-```bash
-export KODKOD_ANTHROPIC_API_KEY="sk-ant-xxxxx"
-export KODKOD_OPENAI_API_KEY="sk-xxxxx"
-export KODKOD_GEMINI_API_KEY="xxxxx"
-./run.sh
-```
-
-The `KODKOD_` prefixed variables take priority. Non-prefixed variables (e.g. `ANTHROPIC_API_KEY`) are also supported as a fallback.
-
-### Option 2: Pass Directly to Docker
-
-```bash
-docker run --rm -it \
-  -e ANTHROPIC_API_KEY="sk-ant-xxxxx" \
-  -e OPENAI_API_KEY="sk-xxxxx" \
-  -e GEMINI_API_KEY="xxxxx" \
-  kodkod:latest
-```
-
-### Option 3: Use .env file
-
-```bash
-cp .env.example .env
-# Edit .env and add your API keys
-source .env
-./run.sh
-```
-
-## AI CLI Tools
-
-The following AI CLI tools are pre-installed:
-
-- **claude-code**: Anthropic's Claude Code CLI tool
-- **codex**: OpenAI's Codex CLI tool
-- **gemini-cli**: Google's Gemini CLI tool
-- **ralphex**: AI agent CLI tool
-
-### Pre-configured Aliases
-
-The container includes bash aliases for enhanced AI agent development:
-
-```bash
-# Claude runs with sandbox disabled by default
-alias claude="claude --dangerously-skip-permissions"
-
-# Codex runs with safety checks disabled
-alias codex="codex --no-safety"
-```
-
-This allows AI agents to run in full-accept mode without compromising your host system security (since they're containerized).
-
-### Usage inside container
-
-```bash
-# Use the aliases (recommended in container)
-claude --help
-codex --help
-gemini-cli --help
-ralphex --help
-
-# Or call directly without aliases
-/usr/local/bin/claude --help
-```
-
-## Runtime User Mapping
-
-The image is built generically without hardcoded user IDs. The `kodkod` script automatically runs containers as your host user:
-
-```bash
-kodkod  # Automatically uses --user=$(id -u):$(id -g)
-```
-
-This ensures:
-- Files created in the container have correct ownership on the host
-- No permission issues with mounted volumes
-- Same image works for any user
-- Perfect for publishing to container registries
-
-## Advanced Usage
-
-### Using docker run directly (not recommended)
-
-If you prefer not to use the persistent container system:
-
-```bash
-docker run --rm -it \
-  --user=$(id -u):$(id -g) \
-  -v $(pwd):/workspace \
-  -v ~/.kodkod:/.kodkod \
-  -e GRADLE_USER_HOME="/.kodkod/gradle" \
-  -e MAVEN_HOME="/.kodkod/m2" \
-  -e NPM_CONFIG_CACHE="/.kodkod/npm" \
-  -e PIP_CACHE_DIR="/.kodkod/pip" \
-  -e UV_CACHE_DIR="/.kodkod/uv" \
-  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-  -e OPENAI_API_KEY=$OPENAI_API_KEY \
-  -e GEMINI_API_KEY=$GEMINI_API_KEY \
-  kodkod:latest
-```
-
-Note: This creates ephemeral containers that are removed after exit.
-
-## Installed Versions
-
-- **Gradle**: 9.3.1
-- **Kotlin**: 2.3.0
-- **Node.js**: 24.x
-- **Python**: 3.x (via Amazon Linux 2)
-- **uv**: 0.9.28
-- **ripgrep**: 15.1.0
-- **fd**: 10.3.0
-- **ralphex**: 0.6.0
-- **tmux**: Latest (via yum)
-
-## Verification
-
-### Verify all tools are installed
-
-```bash
-docker run --rm ghcr.io/heapy/kodkod:latest bash -c "
-  echo '=== JDK ===' &&
-  java -version &&
-  echo '=== Build Tools ===' &&
-  gradle --version &&
-  kotlin -version &&
-  echo '=== Languages ===' &&
-  python3 --version &&
-  node --version &&
-  echo '=== System Tools ===' &&
-  jq --version &&
-  curl --version &&
-  rg --version &&
-  git --version &&
-  fd --version &&
-  echo '=== AI Tools ===' &&
-  ralphex --version
-"
-```
-
-### Test user permissions
-
-```bash
-docker run --rm --user=$(id -u):$(id -g) -v $(pwd):/workspace kodkod:latest bash -c "
-  id &&
-  touch /workspace/test.txt &&
-  ls -l /workspace/test.txt
-"
-# Verify test.txt is owned by your host user
-ls -l test.txt
-```
+The autoheal behaviour mirrors the excellent
+[`docker-autoheal`](https://github.com/tmknight/docker-autoheal) (Rust) and
+[`willfarrell/docker-autoheal`](https://github.com/willfarrell/docker-autoheal) (shell) projects.
 
 ## License
 
-See LICENSE file for details.
+Apache-2.0 — see [LICENSE](LICENSE).

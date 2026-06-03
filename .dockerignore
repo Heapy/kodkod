@@ -1,5 +1,9 @@
-# Exclude everything
+# Only the build needs sources + Gradle metadata; ignore everything else.
 *
-!entrypoint.sh
-!.bashrc
-!tmux.conf
+
+!gradlew
+!settings.gradle.kts
+!build.gradle.kts
+!gradle.properties
+!gradle
+!src
