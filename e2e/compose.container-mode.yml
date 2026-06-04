@@ -2,21 +2,18 @@
 #
 # consumer shares provider's network namespace. Compose resolves
 # `network_mode: service:provider` to `container:<provider-id>` in the consumer's
-# HostConfig. When kodkod recreates consumer (its image changed), it must rewrite
-# that to `container:<provider-NAME>` so the reference survives provider itself
-# being recreated later (an id would go stale; a name does not).
-#
-# Known limitation (documented in E2E_TESTING.md): if the *provider* is updated,
-# consumer is only restarted, not recreated, so a stale container:<id> would not
-# re-point. Here we update the *consumer* to validate the rewrite cleanly.
+# HostConfig. When kodkod recreates provider, consumer is not stale itself, but it
+# must also be recreated so Docker refreshes the create-time NetworkMode reference.
 name: e2e-cmode
 services:
   provider:
-    image: busybox:1.36
-    command: ["sh", "-c", "echo '[provider] started'; while true; do sleep 1; done"]
+    image: 127.0.0.1:5000/testapp:latest
+    labels:
+      kodkod.update.enable: "true"
 
   consumer:
-    image: 127.0.0.1:5000/testapp:latest
+    image: busybox:1.36
+    command: ["sh", "-c", "echo '[consumer] started'; while true; do sleep 1; done"]
     network_mode: "service:provider"
     depends_on:
       - provider

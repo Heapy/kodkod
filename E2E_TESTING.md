@@ -44,10 +44,11 @@ artifact this suite creates is named `e2e-*`; `e2e/bin/cleanup.sh` removes them.
 
 ## How update testing works (the local registry)
 
-kodkod's update path is, faithfully: *ask the daemon to `pull <repo>:<tag>`, compare
-the resulting image id with the running container's, and recreate if it changed.*
-To exercise that for real you need a registry whose tag you can move. So the harness
-runs a throwaway **`registry:2` on `127.0.0.1:5000`** and a purpose-built image:
+kodkod's update path is, faithfully: *ask the daemon for the registry digest, pull
+`<repo>:<tag>` only when that digest is new or unavailable, compare the local image id
+with the running container's, and recreate if it changed.* To exercise that for real
+you need a registry whose tag you can move. So the harness runs a throwaway
+**`registry:2` on `127.0.0.1:5000`** and a purpose-built image:
 
 - **`e2e/testapp/Dockerfile`** bakes `APP_VARIANT` (env) and `app.variant` (label)
   into the image **defaults**. The running container overrides neither — so an
@@ -235,35 +236,37 @@ alone).
 
 ---
 
-## Scenario C — `network_mode: container:` is rewritten to a name
+## Scenario C — `network_mode: container:` dependent is recreated after provider update
 
-**Proves:** plan fix 4 — when kodkod recreates a container that shares another
-container's netns, it rewrites `container:<id>` to `container:<name>`.
+**Proves:** plan fixes 4 and 5 together — when kodkod recreates a provider
+container, a monitored container using `network_mode: service:<provider>` is
+recreated too, and its `container:<old-id>` network mode is rewritten to the
+provider's name before the old provider id is removed.
 
 ```bash
 ./e2e/bin/publish.sh v1
 docker compose -f e2e/compose.container-mode.yml up -d
 sleep 5
-# initially compose has resolved it to the provider's id:
+OLD_PROVIDER=$(docker inspect -f '{{.Id}}' e2e-cmode-provider-1)
+OLD_CONSUMER=$(docker inspect -f '{{.Id}}' e2e-cmode-consumer-1)
+# initially compose has resolved the consumer's network mode to the provider's id:
 docker inspect -f '{{.HostConfig.NetworkMode}}' e2e-cmode-consumer-1   # container:<hex id>
 
-./e2e/bin/publish.sh v2          # consumer's image changes -> consumer is recreated
+./e2e/bin/publish.sh v2          # provider's image changes -> consumer is recreated as a dependent
 sleep 30
-docker inspect -f '{{index .Config.Labels "app.variant"}}' e2e-cmode-consumer-1  # -> v2
+docker inspect -f '{{index .Config.Labels "app.variant"}}' e2e-cmode-provider-1  # -> v2
+docker inspect -f '{{.Id}}' e2e-cmode-provider-1    # != OLD_PROVIDER
+docker inspect -f '{{.Id}}' e2e-cmode-consumer-1    # != OLD_CONSUMER
 docker inspect -f '{{.HostConfig.NetworkMode}}' e2e-cmode-consumer-1
 #   -> container:<current provider id>  (Docker normalizes the name back to an id)
 docker inspect -f '{{.State.Running}}' e2e-cmode-consumer-1            # -> true
 ```
 
-**Pass:** consumer is **v2** and running, `NetworkMode` points at the current
-provider id. Docker stores the resolved id in `HostConfig.NetworkMode`, so inspect
-will not keep the name string even when kodkod created the replacement with
+**Pass:** provider is **v2**, both provider and consumer container ids changed,
+consumer is running, and `NetworkMode` points at the current provider id. Docker
+stores the resolved id in `HostConfig.NetworkMode`, so inspect will not keep the
+name string even when kodkod created the replacement with
 `container:e2e-cmode-provider-1`.
-
-**Known limitation (by design):** if instead the **provider** is updated, kodkod
-only *restarts* the consumer (it isn't stale), so a stale `container:<old-id>`
-would not re-point. Re-pointing happens only when the consumer is itself recreated,
-as tested here. This matches the plan's "linked-only → start" choice.
 
 **Teardown:** `docker compose -f e2e/compose.container-mode.yml down -v`
 

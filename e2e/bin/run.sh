@@ -44,6 +44,7 @@ p_variant()         { [ "$(c_inspect '{{index .Config.Labels "app.variant"}}' "$
 p_health()          { [ "$(c_inspect '{{.State.Health.Status}}' "$1")" = "$2" ]; }
 p_running()         { [ "$(c_inspect '{{.State.Running}}' "$1")" = "true" ]; }
 p_started_changed() { [ -n "$(c_inspect '{{.State.StartedAt}}' "$1")" ] && [ "$(c_inspect '{{.State.StartedAt}}' "$1")" != "$PREV" ]; }
+p_id_changed()      { [ -n "$(c_inspect '{{.Id}}' "$1")" ] && [ "$(c_inspect '{{.Id}}' "$1")" != "$PREV" ]; }
 p_running_v1()      { [ "$(c_inspect '{{.State.Running}}' "$1")" = "true" ] && [ "$(c_inspect '{{index .Config.Labels "app.variant"}}' "$1")" = "v1" ]; }
 log_has()           { docker logs "$1" 2>&1 | grep -qi "$2"; }
 
@@ -115,13 +116,21 @@ scenario_multinet() {
 }
 
 scenario_cmode() {
-  echo "[C] network_mode: container: — rewritten to the provider's name"
+  echo "[C] network_mode: container: — dependent recreated after provider update"
   publish_variant v1 || return
   dc container-mode up -d >/dev/null 2>&1
-  wait_until 30 "consumer v1 up" p_variant e2e-cmode-consumer-1 v1 || true
+  wait_until 30 "provider v1 up" p_variant e2e-cmode-provider-1 v1 || true
+  wait_until 30 "consumer running" p_running e2e-cmode-consumer-1 || true
+  local old_provider_id old_consumer_id
+  old_provider_id=$(c_inspect '{{.Id}}' e2e-cmode-provider-1)
+  old_consumer_id=$(c_inspect '{{.Id}}' e2e-cmode-consumer-1)
   publish_variant v2 || return
-  wait_until 90 "consumer updated to v2" p_variant e2e-cmode-consumer-1 v2 || true
-  assert_eq "[C] consumer recreated on v2" v2 "$(c_inspect '{{index .Config.Labels "app.variant"}}' e2e-cmode-consumer-1)"
+  wait_until 90 "provider updated to v2" p_variant e2e-cmode-provider-1 v2 || true
+  PREV=$old_consumer_id
+  wait_until 60 "consumer recreated after provider update" p_id_changed e2e-cmode-consumer-1 || true
+  assert_eq "[C] provider updated to v2" v2 "$(c_inspect '{{index .Config.Labels "app.variant"}}' e2e-cmode-provider-1)"
+  assert_ne "[C] provider id changed" "$old_provider_id" "$(c_inspect '{{.Id}}' e2e-cmode-provider-1)"
+  assert_ne "[C] consumer was recreated despite unchanged image" "$old_consumer_id" "$(c_inspect '{{.Id}}' e2e-cmode-consumer-1)"
   local provider_id; provider_id=$(c_inspect '{{.Id}}' e2e-cmode-provider-1)
   assert_eq "[C] NetworkMode points at the provider" "container:$provider_id" "$(c_inspect '{{.HostConfig.NetworkMode}}' e2e-cmode-consumer-1)"
   assert_eq "[C] consumer running" true "$(c_inspect '{{.State.Running}}' e2e-cmode-consumer-1)"

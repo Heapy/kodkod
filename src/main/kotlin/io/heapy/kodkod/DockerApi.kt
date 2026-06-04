@@ -101,6 +101,16 @@ class DockerApi(private val socketPath: String) {
         ok(request("DELETE", "/images/$ref?force=false&noprune=false"), 404, 409)
     }
 
+    /** `GET /distribution/{ref}/json` — fetch registry manifest metadata without pulling layers. */
+    fun inspectDistribution(ref: String, registryAuth: String?): JsonObject {
+        val headers = buildMap {
+            if (registryAuth != null) put("X-Registry-Auth", registryAuth)
+        }
+        val response = request("GET", "/distribution/$ref/json", headers = headers)
+        ok(response)
+        return json.parseToJsonElement(response.bodyText).jsonObject
+    }
+
     /**
      * `POST /images/create` — pull an image. Docker answers 200 and streams newline-delimited
      * JSON progress objects; a failed pull surfaces an `error` field in the stream, so we scan for it.

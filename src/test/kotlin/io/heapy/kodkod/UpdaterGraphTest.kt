@@ -37,6 +37,22 @@ class UpdaterGraphTest {
     }
 
     @Test
+    fun distributionDigest_reads_descriptor_digest() {
+        val digest = jsonObj(
+            """{"Descriptor":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:abc123","size":123}}""",
+        ).distributionDigest()
+        assertEquals("sha256:abc123", digest)
+    }
+
+    @Test
+    fun repoDigests_extracts_digest_values() {
+        val digests = jsonObj(
+            """{"RepoDigests":["registry:5000/repo@sha256:abc123","docker.io/library/nginx@sha256:def456"]}""",
+        ).repoDigests()
+        assertEquals(setOf("sha256:abc123", "sha256:def456"), digests)
+    }
+
+    @Test
     fun resolveLinks_prefers_compose_depends_on() {
         val db = target("db", "proj-db", project = "proj", service = "db")
         val web = target(
@@ -45,6 +61,7 @@ class UpdaterGraphTest {
         )
         resolveLinks(listOf(web, db), "kodkod")
         assertEquals(setOf("db"), web.deps)
+        assertTrue(web.createTimeDeps.isEmpty())
         assertTrue(db.deps.isEmpty())
     }
 
@@ -56,6 +73,8 @@ class UpdaterGraphTest {
         resolveLinks(listOf(a, b, c), "kodkod")
         assertEquals(setOf("a"), b.deps)
         assertEquals(setOf("a"), c.deps)
+        assertTrue(b.createTimeDeps.isEmpty())
+        assertEquals(setOf("a"), c.createTimeDeps)
     }
 
     @Test
@@ -64,6 +83,20 @@ class UpdaterGraphTest {
         val b = target("b", "b", inspect = """{"HostConfig":{"NetworkMode":"container:a1b2c3d4e5f6"}}""")
         resolveLinks(listOf(a, b), "kodkod")
         assertEquals(setOf("a1b2c3d4e5f6"), b.deps)
+        assertEquals(setOf("a1b2c3d4e5f6"), b.createTimeDeps)
+        assertEquals("a", b.networkModeContainerName)
+    }
+
+    @Test
+    fun resolveLinks_resolves_external_container_network_mode_before_update() {
+        val b = target("b", "b", inspect = """{"HostConfig":{"NetworkMode":"container:abc123"}}""")
+        resolveLinks(listOf(b), "kodkod") { ref ->
+            assertEquals("abc123", ref)
+            "provider"
+        }
+        assertTrue(b.deps.isEmpty())
+        assertTrue(b.createTimeDeps.isEmpty())
+        assertEquals("provider", b.networkModeContainerName)
     }
 
     @Test
@@ -92,6 +125,8 @@ class UpdaterGraphTest {
         propagateLinkedRestart(listOf(a, b, c))
         assertTrue(b.toRestart)
         assertTrue(c.toRestart)
+        assertFalse(b.toRecreate)
+        assertFalse(c.toRecreate)
     }
 
     @Test
@@ -100,5 +135,34 @@ class UpdaterGraphTest {
         a.stale = true
         propagateLinkedRestart(listOf(a, b))
         assertFalse(b.toRestart)
+    }
+
+    @Test
+    fun propagateLinkedRestart_recreates_create_time_dependents() {
+        val a = target("a", "a"); val b = target("b", "b")
+        b.deps = setOf("a")
+        b.createTimeDeps = setOf("a")
+        a.stale = true
+
+        propagateLinkedRestart(listOf(a, b))
+
+        assertTrue(b.toRestart)
+        assertTrue(b.toRecreate)
+        assertTrue(b.linkedToRecreate)
+    }
+
+    @Test
+    fun propagateLinkedRestart_recreate_is_transitive_for_create_time_dependencies() {
+        val a = target("a", "a"); val b = target("b", "b"); val c = target("c", "c")
+        b.deps = setOf("a")
+        b.createTimeDeps = setOf("a")
+        c.deps = setOf("b")
+        c.createTimeDeps = setOf("b")
+        a.stale = true
+
+        propagateLinkedRestart(listOf(a, b, c))
+
+        assertTrue(b.toRecreate)
+        assertTrue(c.toRecreate)
     }
 }

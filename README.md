@@ -78,8 +78,10 @@ All configuration is via environment variables:
 For each container marked for updates, kodkod:
 
 1. reads its image reference (e.g. `nginx:1.27`) — containers pinned to a digest (`image@sha256:...`) are skipped;
-2. pulls that repo/tag from the registry;
-3. compares the freshly-pulled image id with the container's current image id;
+2. asks the registry for the tag's manifest digest and skips the pull when it already matches the
+   running image;
+3. pulls that repo/tag only when the digest is new or unavailable, then compares the local image id
+   with the container's current image id;
 4. if they differ, **recreates** the container against the new image:
    stop → rename old → create new → reconnect networks → start → remove old.
 
@@ -95,8 +97,9 @@ kodkod rolls back to the original, running container.
 kodkod updates the whole monitored set together so it can respect dependencies:
 
 - containers are **stopped in reverse dependency order** and brought back in **forward order**;
-- a container that **depends on an updated one is restarted too**, even if its own image didn't change
-  (so links and `network_mode: container:` references re-point to the new container);
+- a container that **depends on an updated one is restarted too**, even if its own image didn't change;
+- create-time dependents (`--link` and `network_mode: container:`) are **recreated** instead of only
+  restarted, so Docker refreshes those references against the new dependency container;
 - `network_mode: container:<id>` is rewritten to the target's **name** so it survives that container
   being recreated.
 

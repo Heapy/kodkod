@@ -18,9 +18,10 @@ import kotlinx.serialization.json.put
  *                                       ordered automatically from the `com.docker.compose.*` labels)
  *
  * A cycle works on the whole monitored set at once so it can honour dependency order: containers are
- * stopped in reverse dependency order and brought back in forward order, and a container that depends on
- * an updated one is restarted too (watchtower's `UpdateImplicitRestart`). Containers pinned to a digest
- * (`image@sha256:...`) are never stale but can still be restarted as a dependent.
+ * stopped in reverse dependency order and brought back in forward order. Ordinary dependents are
+ * restarted; create-time dependents (`--link` / `network_mode: container:`) are recreated so Docker
+ * refreshes their references. Containers pinned to a digest (`image@sha256:...`) are never stale but can
+ * still be restarted or recreated as a dependent.
  */
 class Updater(
     private val api: DockerApi,
@@ -51,18 +52,19 @@ class Updater(
                 Log.error("[${target.name}] stop failed: ${e.message}")
             }
         }
-        // Bring everything back in dependency order: recreate the stale ones, restart the rest.
+        // Bring everything back in dependency order: recreate stale/create-time-linked containers,
+        // restart ordinary dependents.
         for (target in ordered) {
             if (!target.toRestart) continue
             try {
-                if (target.stale) {
+                if (target.toRecreate) {
                     recreate(target)
                 } else {
                     api.start(target.id)
                     Log.info("[${target.name}] restarted (a dependency was updated)")
                 }
             } catch (e: Exception) {
-                Log.error("[${target.name}] ${if (target.stale) "recreate" else "restart"} failed: ${e.message}")
+                Log.error("[${target.name}] ${if (target.toRecreate) "recreate" else "restart"} failed: ${e.message}")
             }
         }
     }
@@ -89,7 +91,11 @@ class Updater(
             }
             targets += toTarget(id, inspect)
         }
-        resolveLinks(targets, ns)
+        resolveLinks(targets, ns) { ref ->
+            runCatching { api.inspectContainer(ref).str("Name")?.trimStart('/') }
+                .onFailure { Log.warn("could not resolve network_mode container:$ref before update: ${it.message}") }
+                .getOrNull()
+        }
         return targets
     }
 
@@ -123,6 +129,26 @@ class Updater(
                 val (repo, tag) = splitImageRef(imageRef)
                 Log.info("[${target.name}] checking $imageRef for updates")
                 target.oldImageConfig = inspectOldImageConfig(target)
+
+                val remoteDigest = remoteDigest(imageRef, target)
+                if (remoteDigest != null && hasRepoDigest(target.currentImageId, remoteDigest)) {
+                    Log.info("[${target.name}] already up to date (digest ${remoteDigest.shortId()})")
+                    continue
+                }
+                if (remoteDigest != null && hasRepoDigest(imageRef, remoteDigest)) {
+                    val localImageId = api.inspectImage(imageRef).str("Id")
+                    if (localImageId == null) {
+                        Log.warn("[${target.name}] could not inspect local image $imageRef — falling back to pull")
+                    } else if (localImageId == target.currentImageId) {
+                        Log.info("[${target.name}] already up to date (digest ${remoteDigest.shortId()})")
+                        continue
+                    } else {
+                        Log.warn("[${target.name}] update available (${target.currentImageId.shortId()} -> ${localImageId.shortId()})")
+                        target.stale = true
+                        continue
+                    }
+                }
+
                 api.pull(repo, tag, config.registryAuth)
                 val newImageId = api.inspectImage(imageRef).str("Id")
                 when {
@@ -141,11 +167,33 @@ class Updater(
         }
     }
 
+    private fun remoteDigest(imageRef: String, target: Target): String? {
+        val digest = runCatching {
+            api.inspectDistribution(imageRef, config.registryAuth).distributionDigest()
+        }.getOrElse {
+            Log.warn("[${target.name}] could not read registry digest for $imageRef — falling back to pull: ${it.message}")
+            return null
+        }
+
+        if (digest == null) {
+            Log.warn("[${target.name}] registry did not return a digest for $imageRef — falling back to pull")
+        }
+        return digest
+    }
+
+    private fun hasRepoDigest(imageRef: String, digest: String): Boolean =
+        runCatching { api.inspectImage(imageRef).repoDigests().contains(digest) }.getOrDefault(false)
+
     // --- Recreate -------------------------------------------------------------------------
 
     private fun recreate(target: Target) {
         val name = target.name
-        val imageRef = target.imageRef ?: return
+        val imageRef = target.imageRef
+        if (imageRef == null) {
+            Log.warn("[$name] cannot recreate because the container has no image reference — restarting instead")
+            api.start(target.id)
+            return
+        }
         val containerConfig = target.inspect.obj("Config") ?: EMPTY_OBJECT
 
         // Subtract the OLD image's defaults so the NEW image's defaults are not masked. Pulling a moved
@@ -166,7 +214,7 @@ class Updater(
             }
         }
 
-        val hostConfig = resolveHostConfig(target.inspect.obj("HostConfig"))
+        val hostConfig = resolveHostConfig(target.inspect.obj("HostConfig"), target.networkModeContainerName)
         val networks = networkEndpoints(target.inspect, hostConfig, target.id)
         val body = buildCreateBody(
             containerConfig,
@@ -191,7 +239,11 @@ class Updater(
                 runCatching { api.remove(newId, force = true) }
                 throw e
             }
-            Log.info("[$name] update complete")
+            if (target.stale) {
+                Log.info("[$name] update complete")
+            } else {
+                Log.info("[$name] recreated (a create-time dependency was updated)")
+            }
             try {
                 api.remove(target.id, force = true)
             } catch (e: Exception) {
@@ -215,21 +267,16 @@ class Updater(
     }
 
     /**
-     * Resolve a `network_mode: container:<id>` to the referenced container's **name**, so the recreated
-     * container keeps sharing that container's network namespace even after the provider is itself
-     * recreated (its id would otherwise change). Other host configs pass through untouched.
+     * Resolve a `network_mode: container:<id>` to the referenced container's **name**, captured before
+     * any dependency is renamed/removed. This lets the recreated container join the replacement provider's
+     * network namespace. Other host configs pass through untouched.
      */
-    private fun resolveHostConfig(hostConfig: JsonObject?): JsonObject? {
+    private fun resolveHostConfig(hostConfig: JsonObject?, resolvedContainerName: String?): JsonObject? {
         if (hostConfig == null) return null
         val mode = hostConfig.str("NetworkMode") ?: return hostConfig
         if (!mode.startsWith("container:")) return hostConfig
         val ref = mode.removePrefix("container:")
-        val resolvedName = try {
-            api.inspectContainer(ref).str("Name")?.trimStart('/')
-        } catch (e: Exception) {
-            Log.warn("could not resolve network_mode container:$ref — keeping as-is: ${e.message}")
-            null
-        } ?: return hostConfig
+        val resolvedName = resolvedContainerName ?: return hostConfig
         Log.info("resolved network_mode container:$ref -> container:$resolvedName")
         return buildJsonObject {
             hostConfig.forEach { (key, value) -> if (key != "NetworkMode") put(key, value) }
@@ -298,13 +345,24 @@ internal class Target(
     /** A container this one depends on is being restarted, so this one must restart too. */
     var linkedToRestarting: Boolean = false
 
+    /** A create-time dependency changed, so this container must be recreated rather than merely started. */
+    var linkedToRecreate: Boolean = false
+
     /** Ids (within this cycle's set) of the containers this one depends on. */
     var deps: Set<String> = emptySet()
+
+    /** Dependency ids that are baked into create-time config (`--link` or `network_mode: container:`). */
+    var createTimeDeps: Set<String> = emptySet()
+
+    /** Name captured before updates for `HostConfig.NetworkMode=container:<id|name>`. */
+    var networkModeContainerName: String? = null
 
     /** The running image's defaults, captured before pulling so a moved tag cannot erase them. */
     var oldImageConfig: JsonObject? = null
 
-    val toRestart: Boolean get() = stale || linkedToRestarting
+    val toRecreate: Boolean get() = stale || linkedToRecreate
+
+    val toRestart: Boolean get() = toRecreate || linkedToRestarting
 }
 
 /**
@@ -312,9 +370,14 @@ internal class Target(
  * `com.docker.compose.depends_on` metadata and falling back to the `<ns>.depends-on` label, legacy
  * `HostConfig.Links`, and `network_mode: container:`.
  */
-internal fun resolveLinks(targets: List<Target>, ns: String) {
+internal fun resolveLinks(
+    targets: List<Target>,
+    ns: String,
+    externalContainerName: (String) -> String? = { null },
+) {
     val byName = HashMap<String, String>()
     val byService = HashMap<String, String>()
+    val byId = targets.associateBy { it.id }
     for (target in targets) {
         byName[target.name] = target.id
         if (target.composeProject != null && target.composeService != null) {
@@ -324,8 +387,10 @@ internal fun resolveLinks(targets: List<Target>, ns: String) {
 
     for (target in targets) {
         val deps = LinkedHashSet<String>()
-        fun addDep(depId: String?) {
+        val createTimeDeps = LinkedHashSet<String>()
+        fun addDep(depId: String?, createTime: Boolean = false) {
             if (depId != null && depId != target.id) deps += depId
+            if (createTime && depId != null && depId != target.id) createTimeDeps += depId
         }
 
         // Compose metadata: entries look like "db:service_started:true" — take the service name.
@@ -342,15 +407,18 @@ internal fun resolveLinks(targets: List<Target>, ns: String) {
         // Legacy --link: "/source:/container/alias".
         target.inspect.obj("HostConfig")?.arr("Links")?.forEach { link ->
             val source = (link.jsonPrimitive.contentOrNull ?: return@forEach).removePrefix("/").substringBefore(':')
-            addDep(byName[source])
+            addDep(byName[source], createTime = true)
         }
         // network_mode: container:<id|name>.
         val mode = target.inspect.obj("HostConfig")?.str("NetworkMode").orEmpty()
         if (mode.startsWith("container:")) {
             val ref = mode.removePrefix("container:")
-            addDep(byName[ref] ?: targets.firstOrNull { it.id.startsWith(ref) }?.id)
+            val depId = byName[ref] ?: targets.firstOrNull { it.id.startsWith(ref) }?.id
+            addDep(depId, createTime = true)
+            target.networkModeContainerName = depId?.let { byId[it]?.name } ?: externalContainerName(ref)
         }
         target.deps = deps
+        target.createTimeDeps = createTimeDeps
     }
 }
 
@@ -365,8 +433,11 @@ internal fun propagateLinkedRestart(targets: List<Target>) {
     while (changed) {
         changed = false
         for (target in targets) {
-            if (target.toRestart) continue
-            if (target.deps.any { byId[it]?.toRestart == true }) {
+            if (!target.toRecreate && target.createTimeDeps.any { byId[it]?.toRestart == true }) {
+                target.linkedToRecreate = true
+                changed = true
+            }
+            if (!target.toRestart && target.deps.any { byId[it]?.toRestart == true }) {
                 target.linkedToRestarting = true
                 changed = true
             }
@@ -407,6 +478,19 @@ internal fun splitImageRef(ref: String): Pair<String, String> {
         ref to "latest"
     }
 }
+
+internal fun JsonObject.distributionDigest(): String? =
+    obj("Descriptor")?.str("digest")?.takeIf { it.isNotBlank() }
+
+internal fun JsonObject.repoDigests(): Set<String> =
+    arr("RepoDigests")
+        ?.mapNotNull { ref ->
+            ref.jsonPrimitive.contentOrNull
+                ?.substringAfter('@', missingDelimiterValue = "")
+                ?.takeIf { it.isNotBlank() }
+        }
+        ?.toSet()
+        ?: emptySet()
 
 private fun serviceKey(project: String, service: String) = "$project $service"
 

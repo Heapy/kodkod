@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Recreate create-time dependents (`--link` / `network_mode: container:`) when a dependency is updated,
+  and resolve `network_mode: container:<id>` to a container name before any old ids are removed.
+
 ## [0.3.0] - 2026-06-04
 
 ### Added
