@@ -24,7 +24,7 @@ import kotlinx.serialization.json.put
  * still be restarted or recreated as a dependent.
  */
 class Updater(
-    private val api: DockerApi,
+    private val api: DockerClient,
     private val config: Config,
     private val selfId: String?,
 ) {

@@ -29,15 +29,15 @@ class DockerException(val status: Int, message: String) : RuntimeException("dock
  * `Connection: close`, so we never have to manage keep-alive state; the response body is either
  * `Transfer-Encoding: chunked` (decoded here) or simply delimited by the socket close.
  */
-class DockerApi(private val socketPath: String) {
+class DockerApi(private val socketPath: String) : DockerClient {
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
     // --- High level helpers ---------------------------------------------------------------
 
-    fun version(): JsonObject = getJson("/version").jsonObject
+    override fun version(): JsonObject = getJson("/version").jsonObject
 
-    fun listContainers(all: Boolean, filters: Map<String, List<String>>): JsonArray {
+    override fun listContainers(all: Boolean, filters: Map<String, List<String>>): JsonArray {
         val filterJson = buildJsonObject {
             filters.forEach { (key, values) -> putJsonArray(key) { values.forEach { add(it) } } }
         }.toString()
@@ -45,30 +45,30 @@ class DockerApi(private val socketPath: String) {
         return getJson("/containers/json?$query").jsonArray
     }
 
-    fun inspectContainer(id: String): JsonObject = getJson("/containers/${enc(id)}/json").jsonObject
+    override fun inspectContainer(id: String): JsonObject = getJson("/containers/${enc(id)}/json").jsonObject
 
-    fun restart(id: String, timeout: Int) {
+    override fun restart(id: String, timeout: Int) {
         ok(request("POST", "/containers/${enc(id)}/restart?t=$timeout"))
     }
 
-    fun stop(id: String, timeout: Int) {
+    override fun stop(id: String, timeout: Int) {
         ok(request("POST", "/containers/${enc(id)}/stop?t=$timeout"), 304)
     }
 
-    fun start(id: String) {
+    override fun start(id: String) {
         ok(request("POST", "/containers/${enc(id)}/start"), 304)
     }
 
-    fun rename(id: String, name: String) {
+    override fun rename(id: String, name: String) {
         ok(request("POST", "/containers/${enc(id)}/rename?name=${enc(name)}"))
     }
 
-    fun remove(id: String, force: Boolean) {
+    override fun remove(id: String, force: Boolean) {
         ok(request("DELETE", "/containers/${enc(id)}?force=$force&v=false"), 404)
     }
 
     /** `POST /networks/{id}/connect` — attach an already-created container to another network. */
-    fun connectNetwork(network: String, containerId: String, endpoint: JsonObject) {
+    override fun connectNetwork(network: String, containerId: String, endpoint: JsonObject) {
         val body = buildJsonObject {
             put("Container", containerId)
             put("EndpointConfig", endpoint)
@@ -83,7 +83,7 @@ class DockerApi(private val socketPath: String) {
         )
     }
 
-    fun create(name: String, body: JsonObject): String {
+    override fun create(name: String, body: JsonObject): String {
         val response = request(
             method = "POST",
             path = "/containers/create?name=${enc(name)}",
@@ -95,14 +95,14 @@ class DockerApi(private val socketPath: String) {
     }
 
     /** `GET /images/{ref}/json` — note the ref (repo/tag) is kept raw; its slashes/colons are valid path chars. */
-    fun inspectImage(ref: String): JsonObject = getJson("/images/$ref/json").jsonObject
+    override fun inspectImage(ref: String): JsonObject = getJson("/images/$ref/json").jsonObject
 
-    fun removeImage(ref: String) {
+    override fun removeImage(ref: String) {
         ok(request("DELETE", "/images/$ref?force=false&noprune=false"), 404, 409)
     }
 
     /** `GET /distribution/{ref}/json` — fetch registry manifest metadata without pulling layers. */
-    fun inspectDistribution(ref: String, registryAuth: String?): JsonObject {
+    override fun inspectDistribution(ref: String, registryAuth: String?): JsonObject {
         val headers = buildMap {
             if (registryAuth != null) put("X-Registry-Auth", registryAuth)
         }
@@ -115,7 +115,7 @@ class DockerApi(private val socketPath: String) {
      * `POST /images/create` — pull an image. Docker answers 200 and streams newline-delimited
      * JSON progress objects; a failed pull surfaces an `error` field in the stream, so we scan for it.
      */
-    fun pull(fromImage: String, tag: String, registryAuth: String?) {
+    override fun pull(fromImage: String, tag: String, registryAuth: String?) {
         val headers = buildMap {
             if (registryAuth != null) put("X-Registry-Auth", registryAuth)
         }

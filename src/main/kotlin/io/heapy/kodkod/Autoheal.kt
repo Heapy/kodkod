@@ -10,7 +10,7 @@ import kotlinx.serialization.json.jsonObject
  *  - `<ns>.stop.timeout=<seconds>`     — per-container stop timeout override
  */
 class Autoheal(
-    private val api: DockerApi,
+    private val api: DockerClient,
     private val config: Config,
     private val selfId: String?,
 ) {
