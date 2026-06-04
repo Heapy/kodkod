@@ -384,7 +384,7 @@ private class E2eHarness {
         check: Boolean,
         env: Map<String, String>,
         hostDocker: Boolean,
-        timeout: Duration? = null,
+        timeout: Duration = DEFAULT_COMMAND_TIMEOUT,
     ): CommandResult {
         val processBuilder = ProcessBuilder(args)
             .directory(root.toFile())
@@ -419,10 +419,7 @@ private class E2eHarness {
             }
         }
 
-        val exited = timeout?.let { process.waitFor(it.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS) } ?: run {
-            process.waitFor()
-            true
-        }
+        val exited = process.waitFor(timeout.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
         if (!exited) {
             process.destroyForcibly()
             reader.join(1000)
@@ -452,6 +449,7 @@ private class E2eHarness {
     }
 
     private companion object {
+        val DEFAULT_COMMAND_TIMEOUT: Duration = Duration.ofMinutes(10)
         const val MAX_CAPTURE_CHARS = 128_000
     }
 }
