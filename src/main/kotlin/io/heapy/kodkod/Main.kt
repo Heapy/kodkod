@@ -3,6 +3,7 @@ package io.heapy.kodkod
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.system.exitProcess
 
 /**
@@ -45,22 +46,23 @@ fun main() {
     val selfId = System.getenv("HOSTNAME")?.takeIf { it.isNotBlank() }
     val autoheal = Autoheal(api, config, selfId)
     val updater = Updater(api, config, selfId)
+    val cycleLock = ReentrantLock()
 
     val scheduler = Executors.newScheduledThreadPool(2) { runnable ->
         Thread(runnable, "kodkod-worker").apply { isDaemon = true }
     }
 
-    // scheduleWithFixedDelay => the next cycle starts only after the previous one finishes,
-    // so cycles never overlap even if a pull/restart runs long.
+    // scheduleWithFixedDelay prevents a job from overlapping with itself; the shared lock also
+    // serializes autoheal and update cycles so restart/recreate operations cannot race.
     if (config.autohealEnabled) {
         scheduler.scheduleWithFixedDelay(
-            guarded("autoheal", autoheal::runOnce),
+            guarded("autoheal", cycleLock, autoheal::runOnce),
             config.autohealStartPeriod, config.autohealInterval, TimeUnit.SECONDS,
         )
     }
     if (config.updateEnabled) {
         scheduler.scheduleWithFixedDelay(
-            guarded("update", updater::runOnce),
+            guarded("update", cycleLock, updater::runOnce),
             config.updateStartPeriod, config.updateInterval, TimeUnit.SECONDS,
         )
     }
@@ -77,10 +79,17 @@ fun main() {
 }
 
 /** Wrap a cycle so a thrown exception is logged instead of cancelling the scheduled task. */
-private fun guarded(name: String, task: () -> Unit): Runnable = Runnable {
+private fun guarded(name: String, cycleLock: ReentrantLock, task: () -> Unit): Runnable = Runnable {
+    var locked = false
     try {
+        cycleLock.lockInterruptibly()
+        locked = true
         task()
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
     } catch (e: Throwable) {
         Log.error("[$name] cycle failed: ${e.message}")
+    } finally {
+        if (locked) cycleLock.unlock()
     }
 }
