@@ -1,8 +1,8 @@
 package io.heapy.kodkod
 
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Test
 import java.nio.charset.StandardCharsets
-import kotlin.test.Test
-import kotlin.test.assertEquals
 
 /** Exercises the hand-rolled HTTP/1.1 parsing in isolation — no socket is opened. */
 class DockerApiParseTest {

@@ -1,11 +1,11 @@
 package io.heapy.kodkod
 
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertFalse
-import kotlin.test.assertNull
-import kotlin.test.assertTrue
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
 
 class ConfigTest {
     private fun env(vararg pairs: Pair<String, String>): (String) -> String? {
@@ -37,7 +37,7 @@ class ConfigTest {
 
     @Test
     fun rejects_non_positive_intervals() {
-        assertFailsWith<IllegalArgumentException> { Config.fromEnv(env("KODKOD_AUTOHEAL_INTERVAL" to "0")) }
-        assertFailsWith<IllegalArgumentException> { Config.fromEnv(env("KODKOD_UPDATE_INTERVAL" to "-5")) }
+        assertThrows(IllegalArgumentException::class.java) { Config.fromEnv(env("KODKOD_AUTOHEAL_INTERVAL" to "0")) }
+        assertThrows(IllegalArgumentException::class.java) { Config.fromEnv(env("KODKOD_UPDATE_INTERVAL" to "-5")) }
     }
 }

@@ -1,0 +1,462 @@
+package io.heapy.kodkod.e2e
+
+import org.junit.jupiter.api.AfterAll
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeAll
+import org.junit.jupiter.api.DisplayName
+import org.junit.jupiter.api.MethodOrderer
+import org.junit.jupiter.api.Order
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.TestInstance
+import org.junit.jupiter.api.TestMethodOrder
+import java.nio.file.Path
+import java.time.Duration
+import kotlin.concurrent.thread
+import kotlin.io.path.absolute
+import kotlin.io.path.pathString
+
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+@TestMethodOrder(MethodOrderer.OrderAnnotation::class)
+@DisplayName("kodkod Docker E2E")
+class KodkodE2eTest {
+    private val e2e = E2eHarness()
+
+    @BeforeAll
+    fun setupSuite() {
+        e2e.startDocker()
+        e2e.setup()
+    }
+
+    @AfterAll
+    fun cleanupSuite() {
+        e2e.close()
+    }
+
+    @Test
+    @Order(1)
+    fun autohealRestartsUnhealthyContainer() = e2e.scenario("autoheal") {
+        compose("autoheal", "up", "-d")
+        waitUntil(40, "app healthy") { health("e2e-autoheal-app-1") == "healthy" }
+        val before = startedAt("e2e-autoheal-app-1")
+
+        docker("exec", "e2e-autoheal-app-1", "rm", "-f", "/tmp/healthy")
+
+        waitUntil(60, "app restarted by kodkod") { startedAt("e2e-autoheal-app-1") != before }
+        assertNotEquals(before, startedAt("e2e-autoheal-app-1"), "StartedAt should advance after going unhealthy")
+        waitUntil(30, "health recovered") { health("e2e-autoheal-app-1") == "healthy" }
+        assertEquals("healthy", health("e2e-autoheal-app-1"))
+    }
+
+    @Test
+    @Order(2)
+    fun updatePullsAndAdoptsNewImageDefaults() = e2e.scenario("update") {
+        publishVariant("v1")
+        compose("update", "up", "-d")
+        waitUntil(30, "app v1 up") { variant("e2e-update-app-1") == "v1" }
+        val oldImage = inspect("{{.Image}}", "e2e-update-app-1")
+
+        publishVariant("v2")
+
+        waitUntil(90, "app updated to v2") { variant("e2e-update-app-1") == "v2" }
+        assertEquals("v2", variant("e2e-update-app-1"))
+        assertNotEquals(oldImage, inspect("{{.Image}}", "e2e-update-app-1"), "image id should change")
+        assertTrue(
+            inspect("{{range .Config.Healthcheck.Test}}{{.}} {{end}}", "e2e-update-app-1").contains("/tmp/healthy-v2"),
+            "healthcheck command should come from the v2 image",
+        )
+        assertEquals("5000000000", inspect("{{json .Config.Healthcheck.Interval}}", "e2e-update-app-1"))
+        assertEquals("4000000000", inspect("{{json .Config.Healthcheck.Timeout}}", "e2e-update-app-1"))
+        assertEquals("4", inspect("{{json .Config.Healthcheck.Retries}}", "e2e-update-app-1"))
+    }
+
+    @Test
+    @Order(3)
+    fun dependencyUpdateRestartsDependentAfterProvider() = e2e.scenario("deps") {
+        publishVariant("v1")
+        compose("deps", "up", "-d")
+        waitUntil(30, "db v1 up") { variant("e2e-deps-db-1") == "v1" }
+
+        publishVariant("v2")
+
+        waitUntil(90, "db updated to v2") { variant("e2e-deps-db-1") == "v2" }
+        assertEquals("v2", variant("e2e-deps-db-1"))
+        val dbStart = startedAt("e2e-deps-db-1")
+        val webStart = startedAt("e2e-deps-web-1")
+        assertTrue(webStart > dbStart, "web should restart after db; db=$dbStart web=$webStart")
+    }
+
+    @Test
+    @Order(4)
+    fun multiNetworkContainerIsReconnectedToEveryNetwork() = e2e.scenario("multinet") {
+        publishVariant("v1")
+        compose("multinet", "up", "-d")
+        waitUntil(30, "app v1 up") { variant("e2e-multinet-app-1") == "v1" }
+
+        publishVariant("v2")
+
+        waitUntil(90, "app updated to v2") { variant("e2e-multinet-app-1") == "v2" }
+        val networks = inspect("{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}} {{end}}", "e2e-multinet-app-1")
+        assertTrue(networks.contains("e2e-multinet_neta"), "missing neta; got: $networks")
+        assertTrue(networks.contains("e2e-multinet_netb"), "missing netb; got: $networks")
+    }
+
+    @Test
+    @Order(5)
+    fun containerNetworkModeDependentIsRecreatedAfterProviderUpdate() = e2e.scenario("container-mode") {
+        publishVariant("v1")
+        compose("container-mode", "up", "-d")
+        waitUntil(30, "provider v1 up") { variant("e2e-cmode-provider-1") == "v1" }
+        waitUntil(30, "consumer running") { running("e2e-cmode-consumer-1") }
+        val oldProviderId = inspect("{{.Id}}", "e2e-cmode-provider-1")
+        val oldConsumerId = inspect("{{.Id}}", "e2e-cmode-consumer-1")
+
+        publishVariant("v2")
+
+        waitUntil(90, "provider updated to v2") { variant("e2e-cmode-provider-1") == "v2" }
+        waitUntil(60, "consumer recreated after provider update") { inspect("{{.Id}}", "e2e-cmode-consumer-1") != oldConsumerId }
+        val providerId = inspect("{{.Id}}", "e2e-cmode-provider-1")
+        assertEquals("v2", variant("e2e-cmode-provider-1"))
+        assertNotEquals(oldProviderId, providerId, "provider id should change")
+        assertNotEquals(oldConsumerId, inspect("{{.Id}}", "e2e-cmode-consumer-1"), "consumer id should change")
+        assertEquals("container:$providerId", inspect("{{.HostConfig.NetworkMode}}", "e2e-cmode-consumer-1"))
+        assertTrue(running("e2e-cmode-consumer-1"))
+    }
+
+    @Test
+    @Order(6)
+    fun failedRecreateRollsBackToRunningOriginal() = e2e.scenario("rollback") {
+        publishVariant("v1")
+        compose("rollback", "up", "-d")
+        waitUntil(30, "app v1 up") { variant("e2e-rollback-app-1") == "v1" }
+
+        publishVariant("broken")
+
+        waitUntil(90, "kodkod logged a rollback") { logHas("e2e-rollback-kodkod-1", "rolling back") }
+        assertTrue(logHas("e2e-rollback-kodkod-1", "rolling back"), "kodkod should report rollback")
+
+        publishVariant("v1")
+
+        waitUntil(60, "app back to running v1") { running("e2e-rollback-app-1") && variant("e2e-rollback-app-1") == "v1" }
+        assertEquals("v1", variant("e2e-rollback-app-1"))
+        assertTrue(running("e2e-rollback-app-1"))
+        assertEquals(0, containerIdsByName("_kodkod_old_").size, "backup containers should be removed")
+    }
+
+    @Test
+    @Order(7)
+    fun digestPinnedContainerIsSkipped() = e2e.scenario("digest") {
+        publishVariant("v1")
+        val repoDigest = inspect("{{index .RepoDigests 0}}", "${registry}/testapp:latest")
+        val digest = repoDigest.substringAfter("@", missingDelimiterValue = "")
+        assertTrue(digest.isNotBlank(), "could not read v1 RepoDigest")
+        val digestEnv = mapOf("TESTAPP_DIGEST" to digest)
+
+        compose("digest", "up", "-d", env = digestEnv)
+        waitUntil(30, "pinned app up") { running("e2e-digest-app-1") }
+        val oldImage = inspect("{{.Image}}", "e2e-digest-app-1")
+
+        publishVariant("v2")
+
+        waitUntil(50, "kodkod logged digest-pinned skip") { logHas("e2e-digest-kodkod-1", "digest-pinned") }
+        assertTrue(logHas("e2e-digest-kodkod-1", "digest-pinned"), "kodkod should skip digest-pinned container")
+        assertEquals(oldImage, inspect("{{.Image}}", "e2e-digest-app-1"))
+        compose("digest", "down", "-v", env = digestEnv)
+    }
+
+    @Test
+    @Order(8)
+    fun monitorAllDoesNotActOnKodkodItself() = e2e.scenario("self") {
+        compose("registry", "stop", check = false)
+        try {
+            compose("self", "up", "-d")
+            waitUntil(30, "kodkod up") { running("e2e-self-kodkod-1") }
+            assertEquals("true", inspect("{{index .Config.Labels \"io.heapy.kodkod.self\"}}", "e2e-self-kodkod-1"))
+            assertEquals("kodkod-custom-host", inspect("{{.Config.Hostname}}", "e2e-self-kodkod-1"))
+            val before = startedAt("e2e-self-kodkod-1")
+            waitUntil(30, "dummy up") { running("e2e-self-dummy-1") }
+            val dummyBefore = startedAt("e2e-self-dummy-1")
+
+            sleep(35)
+
+            assertEquals(before, startedAt("e2e-self-kodkod-1"), "kodkod should not act on itself")
+            waitUntil(30, "dummy restarted by monitor-all") { startedAt("e2e-self-dummy-1") != dummyBefore }
+            assertNotEquals(dummyBefore, startedAt("e2e-self-dummy-1"), "dummy should restart so cycles are proven")
+            assertTrue(running("e2e-self-dummy-1"))
+        } finally {
+            compose("registry", "start", check = false)
+        }
+    }
+}
+
+private class E2eHarness {
+    val root: Path = Path.of(System.getProperty("user.dir")).absolute()
+    val registry: String = System.getenv("KODKOD_E2E_REGISTRY") ?: "127.0.0.1:5000"
+
+    private val useCurrentDocker = boolProperty("kodkod.e2e.useCurrentDocker")
+    private val keepDind = boolProperty("kodkod.e2e.keepDind") || System.getenv("KEEP") == "1"
+    private val dindName = System.getProperty("kodkod.e2e.dindName", "kodkod-e2e-dind")
+    private val dindImage = System.getProperty("kodkod.e2e.dindImage", "docker:dind")
+    private val dindPort = System.getProperty("kodkod.e2e.dindPort", "12375")
+    private var dockerHost: String? = null
+
+    fun startDocker() {
+        if (useCurrentDocker) {
+            println("==> using current Docker daemon")
+            return
+        }
+
+        println("==> (re)starting Docker-in-Docker from $dindImage")
+        hostDocker("rm", "-f", dindName, check = false)
+        hostDocker(
+            "run",
+            "-d",
+            "--privileged",
+            "--name",
+            dindName,
+            "-e",
+            "DOCKER_TLS_CERTDIR=",
+            "-p",
+            "127.0.0.1:$dindPort:2375",
+            dindImage,
+        )
+
+        dockerHost = "tcp://127.0.0.1:$dindPort"
+        println("==> waiting for the inner daemon on $dockerHost")
+        waitUntil(90, "inner Docker daemon ready") {
+            docker("version", check = false).exitCode == 0
+        }
+        val version = docker("version", "--format", "{{.Server.Version}}").output.trim()
+        println("    inner engine: $version")
+    }
+
+    fun setup() {
+        println("==> setup: build kodkod:e2e, start registry, push testapp v1")
+        println("==> building kodkod:e2e (Gradle runs inside the build stage; first run is slow)")
+        docker("build", "-t", "kodkod:e2e", ".")
+
+        println("==> starting local registry on $registry")
+        compose("registry", "up", "-d")
+
+        publishVariant("v1")
+        println(
+            """
+
+            Ready.
+              registry : $registry  (testapp:latest = v1)
+              image    : kodkod:e2e
+            """.trimIndent(),
+        )
+    }
+
+    fun close() {
+        try {
+            cleanupE2e()
+        } finally {
+            if (!useCurrentDocker) {
+                if (keepDind) {
+                    println("==> KEEP=1: leaving '$dindName' up (export DOCKER_HOST=tcp://127.0.0.1:$dindPort)")
+                } else {
+                    println("==> removing dind '$dindName'")
+                    hostDocker("rm", "-f", dindName, check = false)
+                }
+            }
+        }
+    }
+
+    fun publishVariant(variant: String) {
+        println("==> publishing testapp:latest = $variant")
+        when (variant) {
+            "v1", "v2" -> docker(
+                "build",
+                "--target",
+                variant,
+                "--build-arg",
+                "VARIANT=$variant",
+                "-t",
+                "$registry/testapp:latest",
+                "-t",
+                "$registry/testapp:$variant",
+                "e2e/testapp",
+            )
+
+            "broken" -> docker(
+                "build",
+                "-f",
+                "e2e/testapp/Dockerfile.broken",
+                "-t",
+                "$registry/testapp:latest",
+                "e2e/testapp",
+            )
+
+            else -> error("unknown testapp variant: $variant")
+        }
+
+        repeat(20) { attempt ->
+            if (docker("push", "$registry/testapp:latest", check = false).exitCode == 0) return
+            if (attempt < 19) sleep(2)
+        }
+        error("push to $registry failed after retries")
+    }
+
+    fun scenario(composeProject: String, block: E2eHarness.() -> Unit) {
+        println("[$composeProject] starting")
+        try {
+            block()
+        } finally {
+            compose(composeProject, "down", "-v", check = false)
+        }
+    }
+
+    fun compose(file: String, vararg args: String, check: Boolean = true, env: Map<String, String> = emptyMap()): CommandResult {
+        return docker("compose", "-f", "e2e/compose.$file.yml", *args, check = check, env = env)
+    }
+
+    fun docker(vararg args: String, check: Boolean = true, env: Map<String, String> = emptyMap()): CommandResult {
+        return command(listOf("docker") + args, check = check, env = env, hostDocker = false)
+    }
+
+    fun hostDocker(vararg args: String, check: Boolean = true): CommandResult {
+        return command(listOf("docker") + args, check = check, env = emptyMap(), hostDocker = true)
+    }
+
+    fun inspect(format: String, target: String): String {
+        val result = docker("inspect", "-f", format, target, check = false)
+        return if (result.exitCode == 0) result.output.trim() else ""
+    }
+
+    fun health(container: String): String = inspect("{{.State.Health.Status}}", container)
+
+    fun running(container: String): Boolean = inspect("{{.State.Running}}", container) == "true"
+
+    fun startedAt(container: String): String = inspect("{{.State.StartedAt}}", container)
+
+    fun variant(container: String): String = inspect("{{index .Config.Labels \"app.variant\"}}", container)
+
+    fun logHas(container: String, text: String): Boolean {
+        return docker("logs", container, check = false).output.contains(text, ignoreCase = true)
+    }
+
+    fun containerIdsByName(name: String): List<String> {
+        val result = docker("ps", "-aq", "--filter", "name=$name", check = false)
+        return result.output.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+    }
+
+    fun waitUntil(timeoutSeconds: Long, description: String, predicate: () -> Boolean) {
+        val deadline = System.nanoTime() + Duration.ofSeconds(timeoutSeconds).toNanos()
+        while (System.nanoTime() < deadline) {
+            if (predicate()) return
+            sleep(2)
+        }
+        println("    (timeout ${timeoutSeconds}s waiting for: $description)")
+    }
+
+    fun sleep(seconds: Long) {
+        Thread.sleep(Duration.ofSeconds(seconds).toMillis())
+    }
+
+    private fun cleanupE2e() {
+        println("==> tearing down e2e stacks")
+        val digestEnv = mapOf("TESTAPP_DIGEST" to "sha256:${"0".repeat(64)}")
+        listOf("autoheal", "update", "deps", "multinet", "container-mode", "rollback", "self", "digest").forEach {
+            compose(it, "down", "-v", "--remove-orphans", check = false, env = digestEnv)
+        }
+        compose("registry", "down", "-v", "--remove-orphans", check = false, env = digestEnv)
+
+        removeContainersByName("e2e-")
+        removeContainersByName("_kodkod_old_")
+        listOf("latest", "v1", "v2").forEach { tag ->
+            docker("rmi", "$registry/testapp:$tag", check = false)
+        }
+        println("cleanup done (kodkod:e2e kept)")
+    }
+
+    private fun removeContainersByName(name: String) {
+        val ids = containerIdsByName(name)
+        if (ids.isNotEmpty()) {
+            docker(*((listOf("rm", "-f") + ids).toTypedArray()), check = false)
+        }
+    }
+
+    private fun command(
+        args: List<String>,
+        check: Boolean,
+        env: Map<String, String>,
+        hostDocker: Boolean,
+        timeout: Duration? = null,
+    ): CommandResult {
+        val processBuilder = ProcessBuilder(args)
+            .directory(root.toFile())
+            .redirectErrorStream(true)
+
+        val processEnv = processBuilder.environment()
+        processEnv["DOCKER_BUILDKIT"] = "1"
+        processEnv["BUILDKIT_PROGRESS"] = "plain"
+        if (hostDocker) {
+            processEnv.remove("DOCKER_HOST")
+        } else {
+            dockerHost?.let {
+                processEnv["DOCKER_HOST"] = it
+                processEnv.remove("DOCKER_TLS_VERIFY")
+                processEnv.remove("DOCKER_CERT_PATH")
+            }
+        }
+        processEnv.putAll(env)
+
+        val process = processBuilder.start()
+        val output = StringBuilder()
+        val reader = thread(start = true, isDaemon = true) {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        output.appendLine(line)
+                        if (output.length > MAX_CAPTURE_CHARS) {
+                            output.delete(0, output.length - MAX_CAPTURE_CHARS)
+                        }
+                    }
+                }
+            }
+        }
+
+        val exited = timeout?.let { process.waitFor(it.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS) } ?: run {
+            process.waitFor()
+            true
+        }
+        if (!exited) {
+            process.destroyForcibly()
+            reader.join(1000)
+            error("command timed out after $timeout: ${args.joinToString(" ")}")
+        }
+
+        val exitCode = process.exitValue()
+        reader.join(1000)
+        val text = synchronized(output) { output.toString().trimEnd() }
+        val result = CommandResult(exitCode, text)
+        if (check && exitCode != 0) {
+            error(
+                """
+                command failed with exit code $exitCode
+                cwd: ${root.pathString}
+                command: ${args.joinToString(" ")}
+                output:
+                $text
+                """.trimIndent(),
+            )
+        }
+        return result
+    }
+
+    private fun boolProperty(name: String): Boolean {
+        return System.getProperty(name)?.trim()?.lowercase() in setOf("true", "1", "yes", "on")
+    }
+
+    private companion object {
+        const val MAX_CAPTURE_CHARS = 128_000
+    }
+}
+
+private data class CommandResult(
+    val exitCode: Int,
+    val output: String,
+)
