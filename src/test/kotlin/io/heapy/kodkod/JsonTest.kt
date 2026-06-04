@@ -31,4 +31,13 @@ class JsonTest {
         assertFalse(labelTruthy(labels, "missing", default = false))
         assertTrue(labelTruthy(null, "x", default = true))
     }
+
+    @Test
+    fun isSelf_matches_hostname_or_self_label() {
+        assertTrue(isSelf("abcdef123456", labels = null, selfId = "abcdef"))
+        assertFalse(isSelf("abcdef123456", labels = null, selfId = "123456"))
+
+        assertTrue(isSelf("abcdef123456", labels = jsonObj("""{"$SELF_LABEL":"true"}"""), selfId = null))
+        assertFalse(isSelf("abcdef123456", labels = jsonObj("""{"$SELF_LABEL":"false"}"""), selfId = null))
+    }
 }

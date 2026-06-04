@@ -15,6 +15,12 @@ val TRUTHY = setOf("true", "1", "yes", "on")
  */
 const val SELF_LABEL = "io.heapy.kodkod.self"
 
+/** kodkod never acts on itself: matched by its baked-in [SELF_LABEL], or by HOSTNAME as a fallback. */
+fun isSelf(id: String, labels: JsonObject?, selfId: String?): Boolean {
+    if (selfId != null && id.startsWith(selfId)) return true
+    return labelTruthy(labels, SELF_LABEL, false)
+}
+
 val EMPTY_OBJECT = JsonObject(emptyMap())
 
 val EMPTY_ARRAY = JsonArray(emptyList())

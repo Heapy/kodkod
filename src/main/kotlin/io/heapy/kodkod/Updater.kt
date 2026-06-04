@@ -79,7 +79,7 @@ class Updater(
             val summary = element.jsonObject
             val id = summary.str("Id") ?: continue
             val summaryLabels = summary.obj("Labels")
-            if (isSelf(id, summaryLabels)) continue
+            if (isSelf(id, summaryLabels, selfId)) continue
             if (!labelTruthy(summaryLabels, "$ns.update.enable", config.updateMonitorAll)) continue
             val inspect = try {
                 api.inspectContainer(id)
@@ -279,12 +279,6 @@ class Updater(
 
     private fun inspectImageConfig(ref: String): JsonObject? =
         runCatching { api.inspectImage(ref).obj("Config") }.getOrNull()
-
-    /** kodkod never updates itself: matched by its baked-in [SELF_LABEL], or by HOSTNAME as a fallback. */
-    private fun isSelf(id: String, labels: JsonObject?): Boolean {
-        if (selfId != null && id.startsWith(selfId)) return true
-        return labelTruthy(labels, SELF_LABEL, false)
-    }
 }
 
 /** One container kodkod is considering for an update, plus the verdict it accumulates this cycle. */

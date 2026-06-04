@@ -1,6 +1,5 @@
 package io.heapy.kodkod
 
-import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 
 /**
@@ -27,7 +26,7 @@ class Autoheal(
             val container = element.jsonObject
             val id = container.str("Id") ?: continue
             val labels = container.obj("Labels")
-            if (isSelf(id, labels)) continue
+            if (isSelf(id, labels, selfId)) continue
 
             val short = id.take(12)
             val name = container.arr("Names").firstString()?.trimStart('/') ?: short
@@ -47,11 +46,5 @@ class Autoheal(
                 Log.error("[$name ($short)] restart failed: ${e.message}")
             }
         }
-    }
-
-    /** kodkod never heals itself: matched by its baked-in [SELF_LABEL], or by HOSTNAME as a fallback. */
-    private fun isSelf(id: String, labels: JsonObject?): Boolean {
-        if (selfId != null && id.startsWith(selfId)) return true
-        return labelTruthy(labels, SELF_LABEL, false)
     }
 }
