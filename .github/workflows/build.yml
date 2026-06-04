@@ -22,8 +22,21 @@ jobs:
       - name: "Build"
         run: ./gradlew --no-daemon build
 
-  docker:
+  e2e:
     needs: gradle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
+        with:
+          distribution: liberica
+          java-version: "25"
+      - name: "Run E2E tests"
+        run: ./gradlew --no-daemon e2eTest
+
+  docker:
+    needs: [gradle, e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: read
