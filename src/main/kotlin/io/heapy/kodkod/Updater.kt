@@ -492,7 +492,7 @@ internal fun JsonObject.repoDigests(): Set<String> =
         ?.toSet()
         ?: emptySet()
 
-private fun serviceKey(project: String, service: String) = "$project $service"
+private fun serviceKey(project: String, service: String) = project + '\u0000' + service
 
 private fun String.shortId(): String =
     removePrefix("sha256:").take(12).ifEmpty { "<none>" }
