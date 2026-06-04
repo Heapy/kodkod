@@ -93,11 +93,14 @@ class KodkodE2eTest {
         publishVariant("v1")
         compose("multinet", "up", "-d")
         waitUntil(30, "app v1 up") { variant("e2e-multinet-app-1") == "v1" }
+        val oldImage = inspect("{{.Image}}", "e2e-multinet-app-1")
 
         publishVariant("v2")
 
         waitUntil(90, "app updated to v2") { variant("e2e-multinet-app-1") == "v2" }
-        val networks = inspect("{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}} {{end}}", "e2e-multinet-app-1")
+        assertEquals("v2", variant("e2e-multinet-app-1"))
+        assertNotEquals(oldImage, inspect("{{.Image}}", "e2e-multinet-app-1"), "image id should change")
+        val networks = inspect($$"{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}", "e2e-multinet-app-1")
         assertTrue(networks.contains("e2e-multinet_neta"), "missing neta; got: $networks")
         assertTrue(networks.contains("e2e-multinet_netb"), "missing netb; got: $networks")
     }
@@ -349,7 +352,7 @@ private class E2eHarness {
             if (predicate()) return
             sleep(2)
         }
-        println("    (timeout ${timeoutSeconds}s waiting for: $description)")
+        assertTrue(false, "Timed out after ${timeoutSeconds}s waiting for: $description")
     }
 
     fun sleep(seconds: Long) {
