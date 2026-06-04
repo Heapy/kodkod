@@ -1,0 +1,27 @@
+# Scenario A — Autoheal: an unhealthy container is restarted.
+#
+# app turns unhealthy when /tmp/healthy is removed; kodkod restarts it; the
+# startup command re-creates the marker, so it returns to healthy. No registry
+# needed — this scenario only exercises the healthcheck path.
+name: e2e-autoheal
+services:
+  app:
+    image: busybox:1.36
+    command: ["sh", "-c", "touch /tmp/healthy; echo '[app] started'; while true; do sleep 1; done"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 3s
+      timeout: 2s
+      retries: 2
+      start_period: 2s
+    labels:
+      kodkod.autoheal.enable: "true"
+
+  kodkod:
+    image: kodkod:e2e
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      KODKOD_UPDATE_ENABLED: "false"
+      KODKOD_AUTOHEAL_INTERVAL: "5"
+      KODKOD_AUTOHEAL_START_PERIOD: "2"

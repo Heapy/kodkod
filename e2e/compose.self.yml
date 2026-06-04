@@ -1,0 +1,40 @@
+# Scenario S — Self-protection (plan fix 3).
+#
+# ⚠️  This scenario sets *_MONITOR_ALL=true, so kodkod will act on EVERY running
+#     container on the daemon it talks to. Run it ONLY against a disposable daemon
+#     (Docker-in-Docker or a throwaway VM). See E2E_TESTING.md "Safety".
+#
+# `hostname:` is set to something that is NOT the container id, defeating the
+# HOSTNAME fallback. kodkod must still skip itself via the io.heapy.kodkod.self
+# label baked into its image — so it never restarts/recreates its own container.
+name: e2e-self
+services:
+  kodkod:
+    image: kodkod:e2e
+    hostname: kodkod-custom-host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "exit 1"]
+      interval: 3s
+      timeout: 1s
+      retries: 1
+      start_period: 1s
+    environment:
+      KODKOD_AUTOHEAL_MONITOR_ALL: "true"
+      KODKOD_UPDATE_MONITOR_ALL: "true"
+      KODKOD_AUTOHEAL_INTERVAL: "8"
+      KODKOD_UPDATE_INTERVAL: "10"
+      KODKOD_UPDATE_START_PERIOD: "3"
+
+  # A bystander with a failing healthcheck: monitor-all must restart it, proving
+  # cycles ran while still skipping the unhealthy kodkod container itself.
+  dummy:
+    image: busybox:1.36
+    command: ["sh", "-c", "echo '[dummy] started'; while true; do sleep 1; done"]
+    healthcheck:
+      test: ["CMD-SHELL", "exit 1"]
+      interval: 3s
+      timeout: 1s
+      retries: 1
+      start_period: 1s

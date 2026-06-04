@@ -33,10 +33,75 @@ class ImageDefaultsTest {
     }
 
     @Test
+    fun envKeySubtract_removes_entries_by_name() {
+        assertEquals(
+            jsonArr("""["USER_SET=1"]"""),
+            envKeySubtract(jsonArr("""["APP_VARIANT=v1","PATH=/bin","USER_SET=1"]"""), jsonArr("""["APP_VARIANT=v2","PATH=/usr/bin"]""")),
+        )
+    }
+
+    @Test
     fun stringMapSubtract_keeps_absent_or_differing() {
         val result = stringMapSubtract(jsonObj("""{"a":"1","b":"2","c":"3"}"""), jsonObj("""{"a":"1","b":"9"}"""))
         // a removed (same value), b kept (different value), c kept (absent from image)
         assertEquals(jsonObj("""{"b":"2","c":"3"}"""), result)
+    }
+
+    @Test
+    fun stringMapSubtractKeys_removes_entries_by_key() {
+        val result = stringMapSubtractKeys(jsonObj("""{"app.variant":"v1","custom":"x"}"""), jsonObj("""{"app.variant":"v2"}"""))
+        assertEquals(jsonObj("""{"custom":"x"}"""), result)
+    }
+
+    @Test
+    fun healthcheckSubtract_removes_matching_fields() {
+        val result = healthcheckSubtract(
+            jsonObj(
+                """
+                {
+                  "Test":["CMD-SHELL","curl -f http://localhost/old || exit 1"],
+                  "Interval":5000000000,
+                  "Timeout":3000000000,
+                  "Retries":3
+                }
+                """.trimIndent(),
+            ),
+            jsonObj(
+                """
+                {
+                  "Test":["CMD-SHELL","curl -f http://localhost/old || exit 1"],
+                  "Interval":30000000000,
+                  "Timeout":3000000000,
+                  "Retries":3
+                }
+                """.trimIndent(),
+            ),
+        )
+
+        assertEquals(jsonObj("""{"Interval":5000000000}"""), result)
+    }
+
+    @Test
+    fun healthcheckSubtractKeys_removes_fields_by_name() {
+        val result = healthcheckSubtractKeys(
+            jsonObj(
+                """
+                {
+                  "Test":["CMD-SHELL","curl -f http://localhost/old || exit 1"],
+                  "Interval":5000000000
+                }
+                """.trimIndent(),
+            ),
+            jsonObj(
+                """
+                {
+                  "Test":["CMD-SHELL","curl -f http://localhost/new || exit 1"]
+                }
+                """.trimIndent(),
+            ),
+        )
+
+        assertEquals(jsonObj("""{"Interval":5000000000}"""), result)
     }
 
     @Test
@@ -70,7 +135,13 @@ class ImageDefaultsTest {
               "Labels":{"com.docker.compose.service":"app","custom":"x"},
               "WorkingDir":"/app",
               "User":"root",
-              "Hostname":"deadbeef1234"
+              "Hostname":"deadbeef1234",
+              "Healthcheck":{
+                "Test":["CMD-SHELL","curl -f http://localhost/old || exit 1"],
+                "Interval":5000000000,
+                "Timeout":3000000000,
+                "Retries":3
+              }
             }
             """.trimIndent(),
         )
@@ -82,7 +153,13 @@ class ImageDefaultsTest {
               "Entrypoint":["/entry.sh"],
               "Labels":{"com.docker.compose.service":"app"},
               "WorkingDir":"/app",
-              "User":"root"
+              "User":"root",
+              "Healthcheck":{
+                "Test":["CMD-SHELL","curl -f http://localhost/old || exit 1"],
+                "Interval":30000000000,
+                "Timeout":3000000000,
+                "Retries":3
+              }
             }
             """.trimIndent(),
         )
@@ -96,6 +173,51 @@ class ImageDefaultsTest {
         assertNull(result["User"]) // equal to image -> dropped
         assertNull(result["Hostname"]) // == oldId short -> dropped (auto-assigned)
         assertEquals(jsonObj("""{"custom":"x"}"""), result["Labels"]) // compose label (from image) removed
+        assertEquals(jsonObj("""{"Interval":5000000000}"""), result["Healthcheck"])
+    }
+
+    @Test
+    fun buildContainerConfig_can_drop_new_image_default_keys_when_old_image_is_unavailable() {
+        val containerConfig = jsonObj(
+            """
+            {
+              "Image":"app:1",
+              "Env":["APP_VARIANT=v1","CUSTOM_ENV=yes"],
+              "Cmd":["old-default"],
+              "Labels":{"app.variant":"v1","custom":"x"},
+              "Healthcheck":{
+                "Test":["CMD-SHELL","curl -f http://localhost/old || exit 1"],
+                "Interval":5000000000
+              }
+            }
+            """.trimIndent(),
+        )
+        val newImageConfig = jsonObj(
+            """
+            {
+              "Env":["APP_VARIANT=v2"],
+              "Cmd":["new-default"],
+              "Labels":{"app.variant":"v2"},
+              "Healthcheck":{
+                "Test":["CMD-SHELL","curl -f http://localhost/new || exit 1"]
+              }
+            }
+            """.trimIndent(),
+        )
+        val result = buildContainerConfig(
+            containerConfig,
+            newImageConfig,
+            hostConfig = null,
+            oldId = "id",
+            imageRef = "app:2",
+            subtractImageDefaultsByKey = true,
+        )
+
+        assertEquals("app:2", result["Image"]!!.jsonPrimitive.content)
+        assertEquals(jsonArr("""["CUSTOM_ENV=yes"]"""), result["Env"])
+        assertNull(result["Cmd"])
+        assertEquals(jsonObj("""{"custom":"x"}"""), result["Labels"])
+        assertEquals(jsonObj("""{"Interval":5000000000}"""), result["Healthcheck"])
     }
 
     @Test

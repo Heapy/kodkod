@@ -1,0 +1,23 @@
+# Scenario U — Update: a new image is pulled and the container recreated, and
+# the new image's changed *defaults* (env/label) are actually adopted.
+#
+# app overrides no env/cmd/labels, so after the tag is overwritten with v2 the
+# recreated container must reflect v2's baked-in defaults (plan fix 1).
+name: e2e-update
+services:
+  app:
+    image: 127.0.0.1:5000/testapp:latest
+    labels:
+      kodkod.update.enable: "true"
+    healthcheck:
+      interval: 5s
+
+  kodkod:
+    image: kodkod:e2e
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      KODKOD_AUTOHEAL_ENABLED: "false"
+      KODKOD_UPDATE_INTERVAL: "15"
+      KODKOD_UPDATE_START_PERIOD: "5"
+      KODKOD_UPDATE_CLEANUP: "true"

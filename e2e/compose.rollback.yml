@@ -1,0 +1,23 @@
+# Scenario R — Rollback on a failed recreate (plan fix 2).
+#
+# app starts on a good image (v1). The runbook then pushes the *broken* variant
+# (entrypoint that can't exec) to testapp:latest. kodkod stops+renames app,
+# creates the new container (succeeds), tries to start it (FAILS), removes it and
+# rolls app back to running on v1. The container must never be left stopped.
+name: e2e-rollback
+services:
+  app:
+    image: 127.0.0.1:5000/testapp:latest
+    labels:
+      kodkod.update.enable: "true"
+
+  kodkod:
+    image: kodkod:e2e
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      KODKOD_AUTOHEAL_ENABLED: "false"
+      KODKOD_UPDATE_INTERVAL: "15"
+      KODKOD_UPDATE_START_PERIOD: "5"
+      # Don't delete the "old" image on a rollback test run.
+      KODKOD_UPDATE_CLEANUP: "false"

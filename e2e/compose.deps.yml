@@ -1,0 +1,33 @@
+# Scenario D — Dependencies: ordered recreate + dependent restart (plan fix 5).
+#
+# web depends_on db. Compose stamps web with `com.docker.compose.depends_on`,
+# which kodkod reads (no YAML parsing). When db's image changes:
+#   - db is stale -> recreated;
+#   - web is not stale but depends on db -> restarted too;
+#   - stop order is reverse (web, then db), start order is forward (db, then web).
+# So db must come back up BEFORE web restarts.
+name: e2e-deps
+services:
+  db:
+    image: 127.0.0.1:5000/testapp:latest
+    labels:
+      kodkod.update.enable: "true"
+
+  web:
+    image: busybox:1.36
+    command: ["sh", "-c", "echo '[web] started'; while true; do sleep 1; done"]
+    depends_on:
+      - db
+    labels:
+      kodkod.update.enable: "true"
+      # Fallback for compose versions that don't emit com.docker.compose.depends_on:
+      kodkod.depends-on: "db"
+
+  kodkod:
+    image: kodkod:e2e
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      KODKOD_AUTOHEAL_ENABLED: "false"
+      KODKOD_UPDATE_INTERVAL: "15"
+      KODKOD_UPDATE_START_PERIOD: "5"

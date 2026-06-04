@@ -122,6 +122,7 @@ class Updater(
             try {
                 val (repo, tag) = splitImageRef(imageRef)
                 Log.info("[${target.name}] checking $imageRef for updates")
+                target.oldImageConfig = inspectOldImageConfig(target)
                 api.pull(repo, tag, config.registryAuth)
                 val newImageId = api.inspectImage(imageRef).str("Id")
                 when {
@@ -147,18 +148,35 @@ class Updater(
         val imageRef = target.imageRef ?: return
         val containerConfig = target.inspect.obj("Config") ?: EMPTY_OBJECT
 
-        // Subtract the OLD image's defaults so the NEW image's defaults are not masked. If the old image
-        // is already gone, fall back to copying the full config rather than failing the update.
-        val oldImageConfig = try {
-            api.inspectImage(target.currentImageId).obj("Config")
-        } catch (e: Exception) {
-            Log.warn("[$name] could not inspect old image for defaults — keeping full config: ${e.message}")
-            null
+        // Subtract the OLD image's defaults so the NEW image's defaults are not masked. Pulling a moved
+        // tag can make the old image id disappear from the local image store, so prefer the config captured
+        // before the pull. If the old defaults are already gone, fall back to subtracting keys present in
+        // the newly pulled image so its env/labels/cmd defaults can still win over stale resolved config.
+        val oldImageConfig = target.oldImageConfig ?: inspectOldImageConfig(target)
+        val (imageConfig, subtractByKey) = if (oldImageConfig != null) {
+            oldImageConfig to false
+        } else {
+            val newImageConfig = inspectImageConfig(imageRef)
+            if (newImageConfig == null) {
+                Log.warn("[$name] could not inspect old or new image defaults — keeping full config")
+                null to false
+            } else {
+                Log.warn("[$name] could not inspect old image defaults — subtracting new image default keys")
+                newImageConfig to true
+            }
         }
 
         val hostConfig = resolveHostConfig(target.inspect.obj("HostConfig"))
         val networks = networkEndpoints(target.inspect, hostConfig, target.id)
-        val body = buildCreateBody(containerConfig, oldImageConfig, hostConfig, imageRef, target.id, networks.firstOrNull())
+        val body = buildCreateBody(
+            containerConfig,
+            imageConfig,
+            hostConfig,
+            imageRef,
+            target.id,
+            networks.firstOrNull(),
+            subtractImageDefaultsByKey = subtractByKey,
+        )
         val backupName = "${name}_kodkod_old_${target.id.take(12)}"
         val timeout = stopTimeout(target)
 
@@ -212,6 +230,7 @@ class Updater(
             Log.warn("could not resolve network_mode container:$ref — keeping as-is: ${e.message}")
             null
         } ?: return hostConfig
+        Log.info("resolved network_mode container:$ref -> container:$resolvedName")
         return buildJsonObject {
             hostConfig.forEach { (key, value) -> if (key != "NetworkMode") put(key, value) }
             put("NetworkMode", "container:$resolvedName")
@@ -251,6 +270,16 @@ class Updater(
     private fun stopTimeout(target: Target): Int =
         target.composeLabels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
 
+    private fun inspectOldImageConfig(target: Target): JsonObject? =
+        if (target.currentImageId.isEmpty()) {
+            null
+        } else {
+            inspectImageConfig(target.currentImageId)
+        }
+
+    private fun inspectImageConfig(ref: String): JsonObject? =
+        runCatching { api.inspectImage(ref).obj("Config") }.getOrNull()
+
     /** kodkod never updates itself: matched by its baked-in [SELF_LABEL], or by HOSTNAME as a fallback. */
     private fun isSelf(id: String, labels: JsonObject?): Boolean {
         if (selfId != null && id.startsWith(selfId)) return true
@@ -277,6 +306,9 @@ internal class Target(
 
     /** Ids (within this cycle's set) of the containers this one depends on. */
     var deps: Set<String> = emptySet()
+
+    /** The running image's defaults, captured before pulling so a moved tag cannot erase them. */
+    var oldImageConfig: JsonObject? = null
 
     val toRestart: Boolean get() = stale || linkedToRestarting
 }

@@ -1,0 +1,14 @@
+# Shared infrastructure: a throwaway local registry on 127.0.0.1:5000.
+#
+# This is the only faithful way to test "pull an update": kodkod asks the Docker
+# daemon to pull <repo>:<tag>, and overwriting that tag's digest in a registry is
+# what a real "new release" looks like. 127.0.0.1 is treated as an insecure
+# registry by default, so no daemon configuration is needed.
+#
+#   docker compose -f e2e/compose.registry.yml up -d
+name: e2e-registry
+services:
+  registry:
+    image: registry:2
+    ports:
+      - "127.0.0.1:5000:5000"

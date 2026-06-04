@@ -1,0 +1,9 @@
+# A deliberately broken image: the entrypoint binary does not exist, so the
+# container CREATES fine but FAILS to start. Pushed as testapp:latest it forces
+# kodkod down the rollback path (plan fix 2):
+#   stop old -> rename old -> create new (ok) -> start new (FAILS) ->
+#   remove new -> rename old back -> start old  => original is running again.
+FROM busybox:1.36
+ENV APP_VARIANT=broken
+LABEL app.variant=broken
+ENTRYPOINT ["/does-not-exist-kodkod-rollback-probe"]

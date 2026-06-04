@@ -1,0 +1,26 @@
+# Scenario N — Multi-network reconnect (plan fix 4).
+#
+# app is attached to two user-defined networks. Docker rejects more than one
+# endpoint at create time, so kodkod must create on the first network and then
+# connect the rest before starting. After an update app must end up on BOTH.
+name: e2e-multinet
+networks:
+  neta:
+  netb:
+services:
+  app:
+    image: 127.0.0.1:5000/testapp:latest
+    networks:
+      - neta
+      - netb
+    labels:
+      kodkod.update.enable: "true"
+
+  kodkod:
+    image: kodkod:e2e
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      KODKOD_AUTOHEAL_ENABLED: "false"
+      KODKOD_UPDATE_INTERVAL: "15"
+      KODKOD_UPDATE_START_PERIOD: "5"

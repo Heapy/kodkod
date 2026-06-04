@@ -5,6 +5,8 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Subtracting an image's baked-in defaults from a container's *resolved* `Config` when recreating it.
@@ -32,11 +34,40 @@ internal fun sliceSubtract(container: JsonArray?, image: JsonArray?): JsonArray 
     return JsonArray(container.filter { it !in imageEntries })
 }
 
+/** Keep container env vars whose names are absent from the image env. Used when old defaults are gone. */
+internal fun envKeySubtract(container: JsonArray?, image: JsonArray?): JsonArray {
+    if (container == null) return EMPTY_ARRAY
+    val imageKeys = image?.mapNotNullTo(HashSet()) { it.envKey() } ?: emptySet()
+    if (imageKeys.isEmpty()) return container
+    return JsonArray(container.filter { it.envKey() !in imageKeys })
+}
+
 /** Keep a label/entry when its key is absent from the image, or present there with a different value. */
 internal fun stringMapSubtract(container: JsonObject?, image: JsonObject?): JsonObject {
     if (container == null) return EMPTY_OBJECT
     val img = image ?: EMPTY_OBJECT
     return JsonObject(container.filter { (key, value) -> img[key] != value })
+}
+
+/** Keep labels/entries whose keys are absent from the image. Used when old defaults are gone. */
+internal fun stringMapSubtractKeys(container: JsonObject?, image: JsonObject?): JsonObject {
+    if (container == null) return EMPTY_OBJECT
+    val img = image ?: EMPTY_OBJECT
+    return JsonObject(container.filterKeys { it !in img })
+}
+
+/** Keep healthcheck fields whose values differ from the image defaults. */
+internal fun healthcheckSubtract(container: JsonObject?, image: JsonObject?): JsonObject {
+    if (container == null) return EMPTY_OBJECT
+    val img = image ?: EMPTY_OBJECT
+    return JsonObject(container.filter { (key, value) -> img[key] != value })
+}
+
+/** Keep healthcheck fields whose names are absent from the image. Used when old defaults are gone. */
+internal fun healthcheckSubtractKeys(container: JsonObject?, image: JsonObject?): JsonObject {
+    if (container == null) return EMPTY_OBJECT
+    val img = image ?: EMPTY_OBJECT
+    return JsonObject(container.filterKeys { it !in img })
 }
 
 /** Keep only the keys absent from the image (values ignored — used for anonymous `Volumes`). */
@@ -70,6 +101,7 @@ internal fun buildContainerConfig(
     hostConfig: JsonObject?,
     oldId: String,
     imageRef: String,
+    subtractImageDefaultsByKey: Boolean = false,
 ): JsonObject {
     val networkMode = hostConfig?.str("NetworkMode").orEmpty()
     val isContainerMode = networkMode.startsWith("container:")
@@ -83,23 +115,50 @@ internal fun buildContainerConfig(
             when (key) {
                 "Image" -> {} // set explicitly below
                 "Hostname" -> if (!dropHostname) put(key, value)
-                "Env" -> sliceSubtract(value as? JsonArray, imageConfig?.arr("Env"))
-                    .let { if (it.isNotEmpty()) put("Env", it) }
-                "Entrypoint" ->
-                    if (!sliceEqual(value as? JsonArray, imageConfig?.arr("Entrypoint"))) put("Entrypoint", value)
-                "Cmd" -> {
-                    // Only drop Cmd when the Entrypoint also matched the image — otherwise a custom
-                    // entrypoint may rely on the image's Cmd as its arguments.
-                    val entrypointMatches = sliceEqual(containerConfig.arr("Entrypoint"), imageConfig?.arr("Entrypoint"))
-                    val cmdMatches = sliceEqual(value as? JsonArray, imageConfig?.arr("Cmd"))
-                    if (!(entrypointMatches && cmdMatches)) put("Cmd", value)
+                "Env" -> if (subtractImageDefaultsByKey) {
+                    envKeySubtract(value as? JsonArray, imageConfig?.arr("Env"))
+                } else {
+                    sliceSubtract(value as? JsonArray, imageConfig?.arr("Env"))
                 }
-                "Healthcheck" -> if (value != imageConfig?.get("Healthcheck")) put("Healthcheck", value)
-                "Labels" -> put("Labels", stringMapSubtract(value as? JsonObject, imageConfig?.obj("Labels")))
+                    .let { if (it.isNotEmpty()) put("Env", it) }
+                "Entrypoint" -> if (subtractImageDefaultsByKey) {
+                    if (!imageConfig.has("Entrypoint")) put("Entrypoint", value)
+                } else {
+                    if (!sliceEqual(value as? JsonArray, imageConfig?.arr("Entrypoint"))) put("Entrypoint", value)
+                }
+                "Cmd" -> {
+                    if (subtractImageDefaultsByKey) {
+                        if (!imageConfig.has("Cmd")) put("Cmd", value)
+                    } else {
+                        // Only drop Cmd when the Entrypoint also matched the image — otherwise a custom
+                        // entrypoint may rely on the image's Cmd as its arguments.
+                        val entrypointMatches = sliceEqual(containerConfig.arr("Entrypoint"), imageConfig?.arr("Entrypoint"))
+                        val cmdMatches = sliceEqual(value as? JsonArray, imageConfig?.arr("Cmd"))
+                        if (!(entrypointMatches && cmdMatches)) put("Cmd", value)
+                    }
+                }
+                "Healthcheck" -> if (subtractImageDefaultsByKey) {
+                    healthcheckSubtractKeys(value as? JsonObject, imageConfig?.obj("Healthcheck"))
+                } else {
+                    healthcheckSubtract(value as? JsonObject, imageConfig?.obj("Healthcheck"))
+                }.let { if (it.isNotEmpty()) put("Healthcheck", it) }
+                "Labels" -> if (subtractImageDefaultsByKey) {
+                    stringMapSubtractKeys(value as? JsonObject, imageConfig?.obj("Labels"))
+                } else {
+                    stringMapSubtract(value as? JsonObject, imageConfig?.obj("Labels"))
+                }.let { if (it.isNotEmpty()) put("Labels", it) }
                 "Volumes" -> structMapSubtract(value as? JsonObject, imageConfig?.obj("Volumes"))
                     .let { if (it.isNotEmpty()) put("Volumes", it) }
-                "WorkingDir" -> if (value != imageConfig?.get("WorkingDir")) put(key, value)
-                "User" -> if (value != imageConfig?.get("User")) put(key, value)
+                "WorkingDir" -> if (subtractImageDefaultsByKey) {
+                    if (!imageConfig.has("WorkingDir")) put(key, value)
+                } else {
+                    if (value != imageConfig?.get("WorkingDir")) put(key, value)
+                }
+                "User" -> if (subtractImageDefaultsByKey) {
+                    if (!imageConfig.has("User")) put(key, value)
+                } else {
+                    if (value != imageConfig?.get("User")) put(key, value)
+                }
                 "ExposedPorts" -> {} // handled after the loop together with PortBindings
                 else -> put(key, value)
             }
@@ -122,8 +181,16 @@ internal fun buildCreateBody(
     imageRef: String,
     oldId: String,
     firstNetwork: Pair<String, JsonObject>?,
+    subtractImageDefaultsByKey: Boolean = false,
 ): JsonObject = buildJsonObject {
-    buildContainerConfig(containerConfig, imageConfig, hostConfig, oldId, imageRef).forEach { (k, v) -> put(k, v) }
+    buildContainerConfig(
+        containerConfig,
+        imageConfig,
+        hostConfig,
+        oldId,
+        imageRef,
+        subtractImageDefaultsByKey,
+    ).forEach { (k, v) -> put(k, v) }
     if (hostConfig != null) put("HostConfig", hostConfig)
     if (firstNetwork != null) {
         buildJsonObject {
@@ -133,3 +200,9 @@ internal fun buildCreateBody(
         }
     }
 }
+
+private fun JsonObject?.has(key: String): Boolean =
+    this != null && key in this
+
+private fun JsonElement.envKey(): String? =
+    jsonPrimitive.contentOrNull?.substringBefore('=')
