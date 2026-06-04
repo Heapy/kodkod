@@ -6,10 +6,10 @@ cannot: **kodkod driving a real Docker daemon** — pulling images, recreating
 containers, ordering a stack, rolling back a failed update, restarting on a
 healthcheck, and refusing to touch itself.
 
-It is a **runbook**: a set of `docker compose` files under `e2e/`, each isolating
-one aspect, plus the exact commands and pass/fail checks for each. The verify
-steps are deterministic, so they can later be wrapped in an assertion script or a
-Testcontainers suite (see [Automating](#automating)).
+It is both a **runbook** and an assertion suite: the `docker compose` files under
+`e2e/` isolate each aspect, the sections below show the manual commands and
+pass/fail checks, and `e2e/bin/run.sh` executes those checks automatically (see
+[Automating](#automating)).
 
 ---
 
@@ -19,16 +19,15 @@ Some scenarios set `KODKOD_*_MONITOR_ALL=true`. In that mode kodkod acts on **ev
 running container on the daemon it talks to**, not just the test ones. **Do not run
 this suite against a Docker daemon that hosts anything you care about.**
 
-Use a disposable daemon. The simplest is Docker-in-Docker:
+Use a disposable daemon. The simplest path is the Docker-in-Docker wrapper:
 
 ```bash
-docker run --privileged -d --name kodkod-dind -p 5000:5000 docker:29-dind
-export DOCKER_HOST=tcp://127.0.0.1:2375   # if the dind daemon exposes TCP; otherwise:
-#   run the suite *inside* it:  docker exec -it kodkod-dind sh
+./e2e/bin/dind-e2e.sh
 ```
 
 or a throwaway VM / a dedicated Colima profile (`colima start kodkod-e2e`). Every
-artifact this suite creates is named `e2e-*`; `e2e/bin/cleanup.sh` removes them.
+artifact this suite creates is named `e2e-*`; `e2e/bin/cleanup.sh` removes them,
+and `e2e/bin/dind-e2e.sh` removes its dind container unless `KEEP=1` is set.
 
 ---
 
@@ -64,14 +63,35 @@ you need a registry whose tag you can move. So the harness runs a throwaway
 
 ## Quick start
 
+Fast path: run the assertion suite against an isolated Docker-in-Docker daemon.
+The host Docker daemon is used only to start the dind container; the build,
+registry, kodkod, and all test stacks run inside that disposable daemon.
+
+```bash
+# Run all scenarios, then remove the dind container
+./e2e/bin/dind-e2e.sh
+
+# Run only selected scenarios
+./e2e/bin/dind-e2e.sh update rollback
+
+# Keep the dind daemon for debugging or re-runs
+KEEP=1 ./e2e/bin/dind-e2e.sh self
+```
+
+`dind-e2e.sh` runs `setup.sh`, then `run.sh`, then `cleanup.sh`. With `KEEP=1`,
+it leaves the dind container up and prints the `DOCKER_HOST` to reuse.
+
+Manual path, useful when you are already on a disposable daemon and want to step
+through a scenario:
+
 ```bash
 # 1. Build kodkod:e2e, start the registry, publish testapp:latest = v1
 ./e2e/bin/setup.sh
 
-# 2. Run a scenario (example: the update happy-path)
-docker compose -f e2e/compose.update.yml up -d
-docker logs -f e2e-update-kodkod-1        # watch cycles; Ctrl-C to detach
-#    ...follow the scenario's steps below...
+# 2. Run the scripted assertions, or follow a scenario manually below
+./e2e/bin/run.sh update
+# docker compose -f e2e/compose.update.yml up -d
+# docker logs -f e2e-update-kodkod-1      # watch cycles; Ctrl-C to detach
 
 # 3. Tear everything down
 ./e2e/bin/cleanup.sh
@@ -98,7 +118,9 @@ quickly; "wait for a cycle" below means ~`interval + start_period + a few second
 | S  | **Self-protection** under monitor-all + custom hostname | 3 | `compose.self.yml` | no |
 | P  | **Digest-pinned** containers are skipped | — | `compose.digest.yml` | yes |
 
-A and S need no registry. The rest do — run `./e2e/bin/setup.sh` first.
+A and S need no registry when run manually. The rest do; run
+`./e2e/bin/setup.sh` first, or use `./e2e/bin/dind-e2e.sh` and let it prepare the
+whole suite.
 
 Helper for the registry scenarios: `e2e/bin/publish.sh {v1|v2|broken}` builds and
 pushes that variant to `testapp:latest`.
@@ -367,17 +389,31 @@ docker logs e2e-digest-kodkod-1 | grep -i 'digest-pinned'
 
 ## Automating
 
-The scenarios are written to be scriptable later, in increasing order of effort:
+The Bash assertion runner already exists:
 
-1. **Bash assert runner.** Each "Pass" check is a comparison; wrap the steps in a
-   function returning non-zero on mismatch and print a TAP/JUnit summary. Replace
-   the fixed `sleep`s with a poll loop (e.g. wait until `app.variant == v2` or a
-   timeout) for speed and reliability.
-2. **`bats`** for nicer reporting with the same commands.
-3. **Testcontainers (JVM)** in a separate Gradle source set (`integrationTest`)
-   that starts dind + registry as containers and asserts via the Docker API — runs
-   with `./gradlew integrationTest` and fits CI. Heaviest, but self-contained and
-   language-native.
+```bash
+./e2e/bin/run.sh                 # all scenarios against the current DOCKER_HOST
+./e2e/bin/run.sh update rollback # selected scenarios
+```
+
+`run.sh` assumes `setup.sh` has already built `kodkod:e2e`, started the local
+registry, and pushed `testapp:latest = v1`. It replaces fixed sleeps with poll
+loops where possible, prints per-check `PASS`/`FAIL` lines, and exits non-zero on
+any failed assertion.
+
+For CI or for local runs that must not touch the host Docker daemon, use the dind
+wrapper:
+
+```bash
+./e2e/bin/dind-e2e.sh                 # setup + run + cleanup in Docker-in-Docker
+./e2e/bin/dind-e2e.sh update rollback # same, but only selected scenarios
+KEEP=1 ./e2e/bin/dind-e2e.sh          # keep the daemon for debugging
+```
+
+Remaining automation work is reporting polish, not the runner itself: optional
+TAP/JUnit output for CI annotations, or a heavier Testcontainers/Gradle
+`integrationTest` source set if JVM-native assertions become worth the extra
+maintenance.
 
 CI note: the kodkod image build runs Gradle inside the build stage (minutes on a
 cold cache). Build `kodkod:e2e` once and cache it; keep `registry:2`/`busybox`
@@ -415,6 +451,8 @@ e2e/
   compose.self.yml          (S)      self-protection under monitor-all
   compose.digest.yml        (P)      digest-pinned skip
   bin/setup.sh                       build kodkod:e2e, start registry, push v1
+  bin/run.sh                         assertion runner for all or selected scenarios
+  bin/dind-e2e.sh                    isolated Docker-in-Docker wrapper around setup/run/cleanup
   bin/publish.sh {v1|v2|broken}      build+push a variant to testapp:latest
   bin/cleanup.sh                     tear everything down
 ```
