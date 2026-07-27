@@ -126,8 +126,21 @@ class KodkodE2eTest {
         waitUntil(90, "db updated to v2") { variant("e2e-deps-db-1") == "v2" }
         assertEquals("v2", variant("e2e-deps-db-1"))
         val dbStart = startedAt("e2e-deps-db-1")
+        // db being up is not the end of the cycle: the dependents only come back once db has passed its
+        // liveness gate, seconds later. Comparing timestamps the moment db appears races that window —
+        // the wait is what makes the ordering assertion mean "web restarted after db" rather than
+        // "web has not restarted yet".
+        waitUntil(90, "web restarted after db") { startedAt("e2e-deps-web-1") > dbStart }
+        // `cache` carries no `kodkod.depends-on` fallback: its edge exists only if kodkod parsed
+        // compose's `<service>:<condition>:<restart>` triple, and survives only if the `restart: false`
+        // compose puts there by default did not silence the dependent restart.
+        waitUntil(90, "cache restarted after db (compose depends_on label only)") {
+            startedAt("e2e-deps-cache-1") > dbStart
+        }
         val webStart = startedAt("e2e-deps-web-1")
+        val cacheStart = startedAt("e2e-deps-cache-1")
         assertTrue(webStart > dbStart, "web should restart after db; db=$dbStart web=$webStart")
+        assertTrue(cacheStart > dbStart, "cache should restart after db; db=$dbStart cache=$cacheStart")
     }
 
     @Test

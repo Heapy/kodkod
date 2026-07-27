@@ -57,6 +57,25 @@ data class Config(
      * and restores the retry-every-cycle behaviour.
      */
     val updateFailureCooldown: Long,
+    /**
+     * `KODKOD_DEPENDENCY_HEALTH_TIMEOUT` — how many seconds a container waits for a dependency compose
+     * marked `condition: service_healthy` to actually become healthy before it is started anyway. The
+     * condition is about ordering, so the wait must be bounded: a dependency that never passes its
+     * healthcheck may delay its dependents, never keep them down (and never stall the whole cycle,
+     * which also drives every *other* container's update). `0` means "check once and carry on".
+     */
+    val dependencyHealthTimeout: Long,
+    /**
+     * `KODKOD_RESPECT_DEPENDS_ON_RESTART` — whether `depends_on[*].restart: false` suppresses the
+     * restart of a dependent. Off by default, deliberately: compose's field governs whether
+     * `docker compose restart` propagates, while kodkod *replaces* the dependency with a new container
+     * holding a new IP — the case where a dependent usually does need to be restarted. And since
+     * `restart: false` is compose's own default, obeying it by default would turn kodkod's documented
+     * dependent-restart into a no-op for essentially every stack. Even when this is on, the flag can
+     * only suppress a plain restart: a create-time dependent (`--link` / `network_mode: container:`) is
+     * always recreated, since leaving it be would leave it on a dead network namespace.
+     */
+    val respectDependsOnRestart: Boolean,
     val registryAuth: String?,
     /**
      * `KODKOD_SHUTDOWN_GRACE` — how many seconds a stopping kodkod gives the cycle in flight to
@@ -95,6 +114,8 @@ data class Config(
                 updateVerifySeconds = long("KODKOD_UPDATE_VERIFY_SECONDS", 15).coerceAtLeast(0),
                 updateVerifyHealth = bool("KODKOD_UPDATE_VERIFY_HEALTH", true),
                 updateFailureCooldown = long("KODKOD_UPDATE_FAILURE_COOLDOWN", 21600).coerceAtLeast(0),
+                dependencyHealthTimeout = long("KODKOD_DEPENDENCY_HEALTH_TIMEOUT", 120).coerceAtLeast(0),
+                respectDependsOnRestart = bool("KODKOD_RESPECT_DEPENDS_ON_RESTART", false),
                 registryAuth = get("KODKOD_REGISTRY_AUTH")?.takeIf { it.isNotBlank() },
                 shutdownGrace = long("KODKOD_SHUTDOWN_GRACE", 30).coerceAtLeast(0),
             ).also {

@@ -89,6 +89,82 @@ class UpdaterGraphTest {
     }
 
     @Test
+    fun parseDependsOn_reads_all_three_fields() {
+        val edges = parseDependsOn("db:service_healthy:true,cache:service_started:false")
+        assertEquals(listOf("db", "cache"), edges.map { it.service })
+        assertEquals(listOf("service_healthy", "service_started"), edges.map { it.condition })
+        assertEquals(listOf(true, false), edges.map { it.restart })
+    }
+
+    @Test
+    fun parseDependsOn_tolerates_labels_with_fewer_fields() {
+        // Older compose versions emit fewer fields; a missing `restart` is "compose said nothing",
+        // which must not read as the explicit `false` that can suppress a dependent's restart.
+        assertEquals("service_healthy", parseDependsOn("db:service_healthy").single().condition)
+        assertNull(parseDependsOn("db:service_healthy").single().restart)
+        assertEquals("service_started", parseDependsOn("db").single().condition)
+        assertNull(parseDependsOn("db").single().restart)
+        assertNull(parseDependsOn("db:service_started:maybe").single().restart, "an unparsable flag is no flag")
+        assertTrue(parseDependsOn("").isEmpty(), "compose stamps an empty label on a service with no deps")
+        assertTrue(parseDependsOn(null).isEmpty())
+    }
+
+    @Test
+    fun resolveLinks_keeps_the_condition_and_the_restart_flag_of_each_edge() {
+        val db = target("db", "proj-db", project = "proj", service = "db")
+        val cache = target("cache", "proj-cache", project = "proj", service = "cache")
+        val web = target(
+            "web", "proj-web", project = "proj", service = "web",
+            labels = """{"com.docker.compose.depends_on":"db:service_healthy:false,cache:service_started:true"}""",
+        )
+        resolveLinks(listOf(web, db, cache), "kodkod")
+        assertEquals(setOf("db", "cache"), web.deps)
+        assertEquals(setOf("db"), web.healthGatedDeps, "only the service_healthy edge is gated on health")
+        assertEquals(setOf("db"), web.noRestartDeps, "only the restart: false edge may ever be suppressed")
+    }
+
+    @Test
+    fun propagateLinkedRestart_obeys_restart_false_only_when_asked_to() {
+        fun graph(): Pair<Target, Target> {
+            val a = target("a", "a")
+            val b = target("b", "b")
+            b.deps = setOf("a")
+            b.noRestartDeps = setOf("a")
+            a.stale = true
+            return a to b
+        }
+
+        val (byDefault, dependentByDefault) = graph()
+        propagateLinkedRestart(listOf(byDefault, dependentByDefault))
+        assertTrue(
+            dependentByDefault.toRestart,
+            "restart: false is compose's default; obeying it by default would make kodkod's dependent " +
+                "restart a no-op for nearly every stack",
+        )
+
+        val (respected, dependentRespected) = graph()
+        propagateLinkedRestart(listOf(respected, dependentRespected), respectDependsOnRestart = true)
+        assertFalse(dependentRespected.toRestart, "with the flag on the operator asked for compose's semantics")
+    }
+
+    @Test
+    fun propagateLinkedRestart_never_lets_restart_false_suppress_a_recreate() {
+        val a = target("a", "a")
+        val b = target("b", "b")
+        b.deps = setOf("a")
+        b.createTimeDeps = setOf("a") // shares a's network namespace
+        b.noRestartDeps = setOf("a")
+        a.stale = true
+
+        propagateLinkedRestart(listOf(a, b), respectDependsOnRestart = true)
+
+        assertTrue(
+            b.linkedToRecreate,
+            "suppressing a create-time edge would leave b attached to a namespace that no longer exists",
+        )
+    }
+
+    @Test
     fun resolveLinks_falls_back_to_label_and_links() {
         val a = target("a", "a")
         val b = target("b", "b", labels = """{"kodkod.depends-on":"a"}""")

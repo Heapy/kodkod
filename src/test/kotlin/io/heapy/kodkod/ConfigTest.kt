@@ -28,6 +28,8 @@ class ConfigTest {
         assertEquals(15, c.updateVerifySeconds)
         assertTrue(c.updateVerifyHealth)
         assertEquals(21600, c.updateFailureCooldown)
+        assertEquals(120, c.dependencyHealthTimeout)
+        assertFalse(c.respectDependsOnRestart)
         assertNull(c.registryAuth)
         assertEquals(30, c.shutdownGrace)
     }
@@ -81,6 +83,34 @@ class ConfigTest {
         assertEquals(
             21600, Config.fromEnv(env("KODKOD_UPDATE_FAILURE_COOLDOWN" to "a while")).updateFailureCooldown,
             "an unparseable value falls back to the default rather than to retrying an outage every cycle",
+        )
+    }
+
+    @Test
+    fun reads_the_dependency_health_timeout() {
+        assertEquals(
+            30, Config.fromEnv(env("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "30")).dependencyHealthTimeout,
+        )
+        assertEquals(
+            0, Config.fromEnv(env("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "0")).dependencyHealthTimeout,
+            "0 is legal: check the dependency's health once and carry on",
+        )
+        assertEquals(
+            0, Config.fromEnv(env("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "-5")).dependencyHealthTimeout,
+            "a negative bound cannot mean \"wait backwards\" — it degrades to a single check",
+        )
+        assertEquals(
+            120, Config.fromEnv(env("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "a while")).dependencyHealthTimeout,
+            "an unparseable value falls back to the default rather than to an unbounded wait",
+        )
+    }
+
+    @Test
+    fun reads_whether_the_depends_on_restart_flag_is_respected() {
+        assertTrue(Config.fromEnv(env("KODKOD_RESPECT_DEPENDS_ON_RESTART" to "true")).respectDependsOnRestart)
+        assertFalse(
+            Config.fromEnv(env("KODKOD_RESPECT_DEPENDS_ON_RESTART" to "nonsense")).respectDependsOnRestart,
+            "obeying compose's default (restart: false) would make the dependent restart a no-op",
         )
     }
 

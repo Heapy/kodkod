@@ -53,6 +53,8 @@ class UpdaterTest {
         verifySeconds: String? = null,
         verifyHealth: Boolean? = null,
         failureCooldown: String? = null,
+        dependencyHealthTimeout: String? = null,
+        respectDependsOnRestart: Boolean? = null,
     ): Config =
         Config.fromEnv(
             buildMap {
@@ -62,6 +64,8 @@ class UpdaterTest {
                 verifySeconds?.let { put("KODKOD_UPDATE_VERIFY_SECONDS", it) }
                 verifyHealth?.let { put("KODKOD_UPDATE_VERIFY_HEALTH", it.toString()) }
                 failureCooldown?.let { put("KODKOD_UPDATE_FAILURE_COOLDOWN", it) }
+                dependencyHealthTimeout?.let { put("KODKOD_DEPENDENCY_HEALTH_TIMEOUT", it) }
+                respectDependsOnRestart?.let { put("KODKOD_RESPECT_DEPENDS_ON_RESTART", it.toString()) }
             }::get,
         )
 
@@ -790,6 +794,137 @@ class UpdaterTest {
         assertFalse(docker.ops.contains("create:web"), "web only depends on db; it is restarted, not recreated: ${docker.ops}")
     }
 
+    // --- compose depends_on: condition and restart ----------------------------------------
+
+    /**
+     * db + web wired the way a compose stack is wired: **no** `kodkod.depends-on` fallback label, so the
+     * only thing that can produce the edge is the `<service>:<condition>:<restart>` entry compose stamps
+     * into `com.docker.compose.depends_on`. db's image moves, web's does not.
+     */
+    private fun composeDependentWeb(docker: FakeDockerClient, dependsOn: String, webHostConfig: String = "{}") {
+        docker.container(
+            id = "db", imageRef = "db:1", currentImageId = "sha256:db-old",
+            labels = """{"com.docker.compose.project":"proj","com.docker.compose.service":"db"}""",
+        )
+        docker.container(
+            id = "web", imageRef = "web:1", currentImageId = "sha256:web-old",
+            labels = """{"com.docker.compose.project":"proj","com.docker.compose.service":"web",""" +
+                """"com.docker.compose.depends_on":"$dependsOn"}""",
+            hostConfig = webHostConfig,
+        )
+        docker.distribution["db:1"] = "sha256:db-remote"
+        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
+        docker.distribution["web:1"] = "sha256:web-remote"
+        docker.images["sha256:web-old"] =
+            json("""{"Id":"sha256:web-old","Config":{},"RepoDigests":["web@sha256:web-remote"]}""")
+    }
+
+    @Test
+    fun a_dependency_with_condition_service_healthy_is_awaited_before_its_dependent_starts() {
+        val docker = FakeDockerClient()
+        composeDependentWeb(docker, dependsOn = "db:service_healthy:true")
+        // The replacement's healthcheck only passes after a while — `starting` until then.
+        val daemon = HealthFlip(docker, target = "new-db-0", startingProbes = 6)
+
+        updater(daemon, config(verifyHealth = false)).runOnce()
+
+        assertEquals(
+            "healthy", daemon.healthWhenStarted["web"],
+            "condition: service_healthy means web may not be started while db is still starting",
+        )
+        assertTrue(docker.ops.contains("start:web"), "web still has to come back: ${docker.ops}")
+    }
+
+    @Test
+    fun condition_service_started_is_satisfied_by_the_dependency_being_started() {
+        val docker = FakeDockerClient()
+        composeDependentWeb(docker, dependsOn = "db:service_started:false")
+        docker.health["new-db-0"] = "starting" // never becomes healthy, and nothing may wait for it
+
+        val log = captureLog { updater(docker, config(verifyHealth = false)).runOnce() }
+
+        assertFalse(
+            log.contains("waiting for db"),
+            "service_started asks for a started dependency, not a healthy one: $log",
+        )
+        assertTrue(docker.ops.contains("start:web"), "web has to come back right away: ${docker.ops}")
+    }
+
+    @Test
+    fun a_dependency_that_never_becomes_healthy_only_delays_its_dependent() {
+        val docker = FakeDockerClient()
+        composeDependentWeb(docker, dependsOn = "db:service_healthy:false")
+        docker.health["new-db-0"] = "starting" // the healthcheck never passes
+
+        val log = captureLog {
+            updater(docker, config(verifyHealth = false, dependencyHealthTimeout = "5")).runOnce()
+        }
+
+        assertTrue(log.contains("did not become healthy within 5s"), "the bound has to be visible: $log")
+        assertTrue(
+            docker.ops.contains("start:web"),
+            "the wait is a bound on ordering, not a licence to abandon the dependent: ${docker.ops}",
+        )
+        assertTrue(
+            clock.sleeps.count { it == 500L } >= 10,
+            "5s of waiting at a 500ms probe interval is 10 sleeps: ${clock.sleeps}",
+        )
+    }
+
+    @Test
+    fun a_health_gated_dependency_without_a_healthcheck_is_not_waited_for() {
+        val docker = FakeDockerClient()
+        composeDependentWeb(docker, dependsOn = "db:service_healthy:false")
+        // No `health` entry at all: the shape of a container whose image declares no healthcheck.
+
+        val log = captureLog { updater(docker, config(verifyHealth = false)).runOnce() }
+
+        assertTrue(log.contains("declares no healthcheck"), "waiting 120s for a health that never comes: $log")
+        assertTrue(docker.ops.contains("start:web"), "web has to come back: ${docker.ops}")
+    }
+
+    @Test
+    fun by_default_a_restart_false_edge_still_restarts_the_dependent() {
+        val docker = FakeDockerClient()
+        composeDependentWeb(docker, dependsOn = "db:service_started:false")
+
+        updater(docker).runOnce()
+
+        assertOrder(docker.ops, "stop:web", "stop:db", "create:db", "start:web")
+    }
+
+    @Test
+    fun with_the_restart_flag_respected_a_restart_false_edge_leaves_the_dependent_alone() {
+        val docker = FakeDockerClient()
+        composeDependentWeb(docker, dependsOn = "db:service_started:false")
+
+        updater(docker, config(respectDependsOnRestart = true)).runOnce()
+
+        assertTrue(docker.ops.contains("create:db"), "db itself still has to be updated: ${docker.ops}")
+        assertTrue(
+            docker.ops.none { it.endsWith(":web") },
+            "compose said restart: false and the operator asked kodkod to obey it: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun the_restart_flag_never_suppresses_a_netns_dependent() {
+        val docker = FakeDockerClient()
+        // web shares db's network namespace: a restart is not enough, it has to be recreated against
+        // the replacement — leaving it alone would leave it on a dead namespace.
+        composeDependentWeb(
+            docker, dependsOn = "db:service_started:false",
+            webHostConfig = """{"NetworkMode":"container:db"}""",
+        )
+
+        updater(docker, config(respectDependsOnRestart = true)).runOnce()
+
+        assertTrue(
+            docker.ops.contains("create:web"),
+            "restart: false may only suppress a restart, never a create-time edge: ${docker.ops}",
+        )
+    }
+
     // --- bringing dependents back ---------------------------------------------------------
 
     /** db's image moved; web is up to date but depends on db, so web is stopped and started again. */
@@ -1009,6 +1144,30 @@ private class FlakyStart(
             times--
             throw DockerException(500, "fake: transient start failure for '$id'")
         }
+        delegate.start(id)
+    }
+}
+
+/**
+ * A [FakeDockerClient] whose [target] reports `starting` for its first [startingProbes] inspects and
+ * `healthy` from then on — a container whose healthcheck takes a while to pass, which the static
+ * [FakeDockerClient.health] map cannot express. [healthWhenStarted] records what [target] reported at
+ * the moment each container was started, which is exactly what "waited for it" comes down to.
+ */
+private class HealthFlip(
+    private val delegate: FakeDockerClient,
+    private val target: String,
+    private var startingProbes: Int,
+) : DockerClient by delegate {
+    val healthWhenStarted = mutableMapOf<String, String?>()
+
+    override fun inspectContainer(id: String): JsonObject {
+        if (id == target) delegate.health[target] = if (startingProbes-- > 0) "starting" else "healthy"
+        return delegate.inspectContainer(id)
+    }
+
+    override fun start(id: String) {
+        healthWhenStarted[id] = delegate.health[target]
         delegate.start(id)
     }
 }

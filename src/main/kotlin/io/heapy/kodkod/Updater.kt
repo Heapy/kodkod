@@ -24,6 +24,11 @@ import java.time.Instant
  * refreshes their references. Containers pinned to a digest (`image@sha256:...`) are never stale but can
  * still be restarted or recreated as a dependent.
  *
+ * Compose's `depends_on` carries a condition and a `restart` flag per edge. `condition: service_healthy`
+ * is always honoured — a dependent waits for its dependency's healthcheck to pass, bounded by
+ * `KODKOD_DEPENDENCY_HEALTH_TIMEOUT` — while `restart: false` is obeyed only under
+ * `KODKOD_RESPECT_DEPENDS_ON_RESTART` (see [Config.respectDependsOnRestart]).
+ *
  * A replacement container is watched for a short window after `start` (see `verifyStarted`) and the
  * container and image it replaced are destroyed only once it has proven it stays up. An update that
  * failed that gate is remembered for `KODKOD_UPDATE_FAILURE_COOLDOWN` so a broken `:latest` costs one
@@ -151,7 +156,7 @@ class Updater(
         if (targets.isEmpty()) return
 
         markStale(targets)
-        propagateLinkedRestart(targets)
+        propagateLinkedRestart(targets, config.respectDependsOnRestart)
         if (targets.none { it.toRestart }) {
             Log.info("update: all monitored containers are up to date")
             return
@@ -170,13 +175,75 @@ class Updater(
         }
         // Bring everything back in dependency order: recreate stale/create-time-linked containers,
         // restart ordinary dependents.
+        val byId = targets.associateBy { it.id }
         for (target in ordered) {
             if (!target.toRestart) continue
+            awaitHealthyDependencies(target, byId)
             try {
                 if (target.toRecreate) recreate(target) else startDependent(target)
             } catch (e: Exception) {
                 Log.error("[${target.name}] ${if (target.toRecreate) "recreate" else "restart"} failed: ${e.message}")
             }
+        }
+    }
+
+    /**
+     * Hold [target] back until every dependency compose marked `condition: service_healthy` reports
+     * healthy. Compose's own `up` does this, and a dependent started against a database that is up but
+     * still replaying its log is exactly what the condition exists to prevent.
+     *
+     * Only dependencies *this cycle* brought back are waited for. One it did not touch has been running
+     * since before the cycle: its health is not something this ordering can influence, and blocking on
+     * it would stall every cycle of a stack that has one permanently unhealthy service — including the
+     * updates of all the other containers.
+     */
+    private fun awaitHealthyDependencies(target: Target, byId: Map<String, Target>) {
+        for (depId in target.healthGatedDeps) {
+            val dep = byId[depId] ?: continue
+            if (dep.toRestart) awaitHealthy(target, dep)
+        }
+    }
+
+    /**
+     * Wait for [dep] to report healthy, for at most [Config.dependencyHealthTimeout]. Every exit is a
+     * *start*: the condition orders the two containers, and a dependency that never goes healthy must
+     * cost its dependent a delay, not an outage — so the timeout is loud and then proceeds.
+     */
+    private fun awaitHealthy(target: Target, dep: Target) {
+        val deadline = clock.millis() + config.dependencyHealthTimeout * 1000L
+        var announced = false
+        while (true) {
+            val state = runCatching { api.inspectContainer(dep.liveId).obj("State") }
+                .onFailure { Log.warn("[${target.name}] could not read the health of ${dep.name}: ${it.message}") }
+                .getOrNull()
+            // No `Health` at all means the image declares no healthcheck, so `healthy` is a state this
+            // container can never reach: compose would have refused the stack, and waiting out the whole
+            // timeout on every cycle is a self-inflicted delay with no possible payoff.
+            if (state != null && state.obj("Health") == null) {
+                Log.warn(
+                    "[${target.name}] depends on ${dep.name} with condition $CONDITION_SERVICE_HEALTHY, but its " +
+                        "image declares no healthcheck — starting without waiting",
+                )
+                return
+            }
+            val health = state?.healthStatus()
+            if (health == "healthy") {
+                if (announced) Log.info("[${target.name}] ${dep.name} is healthy — starting")
+                return
+            }
+            if (clock.millis() >= deadline) {
+                Log.error(
+                    "[${target.name}] ${dep.name} did not become healthy within " +
+                        "${config.dependencyHealthTimeout}s (health: ${health ?: "unknown"}) — starting anyway, " +
+                        "the depends_on condition can delay this container but not keep it down",
+                )
+                return
+            }
+            if (!announced) {
+                Log.info("[${target.name}] waiting for ${dep.name} to become healthy (health: ${health ?: "unknown"})")
+                announced = true
+            }
+            sleeper.sleep(PROBE_INTERVAL_MS)
         }
     }
 
@@ -442,6 +509,9 @@ class Updater(
                 stranded = discardReplacement(name, newId)
                 throw e
             }
+            // The replacement is what serves this target from here on: a dependent waiting for it to
+            // become healthy has to probe the new container, not the one about to be removed.
+            target.liveId = newId
             // The image proved it can run here, so whatever this container was suppressed for is history.
             failedUpdates.remove(target.id)
             if (target.stale) {
@@ -806,6 +876,22 @@ internal class Target(
     /** Dependency ids that are baked into create-time config (`--link` or `network_mode: container:`). */
     var createTimeDeps: Set<String> = emptySet()
 
+    /** Dependency ids compose marked `condition: service_healthy` — awaited before this one starts. */
+    var healthGatedDeps: Set<String> = emptySet()
+
+    /**
+     * Dependency ids whose compose edge says `restart: false`. Only consulted when
+     * [Config.respectDependsOnRestart] is on, and even then only for a plain restart.
+     */
+    var noRestartDeps: Set<String> = emptySet()
+
+    /**
+     * The container id serving this target right now: its own until a recreate replaced it, the
+     * replacement's after that. Anything looking at a *dependency* mid-cycle (the `service_healthy`
+     * wait) has to read the container that is actually running, not the one that was removed.
+     */
+    var liveId: String = id
+
     /** Name captured before updates for `HostConfig.NetworkMode=container:<id|name>`. */
     var networkModeContainerName: String? = null
 
@@ -846,16 +932,21 @@ internal fun resolveLinks(
     for (target in targets) {
         val deps = LinkedHashSet<String>()
         val createTimeDeps = LinkedHashSet<String>()
+        val healthGatedDeps = LinkedHashSet<String>()
+        val noRestartDeps = LinkedHashSet<String>()
         fun addDep(depId: String?, createTime: Boolean = false) {
             if (depId != null && depId != target.id) deps += depId
             if (createTime && depId != null && depId != target.id) createTimeDeps += depId
         }
 
-        // Compose metadata: entries look like "db:service_started:true" — take the service name.
-        target.composeLabels.label("com.docker.compose.depends_on")?.splitToSequence(',')?.forEach { entry ->
-            val service = entry.substringBefore(':').trim()
-            val project = target.composeProject
-            if (service.isNotEmpty() && project != null) addDep(byService[serviceKey(project, service)])
+        // Compose metadata: "db:service_started:false" — all three fields carry meaning.
+        for (edge in parseDependsOn(target.composeLabels.label("com.docker.compose.depends_on"))) {
+            val project = target.composeProject ?: continue
+            val depId = byService[serviceKey(project, edge.service)] ?: continue
+            if (depId == target.id) continue
+            addDep(depId)
+            if (edge.condition == CONDITION_SERVICE_HEALTHY) healthGatedDeps += depId
+            if (edge.restart == false) noRestartDeps += depId
         }
         // Explicit kodkod label for non-compose users: container names (or service names).
         target.composeLabels.label("$ns.depends-on")?.splitToSequence(',')?.forEach { token ->
@@ -876,25 +967,60 @@ internal fun resolveLinks(
         }
         target.deps = deps
         target.createTimeDeps = createTimeDeps
+        target.healthGatedDeps = healthGatedDeps
+        target.noRestartDeps = noRestartDeps
     }
 }
+
+/** One parsed `com.docker.compose.depends_on` entry. */
+internal class DependsOnEdge(
+    val service: String,
+    /** `service_started` (compose's default and what a field-less entry means), `service_healthy`, … */
+    val condition: String,
+    /** compose's `restart` field, or `null` when the label does not carry one. */
+    val restart: Boolean?,
+)
+
+/**
+ * Parse a `com.docker.compose.depends_on` label: a comma-separated list of
+ * `<service>[:<condition>[:<restart>]]`. Older compose versions emit fewer fields, so a missing
+ * condition reads as `service_started` and a missing (or unparsable) `restart` stays `null` —
+ * "compose said nothing", which is not the same as the explicit `false` that may suppress a restart.
+ */
+internal fun parseDependsOn(label: String?): List<DependsOnEdge> =
+    label?.split(',')?.mapNotNull { entry ->
+        val fields = entry.split(':').map { it.trim() }
+        fields[0].takeIf { it.isNotEmpty() }?.let { service ->
+            DependsOnEdge(
+                service = service,
+                condition = fields.getOrNull(1)?.takeIf { it.isNotEmpty() } ?: CONDITION_SERVICE_STARTED,
+                restart = fields.getOrNull(2)?.lowercase()?.toBooleanStrictOrNull(),
+            )
+        }
+    } ?: emptyList()
 
 /**
  * Mark every container that depends (transitively) on a restarting container as restarting too. A
  * fixpoint loop so chains `c -> b -> a` propagate fully (watchtower's `UpdateImplicitRestart` is a
  * single pass).
+ *
+ * With [respectDependsOnRestart] on, an edge compose marked `restart: false` no longer propagates a
+ * plain restart (see [Config.respectDependsOnRestart]). It can never stop a *recreate*: create-time
+ * dependents are decided from [Target.createTimeDeps], which this subtraction does not touch, so a
+ * netns consumer is never left pointing at a namespace that no longer exists.
  */
-internal fun propagateLinkedRestart(targets: List<Target>) {
+internal fun propagateLinkedRestart(targets: List<Target>, respectDependsOnRestart: Boolean = false) {
     val byId = targets.associateBy { it.id }
     var changed = true
     while (changed) {
         changed = false
         for (target in targets) {
+            val restartDeps = if (respectDependsOnRestart) target.deps - target.noRestartDeps else target.deps
             if (!target.toRecreate && target.createTimeDeps.any { byId[it]?.toRestart == true }) {
                 target.linkedToRecreate = true
                 changed = true
             }
-            if (!target.toRestart && target.deps.any { byId[it]?.toRestart == true }) {
+            if (!target.toRestart && restartDeps.any { byId[it]?.toRestart == true }) {
                 target.linkedToRestarting = true
                 changed = true
             }
@@ -980,6 +1106,12 @@ internal fun JsonObject.repoTags(): Set<String> =
 
 /** `docker images` shows an untagged image this way, and some engines put it in `RepoTags` too. */
 private const val NO_TAG = "<none>:<none>"
+
+/** compose's default `depends_on` condition: the dependency merely has to have been started. */
+private const val CONDITION_SERVICE_STARTED = "service_started"
+
+/** compose's `depends_on` condition that asks for a dependency whose healthcheck actually passes. */
+private const val CONDITION_SERVICE_HEALTHY = "service_healthy"
 
 private fun serviceKey(project: String, service: String) = project + '\u0000' + service
 

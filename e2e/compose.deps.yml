@@ -23,6 +23,19 @@ services:
       # Fallback for compose versions that don't emit com.docker.compose.depends_on:
       kodkod.depends-on: "db"
 
+  # Same edge as `web`, but WITHOUT the fallback label: the only thing that can order this service
+  # after db is the `com.docker.compose.depends_on` value compose stamps on it, which is a
+  # `<service>:<condition>:<restart>` triple (`db:service_started:false`). With `web` carrying both
+  # labels the edge survives even if the triple is misparsed, so this service is what proves the
+  # parsing — and that compose's default `restart: false` does not silence kodkod by default.
+  cache:
+    image: busybox:1.36
+    command: ["sh", "-c", "echo '[cache] started'; while true; do sleep 1; done"]
+    depends_on:
+      - db
+    labels:
+      kodkod.update.enable: "true"
+
   kodkod:
     image: kodkod:e2e
     volumes:

@@ -642,19 +642,33 @@ max-adversarial ревью репозитория дало 15 подтвержд
 - Modify: `src/test/kotlin/io/heapy/kodkod/ConfigTest.kt`
 - Modify: `e2e/compose.deps.yml`
 
-- [ ] тест-на-баг: `db:service_healthy:true` → `web` стартует только после того, как `db` стал healthy
+- [x] тест-на-баг: `db:service_healthy:true` → `web` стартует только после того, как `db` стал healthy
       (сейчас третье и второе поля отбрасываются `substringBefore(':')`)
-- [ ] тест-на-баг: при `KODKOD_RESPECT_DEPENDS_ON_RESTART=true` и `db:service_started:false` → `web` не рестартуется
-- [ ] распарсить все три поля лейбла в `resolveLinks`, сохранить условие и флаг restart на ребро
-- [ ] соблюдать `condition: service_healthy` всегда: ждать здоровья зависимости перед стартом зависимых с
+      (`a_dependency_with_condition_service_healthy_is_awaited_before_its_dependent_starts`)
+- [x] тест-на-баг: при `KODKOD_RESPECT_DEPENDS_ON_RESTART=true` и `db:service_started:false` → `web` не рестартуется
+      (`with_the_restart_flag_respected_a_restart_false_edge_leaves_the_dependent_alone`)
+- [x] распарсить все три поля лейбла в `resolveLinks`, сохранить условие и флаг restart на ребро
+      (`parseDependsOn` + `DependsOnEdge`; `Target.healthGatedDeps` / `Target.noRestartDeps`)
+- [x] соблюдать `condition: service_healthy` всегда: ждать здоровья зависимости перед стартом зависимых с
       ограничением `KODKOD_DEPENDENCY_HEALTH_TIMEOUT` (default 120s) и понятным логом при истечении
-- [ ] флаг `restart` подчиняется только при `KODKOD_RESPECT_DEPENDS_ON_RESTART=true` (default `false` — см.
+      (`awaitHealthyDependencies`/`awaitHealthy`, инъектированные `TimeSource`/`Sleeper`; ждём только
+      зависимости, которые сам цикл перезапустил, и не ждём вовсе, если у зависимости нет healthcheck'а —
+      иначе постоянно unhealthy сервис тормозил бы каждый цикл на весь таймаут)
+- [x] флаг `restart` подчиняется только при `KODKOD_RESPECT_DEPENDS_ON_RESTART=true` (default `false` — см.
       решение в Solution Overview) и **только** для `linkedToRestarting`, никогда для `linkedToRecreate`
-- [ ] добавить в `e2e/compose.deps.yml` сервис **без** fallback-лейбла `kodkod.depends-on` (сейчас `web` несёт и
+- [x] добавить в `e2e/compose.deps.yml` сервис **без** fallback-лейбла `kodkod.depends-on` (сейчас `web` несёт и
       его, поэтому ребро сохраняется независимо от парсинга и сценарий не проверяет новый код)
-- [ ] тесты: `service_started` не ждёт; `service_healthy` ждёт; таймаут ожидания логируется и не роняет цикл;
+      (сервис `cache` + проверка `cacheStart > dbStart` в `KodkodE2eTest`; рекордер поднимает только `db`/`web`,
+      поэтому корпус фикстур не затронут)
+- [x] тесты: `service_started` не ждёт; `service_healthy` ждёт; таймаут ожидания логируется и не роняет цикл;
       двухполевой формат лейбла не ломает парсер; `restart=false` не подавляет netns-ребро
-- [ ] прогнать тесты (ops в replay-сценарии `deps-ordered` не меняются — дефолт `RESPECT_DEPENDS_ON_RESTART=false`)
+- [x] прогнать тесты (ops в replay-сценарии `deps-ordered` не меняются — дефолт `RESPECT_DEPENDS_ON_RESTART=false`)
+      (`./gradlew test` 194/194 и `compileE2eTestKotlin` — зелёные, фикстуры не перезаписывались; e2e-сценарий
+      `deps` прогнан на DinD — зелёный)
+- [x] ➕ починен false-positive в e2e-сценарии `deps` (не в исходном объёме, `KodkodE2eTest.kt`): проверка
+      `webStart > dbStart` сравнивала таймстемпы сразу после появления обновлённого `db`, тогда как зависимые
+      возвращаются только после liveness-гейта (задача 10) — тест падал на гонке, а не на упорядочивании.
+      Теперь перед сравнением есть `waitUntil` на факт рестарта каждого зависимого
 
 ### Task 18: Create-time зависимые за пределами мониторимого набора
 
