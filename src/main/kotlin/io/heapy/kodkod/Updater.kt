@@ -271,8 +271,7 @@ class Updater(
                 Log.warn("[$name] could not remove old container $backupName: ${e.message}")
             }
             if (config.updateCleanup && target.currentImageId.isNotEmpty()) {
-                // Best-effort: the old image is often still referenced; ignore failures.
-                runCatching { api.removeImage(target.currentImageId) }
+                pruneOldImage(name, target.currentImageId, imageRef)
             }
         } catch (e: Exception) {
             // Any failure after we stopped the container must restore the original, running container.
@@ -409,6 +408,36 @@ class Updater(
     /** How long the graceful stop will really take: the override, else the container's own timeout. */
     private fun effectiveStopTimeout(target: Target): Int? =
         stopTimeout(target) ?: target.inspect.obj("Config")?.str("StopTimeout")?.toIntOrNull()
+
+    /**
+     * Delete the image [imageId] the container was running — but only once we know nobody else names
+     * it. `DELETE /images/<id>` is refused with 409 while **two or more** tags point at the image, so
+     * the case that needs guarding is exactly **one** tag left over: `app:1.26` still on the old image
+     * after `app:latest` moved to the new one. That delete succeeds and silently takes the operator's
+     * pinned rollback tag with it, which is why the tags are read first and any tag other than the ref
+     * we just updated ([updatedRef]) cancels the prune.
+     *
+     * An image we cannot inspect is left in place: a stale image costs disk, an untagged one costs a
+     * rollback path.
+     */
+    private fun pruneOldImage(name: String, imageId: String, updatedRef: String) {
+        val tags = try {
+            api.inspectImage(imageId).repoTags()
+        } catch (e: Exception) {
+            Log.warn("[$name] could not inspect old image ${imageId.shortId()} — keeping it: ${e.message}")
+            return
+        }
+        val foreignTags = tags - normalizeImageRef(updatedRef)
+        if (foreignTags.isNotEmpty()) {
+            Log.info("[$name] keeping old image ${imageId.shortId()} — still tagged ${foreignTags.joinToString(", ")}")
+            return
+        }
+        try {
+            api.removeImage(imageId)
+        } catch (e: Exception) {
+            Log.warn("[$name] could not remove old image ${imageId.shortId()}: ${e.message}")
+        }
+    }
 
     private fun inspectOldImageConfig(target: Target): JsonObject? =
         if (target.currentImageId.isEmpty()) {
@@ -580,6 +609,9 @@ internal fun topoSort(targets: List<Target>): List<Target> {
     return result
 }
 
+/** `repo:tag`, with the implicit `:latest` spelled out so a ref compares equal to a `RepoTags` entry. */
+internal fun normalizeImageRef(ref: String): String = splitImageRef(ref).let { (repo, tag) -> "$repo:$tag" }
+
 /** Split `registry:5000/repo:tag` into (`registry:5000/repo`, `tag`), defaulting the tag to `latest`. */
 internal fun splitImageRef(ref: String): Pair<String, String> {
     val lastSlash = ref.lastIndexOf('/')
@@ -619,6 +651,19 @@ internal fun JsonObject.repoDigests(): Set<String> =
         }
         ?.toSet()
         ?: emptySet()
+
+/**
+ * `RepoTags` of an image inspect, without the `<none>:<none>` placeholder some engines emit for an
+ * untagged image — that entry is the *absence* of a tag and must not read as somebody's reference.
+ */
+internal fun JsonObject.repoTags(): Set<String> =
+    arr("RepoTags")
+        ?.mapNotNull { tag -> tag.jsonPrimitive.contentOrNull?.takeIf { it.isNotBlank() && it != NO_TAG } }
+        ?.toSet()
+        ?: emptySet()
+
+/** `docker images` shows an untagged image this way, and some engines put it in `RepoTags` too. */
+private const val NO_TAG = "<none>:<none>"
 
 private fun serviceKey(project: String, service: String) = project + '\u0000' + service
 

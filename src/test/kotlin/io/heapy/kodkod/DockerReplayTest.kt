@@ -111,6 +111,13 @@ class DockerReplayTest {
                     client.created.single().second.str("Image")?.contains("testapp") == true,
                     "replacement created against the new image: ${client.created}",
                 )
+                // The recorder publishes every variant as both `:latest` and `:vN`, so the image left
+                // behind still answers with `RepoTags: [.../testapp:v1]` — a real engine's own proof that
+                // the prune has to stand down rather than untag somebody's pinned image.
+                assertTrue(
+                    ops.none { it.startsWith("removeImage:") },
+                    "the replaced image is still tagged :v1 and must survive the cleanup: $ops",
+                )
             }
 
             "update-noop" -> {

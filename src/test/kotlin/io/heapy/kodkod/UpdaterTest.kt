@@ -170,6 +170,66 @@ class UpdaterTest {
         assertFalse(docker.ops.any { it.startsWith("removeImage:") }, "cleanup disabled must not prune the old image: ${docker.ops}")
     }
 
+    // --- image cleanup --------------------------------------------------------------------
+
+    /** A stale `app:latest` whose old image id still answers inspect with [repoTags]. */
+    private fun staleApp(docker: FakeDockerClient, repoTags: String) {
+        docker.container(id = "web", imageRef = "app:latest", currentImageId = "sha256:old")
+        docker.images["sha256:old"] = json("""{"Id":"sha256:old","Config":{},"RepoDigests":[],"RepoTags":$repoTags}""")
+        docker.images["app:latest"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[],"RepoTags":["app:latest"]}""")
+    }
+
+    @Test
+    fun a_single_remaining_user_tag_saves_the_old_image_from_the_prune() {
+        val docker = FakeDockerClient()
+        // `app:latest` moved to the new image, but the operator's pinned rollback tag stayed behind.
+        staleApp(docker, """["app:1.26"]""")
+
+        updater(docker, config(cleanup = true)).runOnce()
+
+        assertTrue(docker.ops.contains("create:web"), "the update itself must still happen: ${docker.ops}")
+        assertTrue(
+            docker.removedImages.isEmpty(),
+            "deleting an image that carries exactly one foreign tag succeeds and silently untags the " +
+                "operator's rollback image — two tags would already have been refused with 409: ${docker.removedImages}",
+        )
+    }
+
+    @Test
+    fun only_the_updated_tag_left_on_the_old_image_still_prunes() {
+        val docker = FakeDockerClient()
+        staleApp(docker, """["app:latest"]""")
+
+        updater(docker, config(cleanup = true)).runOnce()
+
+        assertEquals(listOf("sha256:old"), docker.removedImages, "nobody else references it: ${docker.removedImages}")
+    }
+
+    @Test
+    fun a_dangling_old_image_is_pruned() {
+        val docker = FakeDockerClient()
+        staleApp(docker, """["<none>:<none>"]""")
+
+        updater(docker, config(cleanup = true)).runOnce()
+
+        assertEquals(listOf("sha256:old"), docker.removedImages, "an untagged image is ours to reclaim: ${docker.removedImages}")
+    }
+
+    @Test
+    fun an_unreadable_old_image_is_left_alone() {
+        val docker = FakeDockerClient()
+        staleApp(docker, """[]""")
+        docker.images.remove("sha256:old") // inspect of the old image now fails, as it would mid-prune
+
+        updater(docker, config(cleanup = true)).runOnce()
+
+        assertTrue(docker.ops.contains("create:web"), "the update itself must still happen: ${docker.ops}")
+        assertTrue(
+            docker.removedImages.isEmpty(),
+            "without an answer about its tags, deleting the image is a guess: ${docker.removedImages}",
+        )
+    }
+
     @Test
     fun recreate_puts_the_first_network_in_the_create_body_and_connects_the_rest() {
         val docker = FakeDockerClient()
