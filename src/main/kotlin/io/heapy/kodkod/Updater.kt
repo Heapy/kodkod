@@ -628,7 +628,13 @@ class Updater(
                 val state = try {
                     api.inspectContainer(target.id).obj("State")
                 } catch (e: Exception) {
-                    if (e is DockerException && e.status == 404) continue
+                    if (e is DockerException && e.status == 404) {
+                        Log.warn(
+                            "[${target.name}] was stopped by this cycle and the daemon no longer knows it — " +
+                                "whoever removed it owns the service now",
+                        )
+                        continue
+                    }
                     Log.error(
                         "[${target.name}] was stopped by this cycle and could not be inspected afterwards, so " +
                             "kodkod cannot tell whether it is serving: ${e.message}",
