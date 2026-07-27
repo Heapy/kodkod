@@ -63,8 +63,13 @@ class Updater(
      */
     private val failedUpdates = HashMap<String, FailedUpdate>()
 
-    /** An image that failed to come up on a container, and when that was last attempted. */
-    private class FailedUpdate(val imageId: String, val attemptedAt: Long)
+    /**
+     * An image that failed to come up on a container, and when that was last attempted — twice over,
+     * because the two readings answer different questions: [attemptedAtNanos] is what the cooldown is
+     * measured with (elapsed time, immune to the wall clock being corrected under us) and
+     * [attemptedAtMillis] is what the log line naming the next attempt is printed from.
+     */
+    private class FailedUpdate(val imageId: String, val attemptedAtNanos: Long, val attemptedAtMillis: Long)
 
     /**
      * Bring back containers a kodkod that died mid-recreate left parked under their
@@ -231,7 +236,7 @@ class Updater(
         // A memory whose window has run out no longer decides anything, and a container that was
         // removed never comes back to have its entry dropped at check time — so the map is swept here
         // rather than growing by one entry per container that ever failed an update.
-        failedUpdates.values.removeIf { clock.millis() - it.attemptedAt >= cooldownMs }
+        failedUpdates.values.removeIf { clock.nanos() - it.attemptedAtNanos >= cooldownNanos }
         val targets = collectTargets()
         if (targets.isEmpty()) return UpdatePlan.NOTHING
 
@@ -364,13 +369,18 @@ class Updater(
         val handled = targets.filter { it.toRestart }.flatMapTo(HashSet()) { listOf(it.id, it.liveId) }
         // A dependent that had to be refreshed becomes a provider in its own right: `c` joined to `b`
         // joined to `a` loses its namespace when `b` is recreated, exactly as `b` lost it when `a` was.
-        // Chains are short in practice, so the queue is bounded rather than cycle-detected.
+        // Every container this cycle brought back is a starting point, at depth 0: the bound below is on
+        // the length of the *chains followed from them*, never on how many of them there are — a stack of
+        // forty updated containers is not a namespace chain, and dropping the last eight would leave
+        // their sidecars broken for a reason that has nothing to do with them.
         val queue = ArrayDeque<RefreshedProvider>()
         targets.filter { it.toRestart }.mapTo(queue) {
-            RefreshedProvider(it.id, it.name, it.liveId, it.composeProject)
+            RefreshedProvider(it.id, it.name, it.liveId, it.composeProject, depth = 0)
         }
-        var scans = 0
-        while (queue.isNotEmpty() && scans++ < MAX_DEPENDENT_SCANS) {
+        // Termination does not rest on the bound: a container is enqueued only when `handled` accepted
+        // it, so each one is followed at most once.
+        val abandoned = ArrayList<String>()
+        while (queue.isNotEmpty()) {
             val provider = queue.removeFirst()
             val asProvider = DependencyProvider(provider.id, setOf(provider.name), provider.composeProject)
             for (dependent in findDependents(api, asProvider)) {
@@ -378,18 +388,20 @@ class Updater(
                 if (isSelf(dependent.id, dependent.labels, selfId)) continue
                 val liveId = refreshDependent(dependent, provider) ?: continue
                 handled += liveId
-                queue += RefreshedProvider(
+                val next = RefreshedProvider(
                     dependent.id,
                     dependent.name,
                     liveId,
                     dependent.labels.label(COMPOSE_PROJECT_LABEL),
+                    provider.depth + 1,
                 )
+                if (next.depth <= MAX_DEPENDENT_CHAIN) queue += next else abandoned += next.name
             }
         }
-        if (queue.isNotEmpty()) {
+        if (abandoned.isNotEmpty()) {
             Log.warn(
-                "stopped following create-time dependents after $MAX_DEPENDENT_SCANS containers — " +
-                    "${queue.joinToString(", ") { it.name }} may be left on a dead network namespace",
+                "stopped following create-time dependents past $MAX_DEPENDENT_CHAIN links — anything joined " +
+                    "to ${abandoned.joinToString(", ")} may be left on a dead network namespace",
             )
         }
     }
@@ -434,6 +446,8 @@ class Updater(
         val name: String,
         val liveId: String,
         val composeProject: String?,
+        /** How many namespace links away from this cycle's own containers this one is. */
+        val depth: Int,
     ) {
         /** Whether the container answering to [name] now is a different one than [id]. */
         val replaced: Boolean get() = liveId != id
@@ -492,7 +506,7 @@ class Updater(
      * cost its dependent a delay, not an outage — so the timeout is loud and then proceeds.
      */
     private fun awaitHealthy(target: Target, dep: Target) {
-        val deadline = clock.millis() + config.dependencyHealthTimeout * 1000L
+        val deadline = clock.nanos() + secondsToNanos(config.dependencyHealthTimeout)
         var announced = false
         var unreadable = 0
         while (true) {
@@ -520,7 +534,7 @@ class Updater(
                 if (announced) Log.info("[${target.name}] ${dep.name} is healthy — starting")
                 return
             }
-            if (clock.millis() >= deadline) {
+            if (clock.nanos() >= deadline) {
                 Log.error(
                     "[${target.name}] ${dep.name} did not become healthy within " +
                         "${config.dependencyHealthTimeout}s (health: ${health ?: "unknown"}) — starting anyway, " +
@@ -683,8 +697,8 @@ class Updater(
      */
     private fun suppressedByCooldown(target: Target, newImageId: String): Boolean {
         val failure = failedUpdates[target.id] ?: return false
-        val nextAttempt = failure.attemptedAt + cooldownMs
-        if (failure.imageId != newImageId || clock.millis() >= nextAttempt) {
+        val nextAttempt = failure.attemptedAtMillis + cooldownMs
+        if (failure.imageId != newImageId || clock.nanos() - failure.attemptedAtNanos >= cooldownNanos) {
             failedUpdates.remove(target.id)
             return false
         }
@@ -711,14 +725,17 @@ class Updater(
         val imageId = target.newImageId?.takeIf { target.stale } ?: return
         if (cooldownMs <= 0) return
         val now = clock.millis()
-        failedUpdates[target.id] = FailedUpdate(imageId, now)
+        failedUpdates[target.id] = FailedUpdate(imageId, clock.nanos(), now)
         Log.warn(
             "[${target.name}] not trying ${imageId.shortId()} again before " +
                 "${Instant.ofEpochMilli(now + cooldownMs)} — a repeat of this update is a repeat of this outage",
         )
     }
 
+    /** The cooldown as the log lines print it. What it is *measured* with is [cooldownNanos]. */
     private val cooldownMs: Long get() = config.updateFailureCooldown * 1000L
+
+    private val cooldownNanos: Long get() = secondsToNanos(config.updateFailureCooldown)
 
     private fun remoteDigest(imageRef: String, target: Target): String? {
         val digest = runCatching {
@@ -1029,7 +1046,7 @@ class Updater(
      * the container it replaced.
      */
     private fun verifyStarted(name: String, newId: String) {
-        val deadline = clock.millis() + config.updateVerifySeconds * 1000L
+        val deadline = clock.nanos() + secondsToNanos(config.updateVerifySeconds)
         var good = 0
         var readable = 0
         var unreadable = 0
@@ -1055,7 +1072,7 @@ class Updater(
                 return
             }
             if (!settled) good = 0
-            if (clock.millis() >= deadline) {
+            if (clock.nanos() >= deadline) {
                 if (readable == 0) {
                     throw UnverifiableReplacement(
                         "the replacement could not be inspected once in ${config.updateVerifySeconds}s " +
@@ -1212,11 +1229,11 @@ class Updater(
         const val START_RETRY_INTERVAL_MS = 1_000L
 
         /**
-         * Containers whose create-time dependents are searched for in one cycle. A bound rather than a
-         * cycle check: each scan costs a listing, and a namespace chain deeper than this is not a
-         * shape kodkod should keep paying for.
+         * How far a chain of shared namespaces is followed away from the containers this cycle brought
+         * back — `c` joined to `b` joined to `a` being two links. Each link costs a listing, and a chain
+         * deeper than this is not a shape kodkod should keep paying to walk.
          */
-        const val MAX_DEPENDENT_SCANS = 32
+        const val MAX_DEPENDENT_CHAIN = 32
 
         /**
          * Uptime below which a stopped container that holds a service name proved nothing, whatever

@@ -44,10 +44,15 @@ class Autoheal(
      * How many restarts a container has had in its current unhealthy spell, when the last one was, and
      * since when it has been missing from the `health=unhealthy` listing (`null` while it is still in
      * it) — see [forgetRecovered].
+     *
+     * Every *window* here is measured in elapsed nanoseconds ([atNanos], [absentSince]), because a wall
+     * clock corrected under a running process would otherwise stretch or collapse a backoff by the size
+     * of the correction. [at] is the wall-clock reading of the same moment, and exists only to print the
+     * instant of the next attempt.
      */
-    private class Restart(val count: Int, val at: Long, val absentSince: Long? = null) {
+    private class Restart(val count: Int, val at: Long, val atNanos: Long, val absentSince: Long? = null) {
         /** The same record, with the container observed as unhealthy again right now. */
-        fun seen(): Restart = if (absentSince == null) this else Restart(count, at)
+        fun seen(): Restart = if (absentSince == null) this else Restart(count, at, atNanos)
     }
 
     fun runOnce() {
@@ -87,7 +92,7 @@ class Autoheal(
             // Counted before the call, not after: a restart the daemon refuses is not a reason to keep
             // asking every cycle either. The same instant is what a lost answer is read back against.
             val issuedAt = clock.millis()
-            restarts[id] = Restart(attempt, issuedAt)
+            restarts[id] = Restart(attempt, issuedAt, clock.nanos())
             val restarted = try {
                 api.restart(id, timeout)
                 Log.info("$where restart successful")
@@ -131,7 +136,7 @@ class Autoheal(
      */
     private fun restartLanded(id: String, where: String, issuedAt: Long, failure: Exception): Boolean {
         if (failure is DockerException && failure.status >= 400) return false
-        val deadline = clock.millis() + RESTART_VERIFY_MS
+        val deadline = clock.nanos() + millisToNanos(RESTART_VERIFY_MS)
         Log.warn("$where the daemon gave no usable answer — reading back whether the restart landed")
         while (true) {
             val state = runCatching { api.inspectContainer(id).obj("State") }.getOrNull()
@@ -139,7 +144,7 @@ class Autoheal(
                 Log.warn("$where it started again — treating the restart as done and refreshing its dependents")
                 return true
             }
-            if (clock.millis() >= deadline) {
+            if (clock.nanos() >= deadline) {
                 Log.error(
                     "$where has not started again ${RESTART_VERIFY_MS / 1000}s later — leaving its dependents " +
                         "alone, restarting them against a container that is down would only spread the outage",
@@ -177,7 +182,7 @@ class Autoheal(
         if (restarts.isEmpty()) return
         val missing = restarts.keys.filterNot { it in unhealthyIds }
         val recovered = if (missing.isEmpty()) emptySet() else healthyAmong(missing)
-        val now = clock.millis()
+        val now = clock.nanos()
         val kept = HashMap<String, Restart>(restarts.size)
         for ((id, restart) in restarts) {
             when {
@@ -186,8 +191,8 @@ class Autoheal(
                     Log.info("[${id.take(12)}] is healthy again — its restart backoff starts from scratch")
                 else -> {
                     val absentSince = restart.absentSince ?: now
-                    if (now - absentSince < config.autohealMaxInterval * 1000L) {
-                        kept[id] = Restart(restart.count, restart.at, absentSince)
+                    if (now - absentSince < secondsToNanos(config.autohealMaxInterval)) {
+                        kept[id] = Restart(restart.count, restart.at, restart.atNanos, absentSince)
                     }
                 }
             }
@@ -237,11 +242,11 @@ class Autoheal(
      */
     private fun backoffHolds(id: String, where: String): Boolean {
         val last = restarts[id] ?: return false
-        val next = last.at + backoffSeconds(last.count) * 1000L
-        if (clock.millis() >= next) return false
+        val window = backoffSeconds(last.count)
+        if (clock.nanos() - last.atNanos >= secondsToNanos(window)) return false
         Log.info(
             "$where still unhealthy after ${last.count} restart(s) — restarting it again is unlikely to " +
-                "help, so the next attempt is no earlier than ${Instant.ofEpochMilli(next)} " +
+                "help, so the next attempt is no earlier than ${Instant.ofEpochMilli(last.at + window * 1000L)} " +
                 "(KODKOD_AUTOHEAL_MAX_INTERVAL=${config.autohealMaxInterval}s)",
         )
         return true

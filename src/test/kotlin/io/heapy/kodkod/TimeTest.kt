@@ -20,6 +20,24 @@ class TimeTest {
 
         clock.advance(5_000)
         assertEquals(5_000L, clock.millis())
+        assertEquals(5_000_000_000L, clock.nanos(), "both hands show the same virtual instant")
+    }
+
+    /**
+     * The two hands mean different things: durations are measured with [WallClock.nanos] precisely
+     * because [WallClock.millis] can be corrected under a running process, and only the latter is an
+     * instant anybody can print.
+     */
+    @Test
+    fun the_production_clock_is_a_wall_clock_and_a_monotonic_one() {
+        val first = WallClock.SYSTEM.nanos()
+        val second = WallClock.SYSTEM.nanos()
+
+        assertTrue(second >= first, "elapsed time never runs backwards ($first -> $second)")
+        assertTrue(
+            WallClock.SYSTEM.millis() > 1_600_000_000_000L,
+            "and millis() is still an instant since the epoch, which is what the log lines print",
+        )
     }
 
     @Test

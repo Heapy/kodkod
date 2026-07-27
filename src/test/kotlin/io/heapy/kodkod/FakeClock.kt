@@ -11,6 +11,9 @@ class FakeClock(private var now: Long = 0L) : WallClock, Sleeper {
 
     override fun millis(): Long = now
 
+    /** The same virtual instant the other hand shows: nothing here can drift between the two. */
+    override fun nanos(): Long = millisToNanos(now)
+
     override fun sleep(millis: Long) {
         sleeps += millis
         if (millis > 0) now += millis

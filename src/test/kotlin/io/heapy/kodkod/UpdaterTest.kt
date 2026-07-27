@@ -859,6 +859,29 @@ class UpdaterTest {
         )
     }
 
+    /**
+     * Elapsed time is not wall time. Every window used to be `currentTimeMillis() + n`, so an NTP
+     * correction landing inside the liveness gate moved the finish line: backwards, and the gate waits
+     * the whole correction out *while `apply` holds the cycle lock*, blocking autoheal with it;
+     * forwards, and the window ends early and accepts a replacement that is still dying — moments before
+     * the container and image it replaced are destroyed.
+     */
+    @Test
+    fun the_liveness_window_is_measured_in_elapsed_time_not_wall_time() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.health["new-web-0"] = "starting" // never settles, so the window has to run out on its own
+        val corrected = CorrectedClock(clock, stepMs = -400)
+
+        Updater(docker, config(verifySeconds = "2"), selfId = null, corrected, corrected).runOnce()
+
+        assertEquals(
+            4, clock.sleeps.size,
+            "a 2s window is 2s of elapsed time; measured against a wall clock walking backwards under it, " +
+                "the same window takes as long as the correction says: ${clock.sleeps}",
+        )
+    }
+
     // --- memory of an image that cannot start ---------------------------------------------
 
     /** A stale `web` whose replacement starts and dies, so the first cycle ends in a rollback. */
@@ -1454,6 +1477,43 @@ class UpdaterTest {
     }
 
     /**
+     * The bound on the daemon-wide scan is on the *depth* of a namespace chain, and cannot be spent on
+     * anything else. It used to count every provider popped off the queue — which is seeded with one
+     * entry per container the cycle brought back — so on a stack of more than 32 updated services the
+     * sidecars of everything past the 32nd were never looked for at all, for a reason that has nothing
+     * to do with a chain.
+     */
+    @Test
+    fun a_cycle_bigger_than_the_chain_bound_still_looks_for_every_sidecar() {
+        val docker = FakeDockerClient()
+        repeat(40) { i ->
+            docker.container(
+                id = "app$i", imageRef = "app:1", currentImageId = "sha256:app-old",
+                labels = """{"kodkod.update.enable":"true"}""",
+            )
+        }
+        docker.images["app:1"] = json("""{"Id":"sha256:app-new","Config":{},"RepoDigests":[]}""")
+        // Joined to the *last* of them, and unlabelled: only the daemon-wide scan can find it.
+        docker.container(
+            id = "side", imageRef = "busybox:1", currentImageId = "sha256:side",
+            currentRepoDigests = listOf("busybox@sha256:side-remote"),
+            hostConfig = """{"NetworkMode":"container:app39"}""",
+        )
+        docker.distribution["busybox:1"] = "sha256:side-remote"
+
+        updater(docker, config(monitorAll = false)).runOnce()
+
+        assertEquals(
+            40, docker.ops.count { it.startsWith("create:app") },
+            "the test is worthless unless every one of them was actually replaced: ${docker.ops}",
+        )
+        assertTrue(
+            docker.ops.contains("restart:side"),
+            "the namespace of the 40th container is just as dead as the namespace of the first: ${docker.ops}",
+        )
+    }
+
+    /**
      * Namespaces chain: `second` is joined to `side`, which is joined to `app`. Recreating `side` tears
      * its namespace down exactly as replacing `app` tore down `app`'s, so a pass that stops at the
      * first link leaves `second` reporting `Running` with no interfaces at all.
@@ -1882,6 +1942,24 @@ private class HealthFlip(
     override fun start(id: String) {
         healthWhenStarted[id] = delegate.health[target]
         delegate.start(id)
+    }
+}
+
+/**
+ * A [WallClock] whose *wall* reading is corrected by [stepMs] on every wait — an NTP step landing in the
+ * middle of a polling loop — while the monotonic reading of [delegate] keeps counting the sleeps like
+ * any other. Only code that measures a duration with the wall clock notices, which is the point.
+ */
+private class CorrectedClock(private val delegate: FakeClock, private val stepMs: Long) : WallClock, Sleeper {
+    private var drift = 0L
+
+    override fun millis(): Long = delegate.millis() + drift
+
+    override fun nanos(): Long = delegate.nanos()
+
+    override fun sleep(millis: Long) {
+        delegate.sleep(millis)
+        drift += stepMs
     }
 }
 
