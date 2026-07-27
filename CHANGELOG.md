@@ -13,7 +13,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   whose replacement reports `unhealthy`; a container still inside its `start_period` is accepted.
 - Memory of an image that could not come up on a container: the same update is not retried for
   `KODKOD_UPDATE_FAILURE_COOLDOWN` seconds (default 6h), so an unstartable `:latest` no longer costs a
-  self-inflicted outage every cycle. Cleared as soon as the tag resolves to a different image. A
+  self-inflicted outage every cycle. Cleared as soon as the tag resolves to a different image. What
+  counts as a failure is graded: a replacement that ran and did not stay up is held back on sight, while
+  a `start` the daemon simply refused is retried once more first — that answer is a host problem (a port
+  still in teardown, a resource limit, a network being rewired) as often as an image one, and only a
+  second refusal in a row holds the update back. A
   container held back this way still follows its own dependencies — being left on a network namespace
   that was destroyed is the worse outcome — but nothing may force it onto that image either, so the
   container it is joined to is the one that waits (see below). Note the memory lives in the process:

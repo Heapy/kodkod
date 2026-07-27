@@ -69,10 +69,50 @@ class Updater(
      * because the two readings answer different questions: [attemptedAtNanos] is what the cooldown is
      * measured with (elapsed time, immune to the wall clock being corrected under us) and
      * [attemptedAtMillis] is what the log line naming the next attempt is printed from.
+     *
+     * Not every entry holds an update back. [ranAndFailed] is the one that does so on sight, because the
+     * replacement really ran and really did not stay up; a start the daemon simply refused is counted in
+     * [strikes] and needs [START_FAILURES_BEFORE_BLAME] of them — see [ImageBlame].
      */
-    private class FailedUpdate(val imageId: String, val attemptedAtNanos: Long, val attemptedAtMillis: Long) {
+    private class FailedUpdate(
+        val imageId: String,
+        val attemptedAtNanos: Long,
+        val attemptedAtMillis: Long,
+        val strikes: Int,
+        val ranAndFailed: Boolean,
+    ) {
         /** Whether this memory has outlived its window, [nowNanos] and [window] both being elapsed nanos. */
         fun expired(nowNanos: Long, window: Long): Boolean = nowNanos - attemptedAtNanos >= window
+
+        /** Whether it is yet enough to hold the update back. */
+        val suppressing: Boolean get() = ranAndFailed || strikes >= START_FAILURES_BEFORE_BLAME
+    }
+
+    /**
+     * How much a failed recreate says about the **image** it was updating to.
+     *
+     * The distinction exists because `POST /containers/{id}/start` answers `500` to two very different
+     * things. An entrypoint that does not exist, a binary built for another architecture, an image whose
+     * new config the runtime rejects — those never produce a container that runs and then dies, so the
+     * liveness gate never sees them and the refused start is the only evidence there will ever be. But a
+     * host port still in teardown, a daemon blip, a resource limit or a network being rewired answer the
+     * same way, and hold nothing against the image at all.
+     *
+     * Nothing in the answer separates the two: both are `500`, and matching on the daemon's wording means
+     * enumerating an open-ended list in somebody else's release notes. Time separates them instead —
+     * [START_FAILURES_BEFORE_BLAME] consecutive cycles. A transient cause has a whole update interval to
+     * clear; a broken image fails again and is held back, having cost one extra rollback rather than one
+     * per cycle forever.
+     */
+    private enum class ImageBlame {
+        /** Whatever failed, the replacement was never asked to run. Nothing was learned. */
+        NONE,
+
+        /** The daemon refused to start it. Evidence, but only once it repeats. */
+        START_REFUSED,
+
+        /** It ran, and the liveness gate watched it not stay up. Evidence on sight. */
+        RAN_AND_FAILED,
     }
 
     /**
@@ -949,6 +989,9 @@ class Updater(
      * Whether updating [target] to [newImageId] is being held back by a previous failed attempt. A
      * memory that no longer applies — the tag has moved on to a different image, or the cooldown has
      * run out — is forgotten here rather than merely ignored, so the next failure starts a fresh window.
+     *
+     * A memory that does not hold the update back yet ([FailedUpdate.suppressing]) is *kept*: it is what
+     * makes the next failure the second one.
      */
     private fun suppressedByCooldown(target: Target, newImageId: String): Boolean {
         val failure = failedUpdates[target.id] ?: return false
@@ -957,8 +1000,17 @@ class Updater(
             failedUpdates.remove(target.id)
             return false
         }
+        if (!failure.suppressing) {
+            Log.info(
+                "[${target.name}] trying ${newImageId.shortId()} again: the daemon refused to start it last " +
+                    "cycle, which is as much a host problem (a port still in teardown, a resource limit) as an " +
+                    "image one — a second refusal is what holds it back",
+            )
+            return false
+        }
+        val how = if (failure.ranAndFailed) "already failed to come up" else "was refused a start twice running"
         Log.warn(
-            "[${target.name}] skipping this update: ${newImageId.shortId()} already failed to come up on " +
+            "[${target.name}] skipping this update: ${newImageId.shortId()} $how on " +
                 "this container, and retrying it means stopping a healthy container for nothing — " +
                 "next attempt no earlier than ${Instant.ofEpochMilli(nextAttempt)} " +
                 "(KODKOD_UPDATE_FAILURE_COOLDOWN=${config.updateFailureCooldown}s). It still follows its own " +
@@ -973,18 +1025,38 @@ class Updater(
      *
      * Only an actual image update is remembered: a recreate that failed while following a dependency
      * has no new image to blame, and suppressing it would leave a container pinned to a dead namespace.
-     * The caller decides *when* there is something to blame the image for — only a replacement that
-     * was actually started can have failed because of it.
+     * How much the failure says about the image is the caller's to decide and arrives as [blame]; a
+     * refused start only holds the update back once it is the [START_FAILURES_BEFORE_BLAME]th in a row,
+     * so the first one is recorded without suppressing anything.
      */
-    private fun rememberFailedUpdate(target: Target) {
+    private fun rememberFailedUpdate(target: Target, blame: ImageBlame) {
+        if (blame == ImageBlame.NONE) return
         val imageId = target.newImageId?.takeIf { target.stale } ?: return
         if (cooldownMs <= 0) return
         val now = clock.millis()
-        failedUpdates[target.id] = FailedUpdate(imageId, clock.nanos(), now)
-        Log.warn(
-            "[${target.name}] not trying ${imageId.shortId()} again before " +
-                "${Instant.ofEpochMilli(now + cooldownMs)} — a repeat of this update is a repeat of this outage",
+        // Only a failure of the *same* image on this container adds to the previous one. Anything else in
+        // the map by now is about another image, and `suppressedByCooldown` would have dropped it.
+        val previous = failedUpdates[target.id]?.takeIf { it.imageId == imageId }
+        val entry = FailedUpdate(
+            imageId = imageId,
+            attemptedAtNanos = clock.nanos(),
+            attemptedAtMillis = now,
+            strikes = (previous?.strikes ?: 0) + 1,
+            ranAndFailed = blame == ImageBlame.RAN_AND_FAILED || previous?.ranAndFailed == true,
         )
+        failedUpdates[target.id] = entry
+        if (entry.suppressing) {
+            Log.warn(
+                "[${target.name}] not trying ${imageId.shortId()} again before " +
+                    "${Instant.ofEpochMilli(now + cooldownMs)} — a repeat of this update is a repeat of this outage",
+            )
+        } else {
+            Log.warn(
+                "[${target.name}] the daemon refused to start ${imageId.shortId()} — that is as much a host " +
+                    "problem (a port still in teardown, a resource limit) as an image one, so it gets one more " +
+                    "cycle; a second refusal holds it back for ${config.updateFailureCooldown}s",
+            )
+        }
     }
 
     /** The cooldown as the log lines print it. What it is *measured* with is [cooldownNanos]. */
@@ -1068,11 +1140,11 @@ class Updater(
         // Whether the name was actually taken away from the old container yet.
         var parked = false
 
-        // Whether the failure (if any) is evidence about the *image*. Only a replacement that was
-        // actually asked to run says anything about it: a refused stop, a name conflict or a create
-        // the daemon rejected happen with any image, and remembering them would freeze the update for
-        // `KODKOD_UPDATE_FAILURE_COOLDOWN` over a blip that never let the image run at all.
-        var imageBlamed = false
+        // How much the failure (if any) is evidence about the *image* — see [ImageBlame]. Only a
+        // replacement that was actually asked to run says anything about it: a refused stop, a name
+        // conflict or a create the daemon rejected happen with any image, and remembering them would
+        // freeze the update for `KODKOD_UPDATE_FAILURE_COOLDOWN` over a blip that never let it run.
+        var blame = ImageBlame.NONE
 
         try {
             stopGracefully(target) // usually a no-op (already stopped in the reverse-order pass)
@@ -1081,8 +1153,10 @@ class Updater(
             val newId = api.create(name, body, target.platform)
             try {
                 networks.drop(1).forEach { (net, endpoint) -> api.connectNetwork(net, newId, endpoint) }
-                imageBlamed = true
+                blame = ImageBlame.START_REFUSED
                 api.start(newId)
+                // It ran. From here on the gate's verdict is about this image and nothing else.
+                blame = ImageBlame.RAN_AND_FAILED
                 // Everything past this point destroys the only copy of the previous state, so the
                 // replacement has to prove it is actually up first.
                 verifyStarted(name, newId)
@@ -1090,7 +1164,7 @@ class Updater(
                 // A gate that failed for want of an *answer* is not evidence about the image either:
                 // the replacement may well have been running the whole time, and remembering it would
                 // hold a good update back for `KODKOD_UPDATE_FAILURE_COOLDOWN` over a blip on the socket.
-                if (e is UnverifiableReplacement) imageBlamed = false
+                if (e is UnverifiableReplacement) blame = ImageBlame.NONE
                 blockingId = discardReplacement(name, newId)
                 throw e
             }
@@ -1118,7 +1192,7 @@ class Updater(
         } catch (e: Exception) {
             // Any failure after we stopped the container must restore the original, running container.
             Log.error("[$name] recreate failed — rolling back: ${e.message}")
-            if (imageBlamed) rememberFailedUpdate(target)
+            rememberFailedUpdate(target, blame)
             if (!rollback(target.id, name, blockingId, parked)) rememberStranded(target)
             throw e
         }
@@ -1544,6 +1618,16 @@ class Updater(
          * `KODKOD_UPDATE_VERIFY_SECONDS` was set to (it may be `0`). See [holderEverStayedUp].
          */
         const val MIN_PROVEN_UPTIME_MS = 60_000L
+
+        /**
+         * Consecutive cycles in which the daemon has to refuse to start the same image on the same
+         * container before the update is held back for `KODKOD_UPDATE_FAILURE_COOLDOWN`. See [ImageBlame].
+         *
+         * `2` is the smallest number that is evidence at all, and the cost of each side is not
+         * symmetrical: one more strike buys one more self-inflicted rollback of a service running
+         * perfectly well, while one fewer buys a six-hour hold on an update nothing was ever wrong with.
+         */
+        const val START_FAILURES_BEFORE_BLAME = 2
     }
 }
 

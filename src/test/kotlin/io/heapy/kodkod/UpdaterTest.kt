@@ -954,6 +954,66 @@ class UpdaterTest {
         assertTrue(log.contains("next attempt no earlier than"), "and it has to say for how long: $log")
     }
 
+    /**
+     * `POST /start` answers `500` to an entrypoint that does not exist *and* to a host port the previous
+     * process has not released yet, a resource limit, a network being rewired. The replacement never ran
+     * in either case, so the liveness gate — which is what proves an image cannot serve — never saw it.
+     *
+     * Blaming the image for the first refusal means a container whose start lost a race with its own
+     * teardown carries a six-hour hold on an update nothing was ever wrong with. The first refusal is
+     * therefore recorded and retried; see the test below for what happens when it repeats.
+     */
+    @Test
+    fun a_start_the_daemon_refused_once_is_tried_again_next_cycle() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.failStart += "new-web-0" // only this attempt: whatever refused it is over by the next cycle
+        val updater = updater(docker)
+
+        updater.runOnce()
+        val afterFirstCycle = docker.ops.size
+
+        val log = captureLog { updater.runOnce() }
+
+        assertTrue(
+            docker.ops.drop(afterFirstCycle).contains("create:web"),
+            "nothing about a refused start says the image is at fault, and holding the update back for " +
+                "KODKOD_UPDATE_FAILURE_COOLDOWN over a port in teardown is a cost with no evidence " +
+                "behind it: ${docker.ops}",
+        )
+        assertTrue(docker.ops.contains("start:new-web-1"), "and the retry has to come up: ${docker.ops}")
+        assertFalse(log.contains("skipping this update"), "the update was not skipped, so nothing may say it was: $log")
+    }
+
+    /**
+     * The other half of the same trade-off: an image the runtime refuses (a missing binary, the wrong
+     * architecture) never produces a container that runs and then dies either, so nothing but the refused
+     * start will ever be evidence against it. Retrying it every cycle stops and renames a healthy
+     * container forever — the outage this memory exists to prevent.
+     */
+    @Test
+    fun a_start_refused_twice_running_holds_the_update_back() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.failStart += listOf("new-web-0", "new-web-1", "new-web-2") // this image cannot be started here
+        val updater = updater(docker)
+
+        updater.runOnce()
+        updater.runOnce()
+        val afterSecondCycle = docker.ops.size
+
+        val log = captureLog { updater.runOnce() }
+
+        assertEquals(
+            listOf("pull:nginx:1.27"), docker.ops.drop(afterSecondCycle),
+            "twice in a row is not a race lost to a teardown any more, and a third rollback of a container " +
+                "that is serving buys nothing: ${docker.ops}",
+        )
+        assertTrue(running(docker, "web"), "the container that survived both attempts keeps serving")
+        assertTrue(log.contains("skipping this update"), "a skipped update must not be silent: $log")
+        assertTrue(log.contains("refused a start twice"), "and it has to say what it is holding back on: $log")
+    }
+
     @Test
     fun the_cooldown_running_out_lets_the_update_be_tried_again() {
         val docker = FakeDockerClient()
