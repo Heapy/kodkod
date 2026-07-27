@@ -1,0 +1,20 @@
+{
+    "scenario": "autoheal-restart",
+    "label": "engine-29.6.2_compose-5.3.1",
+    "exchanges": [
+        {
+            "method": "GET",
+            "path": "/containers/json?all=false&filters=%7B%22health%22%3A%5B%22unhealthy%22%5D%2C%22label%22%3A%5B%22kodkod.autoheal.enable%22%5D%7D",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0001.GET.containers-json.bin"
+        },
+        {
+            "method": "POST",
+            "path": "/containers/8cfaa1a5a3b76ef306952cf1d90d4a6c97612153713fa7f26cad64d73ae39f4d/restart?t=10",
+            "requestBodySummary": null,
+            "status": 204,
+            "responseFile": "0002.POST.containers-8cfaa1a5a3b76ef306952cf1d90d4.bin"
+        }
+    ]
+}

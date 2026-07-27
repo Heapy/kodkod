@@ -81,10 +81,10 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
         )
     }
 
-    override fun create(name: String, body: JsonObject): String {
+    override fun create(name: String, body: JsonObject, platform: String?): String {
         val response = request(
             method = "POST",
-            path = "/containers/create?name=${enc(name)}",
+            path = "/containers/create?name=${enc(name)}${platformParam(platform)}",
             body = body.toString().toByteArray(StandardCharsets.UTF_8),
             headers = mapOf("Content-Type" to "application/json"),
         )
@@ -113,13 +113,13 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
      * `POST /images/create` — pull an image. Docker answers 200 and streams newline-delimited
      * JSON progress objects; a failed pull surfaces an `error` field in the stream, so we scan for it.
      */
-    override fun pull(fromImage: String, tag: String, registryAuth: String?) {
+    override fun pull(fromImage: String, tag: String, registryAuth: String?, platform: String?) {
         val headers = buildMap {
             if (registryAuth != null) put("X-Registry-Auth", registryAuth)
         }
         val response = request(
             method = "POST",
-            path = "/images/create?fromImage=${enc(fromImage)}&tag=${enc(tag)}",
+            path = "/images/create?fromImage=${enc(fromImage)}&tag=${enc(tag)}${platformParam(platform)}",
             headers = headers,
             readTimeoutMs = 600_000, // pulls can be slow; allow up to 10 minutes of idle gap
         )
@@ -142,6 +142,13 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
     }
 
     private fun enc(value: String): String = URLEncoder.encode(value, StandardCharsets.UTF_8)
+
+    /**
+     * `&platform=os%2Farch`, or nothing at all. The parameter is omitted rather than sent empty: an
+     * empty `platform=` is a malformed platform spec to the daemon, not "no preference".
+     */
+    private fun platformParam(platform: String?): String =
+        platform?.takeIf { it.isNotBlank() }?.let { "&platform=${enc(it)}" }.orEmpty()
 
     // --- HTTP/1.1 request/response handling -----------------------------------------------
 

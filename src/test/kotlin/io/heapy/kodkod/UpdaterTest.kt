@@ -303,6 +303,59 @@ class UpdaterTest {
         assertNull(body.obj("Labels").label("com.docker.compose.image"), "kodkod must not fabricate compose metadata: $body")
     }
 
+    // --- platform -------------------------------------------------------------------------
+
+    @Test
+    fun the_running_image_platform_is_pinned_on_both_pull_and_create() {
+        val docker = FakeDockerClient()
+        docker.container(
+            id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
+            imageManifestPlatform = """{"architecture":"amd64","os":"linux"}""",
+        )
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+
+        Updater(docker, config(), selfId = null).runOnce()
+
+        assertOrder(docker.ops, "pull:nginx:1.27", "create:web")
+        assertEquals(
+            listOf("linux/amd64", "linux/amd64"), docker.platforms,
+            "an amd64 container on an arm64 host must be updated with, and recreated from, amd64: ${docker.platforms}",
+        )
+    }
+
+    @Test
+    fun a_container_without_an_image_manifest_descriptor_sends_no_platform() {
+        val docker = FakeDockerClient()
+        docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old") // pre-descriptor engine
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+
+        Updater(docker, config(), selfId = null).runOnce()
+
+        assertEquals(
+            listOf(null, null), docker.platforms,
+            "with nothing to read, the daemon must keep choosing its own default: ${docker.platforms}",
+        )
+    }
+
+    @Test
+    fun the_manifest_variant_is_not_pinned() {
+        val docker = FakeDockerClient()
+        docker.container(
+            id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
+            // The OLD image resolved to the v8 variant; the new one may not publish that variant at all.
+            imageManifestPlatform = """{"architecture":"arm64","os":"linux","variant":"v8"}""",
+        )
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+
+        Updater(docker, config(), selfId = null).runOnce()
+
+        assertEquals(
+            listOf("linux/arm64", "linux/arm64"), docker.platforms,
+            "pinning the old image's variant risks 'no matching manifest' on the new one: ${docker.platforms}",
+        )
+        assertTrue(docker.ops.contains("create:web"), "the update must still go through: ${docker.ops}")
+    }
+
     // --- rollback -------------------------------------------------------------------------
 
     @Test
@@ -374,14 +427,17 @@ private fun FakeDockerClient.container(
     hostConfig: String = "{}",
     networks: String = "{}",
     configMacAddress: String? = null,
+    imageManifestPlatform: String? = null,
 ) {
     val repoDigests = currentRepoDigests.joinToString(",", "[", "]") { "\"$it\"" }
     val mac = configMacAddress?.let { ",\"MacAddress\":\"$it\"" } ?: ""
+    // Engines that report it put the resolved manifest (and its platform) on the container inspect.
+    val manifest = imageManifestPlatform?.let { ""","ImageManifestDescriptor":{"platform":$it}""" } ?: ""
     listed += Json.parseToJsonElement("""{"Id":"$id","Labels":$labels}""").jsonObject
     containers[id] = Json.parseToJsonElement(
         """{"Name":"/$name","Image":"$currentImageId",""" +
             """"Config":{"Image":"$imageRef","Labels":$labels$mac},""" +
-            """"HostConfig":$hostConfig,"NetworkSettings":{"Networks":$networks}}""",
+            """"HostConfig":$hostConfig,"NetworkSettings":{"Networks":$networks}$manifest}""",
     ).jsonObject
     images[currentImageId] = Json.parseToJsonElement(
         """{"Id":"$currentImageId","Config":{},"RepoDigests":$repoDigests}""",

@@ -79,8 +79,8 @@ class OpLoggingClient(private val delegate: DockerClient) : DockerClient {
         op("connect", "$network:${label(containerId)}", ops) { delegate.connectNetwork(network, containerId, endpoint) }
     }
 
-    override fun create(name: String, body: JsonObject): String =
-        op("create", name, ops) { delegate.create(name, body).also { created += name to body } }
+    override fun create(name: String, body: JsonObject, platform: String?): String =
+        op("create", name, ops) { delegate.create(name, body, platform).also { created += name to body } }
 
     override fun inspectImage(ref: String): JsonObject =
         op("inspectImage", ref, reads) { delegate.inspectImage(ref) }
@@ -92,7 +92,7 @@ class OpLoggingClient(private val delegate: DockerClient) : DockerClient {
     override fun inspectDistribution(ref: String, registryAuth: String?): JsonObject =
         op("distribution", ref, reads) { delegate.inspectDistribution(ref, registryAuth) }
 
-    override fun pull(fromImage: String, tag: String, registryAuth: String?) {
-        op("pull", "$fromImage:$tag", ops) { delegate.pull(fromImage, tag, registryAuth) }
+    override fun pull(fromImage: String, tag: String, registryAuth: String?, platform: String?) {
+        op("pull", "$fromImage:$tag", ops) { delegate.pull(fromImage, tag, registryAuth, platform) }
     }
 }

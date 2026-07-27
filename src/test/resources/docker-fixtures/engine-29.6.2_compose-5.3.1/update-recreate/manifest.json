@@ -1,0 +1,104 @@
+{
+    "scenario": "update-recreate",
+    "label": "engine-29.6.2_compose-5.3.1",
+    "exchanges": [
+        {
+            "method": "GET",
+            "path": "/containers/json?all=false&filters=%7B%22status%22%3A%5B%22running%22%5D%2C%22label%22%3A%5B%22kodkod.update.enable%22%5D%7D",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0001.GET.containers-json.bin"
+        },
+        {
+            "method": "GET",
+            "path": "/containers/ec4a43047da415c71c6d6f054fb65713fcbb2457e7dcdec98a5cacf7cdd93bdf/json",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0002.GET.containers-ec4a43047da415c71c6d6f054fb65.bin"
+        },
+        {
+            "method": "GET",
+            "path": "/images/sha256:d2008a0ccf70f3d22e2ba40d41403a1fe0be8eee0f78c5c3a526d56b072e0d9a/json",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0003.GET.images-sha256-d2008a0ccf70f3d22e2ba40d41.bin"
+        },
+        {
+            "method": "GET",
+            "path": "/distribution/127.0.0.1:5000/testapp:latest/json",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0004.GET.distribution-127-0-0-1-5000-testapp-late.bin"
+        },
+        {
+            "method": "GET",
+            "path": "/images/sha256:d2008a0ccf70f3d22e2ba40d41403a1fe0be8eee0f78c5c3a526d56b072e0d9a/json",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0005.GET.images-sha256-d2008a0ccf70f3d22e2ba40d41.bin"
+        },
+        {
+            "method": "GET",
+            "path": "/images/127.0.0.1:5000/testapp:latest/json",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0006.GET.images-127-0-0-1-5000-testapp-latest-jso.bin"
+        },
+        {
+            "method": "GET",
+            "path": "/images/127.0.0.1:5000/testapp:latest/json",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0007.GET.images-127-0-0-1-5000-testapp-latest-jso.bin"
+        },
+        {
+            "method": "POST",
+            "path": "/containers/ec4a43047da415c71c6d6f054fb65713fcbb2457e7dcdec98a5cacf7cdd93bdf/stop?t=10",
+            "requestBodySummary": null,
+            "status": 204,
+            "responseFile": "0008.POST.containers-ec4a43047da415c71c6d6f054fb65.bin"
+        },
+        {
+            "method": "POST",
+            "path": "/containers/ec4a43047da415c71c6d6f054fb65713fcbb2457e7dcdec98a5cacf7cdd93bdf/stop?t=10",
+            "requestBodySummary": null,
+            "status": 304,
+            "responseFile": "0009.POST.containers-ec4a43047da415c71c6d6f054fb65.bin"
+        },
+        {
+            "method": "POST",
+            "path": "/containers/ec4a43047da415c71c6d6f054fb65713fcbb2457e7dcdec98a5cacf7cdd93bdf/rename?name=e2e-update-app-1_kodkod_old_ec4a43047da4",
+            "requestBodySummary": null,
+            "status": 204,
+            "responseFile": "0010.POST.containers-ec4a43047da415c71c6d6f054fb65.bin"
+        },
+        {
+            "method": "POST",
+            "path": "/containers/create?name=e2e-update-app-1&platform=linux%2Farm64",
+            "requestBodySummary": "2502 bytes",
+            "status": 201,
+            "responseFile": "0011.POST.containers-create.bin"
+        },
+        {
+            "method": "POST",
+            "path": "/containers/070155e68c8d50cfc3d3eab30b5f5e16a55d8bc07dd54be4216c7b9512c79ea1/start",
+            "requestBodySummary": null,
+            "status": 204,
+            "responseFile": "0012.POST.containers-070155e68c8d50cfc3d3eab30b5f5.bin"
+        },
+        {
+            "method": "DELETE",
+            "path": "/containers/ec4a43047da415c71c6d6f054fb65713fcbb2457e7dcdec98a5cacf7cdd93bdf?force=true&v=false",
+            "requestBodySummary": null,
+            "status": 204,
+            "responseFile": "0013.DELETE.containers-ec4a43047da415c71c6d6f054fb65.bin"
+        },
+        {
+            "method": "DELETE",
+            "path": "/images/sha256:d2008a0ccf70f3d22e2ba40d41403a1fe0be8eee0f78c5c3a526d56b072e0d9a?force=false&noprune=false",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0014.DELETE.images-sha256-d2008a0ccf70f3d22e2ba40d41.bin"
+        }
+    ]
+}

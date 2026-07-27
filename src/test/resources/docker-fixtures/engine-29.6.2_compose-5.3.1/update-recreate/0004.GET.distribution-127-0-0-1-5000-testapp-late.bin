@@ -1,0 +1,1 @@
+{"Descriptor":{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:46264148cada39e2416ff68929570d6f285c6d558910b33773e1e2c6bac804d0","size":855},"Platforms":[{"architecture":"arm64","os":"linux"},{"architecture":"unknown","os":"unknown"}]}

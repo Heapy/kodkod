@@ -41,8 +41,11 @@ interface DockerClient {
     /** `POST /networks/{network}/connect` — attach an already-created container to a further network. */
     fun connectNetwork(network: String, containerId: String, endpoint: JsonObject)
 
-    /** `POST /containers/create` — create a container named [name] from [body]; returns the new id. */
-    fun create(name: String, body: JsonObject): String
+    /**
+     * `POST /containers/create` — create a container named [name] from [body]; returns the new id.
+     * [platform] pins the `os/arch` the image is resolved for (`null` leaves the choice to the daemon).
+     */
+    fun create(name: String, body: JsonObject, platform: String?): String
 
     /** `GET /images/{ref}/json` — inspect a local image by `repo:tag`, digest, or id. */
     fun inspectImage(ref: String): JsonObject
@@ -53,6 +56,10 @@ interface DockerClient {
     /** `GET /distribution/{ref}/json` — registry manifest metadata, fetched without pulling layers. */
     fun inspectDistribution(ref: String, registryAuth: String?): JsonObject
 
-    /** `POST /images/create` — pull [fromImage]:[tag]; throws if the progress stream reports an error. */
-    fun pull(fromImage: String, tag: String, registryAuth: String?)
+    /**
+     * `POST /images/create` — pull [fromImage]:[tag]; throws if the progress stream reports an error.
+     * [platform] pins the `os/arch` picked out of a multi-arch tag, so an amd64 container on an arm64
+     * host keeps being updated with amd64 images; `null` lets the daemon fall back to its own default.
+     */
+    fun pull(fromImage: String, tag: String, registryAuth: String?, platform: String?)
 }

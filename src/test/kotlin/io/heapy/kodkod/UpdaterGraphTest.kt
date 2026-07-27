@@ -4,6 +4,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -23,6 +24,7 @@ class UpdaterGraphTest {
         inspect = jsonObj(inspect),
         imageRef = "img:latest",
         currentImageId = "sha256:$id",
+        platform = null,
         composeLabels = jsonObj(labels),
         composeProject = project,
         composeService = service,
@@ -42,6 +44,27 @@ class UpdaterGraphTest {
             """{"Descriptor":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:abc123","size":123}}""",
         ).distributionDigest()
         assertEquals("sha256:abc123", digest)
+    }
+
+    @Test
+    fun imagePlatform_reads_os_and_arch_and_drops_the_variant() {
+        val inspect = jsonObj(
+            """{"ImageManifestDescriptor":{"digest":"sha256:abc","platform":{"architecture":"arm64","os":"linux","variant":"v8"}}}""",
+        )
+        assertEquals("linux/arm64", inspect.imagePlatform())
+    }
+
+    @Test
+    fun imagePlatform_is_null_without_a_usable_descriptor() {
+        assertNull(jsonObj("""{}""").imagePlatform(), "an engine that reports no descriptor pins nothing")
+        assertNull(
+            jsonObj("""{"ImageManifestDescriptor":{"digest":"sha256:abc"}}""").imagePlatform(),
+            "a descriptor without a platform pins nothing",
+        )
+        assertNull(
+            jsonObj("""{"ImageManifestDescriptor":{"platform":{"architecture":"","os":"linux"}}}""").imagePlatform(),
+            "`linux/` is not a platform the daemon can resolve",
+        )
     }
 
     @Test

@@ -20,7 +20,7 @@ class OpLoggingClientTest {
 
     @Test
     fun a_successful_mutation_is_logged_without_a_marker() {
-        val id = client.create("web", obj("""{"Image":"app:latest"}"""))
+        val id = client.create("web", obj("""{"Image":"app:latest"}"""), platform = null)
 
         assertEquals(listOf("create:web"), client.ops)
         assertEquals(listOf("web"), client.created.map { it.first })
@@ -31,7 +31,7 @@ class OpLoggingClientTest {
     fun a_failed_mutation_is_marked_and_does_not_count_as_done() {
         fake.failCreate += "web"
 
-        assertThrows(DockerException::class.java) { client.create("web", obj("""{"Image":"app:latest"}""")) }
+        assertThrows(DockerException::class.java) { client.create("web", obj("""{"Image":"app:latest"}"""), platform = null) }
 
         assertEquals(listOf("create!:web"), client.ops, "an attempted create must not read as a create")
         assertTrue(client.created.isEmpty(), "a create that threw produced no body worth inspecting")

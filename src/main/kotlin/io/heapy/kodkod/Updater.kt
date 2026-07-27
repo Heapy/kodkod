@@ -113,6 +113,7 @@ class Updater(
             inspect = inspect,
             imageRef = containerConfig?.str("Image"),
             currentImageId = inspect.str("Image").orEmpty(),
+            platform = inspect.imagePlatform(),
             composeLabels = labels,
             composeProject = labels.label("com.docker.compose.project"),
             composeService = labels.label("com.docker.compose.service"),
@@ -155,7 +156,7 @@ class Updater(
                     }
                 }
 
-                api.pull(repo, tag, config.registryAuth)
+                api.pull(repo, tag, config.registryAuth, target.platform)
                 val newImageId = api.inspectImage(imageRef).str("Id")
                 when {
                     newImageId == null ->
@@ -246,7 +247,7 @@ class Updater(
         try {
             api.stop(target.id, timeout) // usually a no-op (already stopped in the reverse-order pass)
             api.rename(target.id, backupName)
-            val newId = api.create(name, body)
+            val newId = api.create(name, body, target.platform)
             try {
                 networks.drop(1).forEach { (net, endpoint) -> api.connectNetwork(net, newId, endpoint) }
                 api.start(newId)
@@ -358,6 +359,8 @@ internal class Target(
     val inspect: JsonObject,
     val imageRef: String?,
     val currentImageId: String,
+    /** `os/arch` this container's image was resolved for, or null when the engine does not report it. */
+    val platform: String?,
     val composeLabels: JsonObject?,
     val composeProject: String?,
     val composeService: String?,
@@ -506,6 +509,22 @@ internal fun splitImageRef(ref: String): Pair<String, String> {
     } else {
         ref to "latest"
     }
+}
+
+/**
+ * `os/arch` of the image manifest this container actually runs, read from the inspect payload's
+ * `ImageManifestDescriptor.platform`. Null on engines that do not report the descriptor — then the
+ * daemon keeps choosing its own default, exactly as it did before.
+ *
+ * `variant` is deliberately **not** included: it describes the specific manifest of the *old* image
+ * (in the recorded corpus one image reports `arm64`/`v8` and another plain `arm64` on the same host),
+ * so pinning it would risk a "no matching manifest" failure against the new image.
+ */
+internal fun JsonObject.imagePlatform(): String? {
+    val platform = obj("ImageManifestDescriptor")?.obj("platform") ?: return null
+    val os = platform.str("os")?.takeIf { it.isNotBlank() } ?: return null
+    val architecture = platform.str("architecture")?.takeIf { it.isNotBlank() } ?: return null
+    return "$os/$architecture"
 }
 
 internal fun JsonObject.distributionDigest(): String? =

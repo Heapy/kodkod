@@ -373,15 +373,20 @@ max-adversarial ревью репозитория дало 15 подтвержд
 - Modify: `src/test/kotlin/io/heapy/kodkod/UpdaterTest.kt`
 - Modify: `src/test/kotlin/io/heapy/kodkod/DockerApiParseTest.kt`
 
-- [ ] тест-на-баг: контейнер с `ImageManifestDescriptor.platform={architecture:amd64,os:linux}` → `pull` и `create`
+- [x] тест-на-баг: контейнер с `ImageManifestDescriptor.platform={architecture:amd64,os:linux}` → `pull` и `create`
       получают `platform="linux/amd64"`
-- [ ] добавить `platform: String?` в `pull`/`create` интерфейса `DockerClient` и `?platform=` в `DockerApi`
+- [x] добавить `platform: String?` в `pull`/`create` интерфейса `DockerClient` и `?platform=` в `DockerApi`
       (параметр не добавляется вовсе, когда `null`)
-- [ ] извлекать платформу из inspect'а в `Updater` как `os/arch` **без `variant`**, хранить в `Target`
-- [ ] тесты: нет `ImageManifestDescriptor` (старый движок) → параметр не отправляется; у старого образа
+- [x] извлекать платформу из inspect'а в `Updater` как `os/arch` **без `variant`**, хранить в `Target`
+      (`Updater.imagePlatform()`); `FakeDockerClient.platforms` пишет аргумент обоих вызовов
+- [x] тесты: нет `ImageManifestDescriptor` (старый движок) → параметр не отправляется; у старого образа
       `variant: v8`, у нового его нет → pull всё равно проходит (variant не пинуется)
-- [ ] перезаписать фикстуры (пути запросов изменились — новые ключи replay) и отревьюить diff
-- [ ] прогнать тесты
+- [x] перезаписать фикстуры (пути запросов изменились — новые ключи replay) и отревьюить diff — записан новый
+      лейбл `engine-29.6.2_compose-5.3.1`, устаревший `engine-29.5.2_compose-5.1.4` удалён из корпуса и
+      `index.json` (его нельзя перезаписать без ровно той версии движка, а старые пути `create` без
+      `?platform=` навсегда красили replay). Число обменов по сценариям не изменилось (14/5/2/20),
+      в `create` появился `&platform=linux%2Farm64`
+- [x] прогнать тесты
 
 ### Task 9: Уважать `Config.StopTimeout` и честный read timeout
 

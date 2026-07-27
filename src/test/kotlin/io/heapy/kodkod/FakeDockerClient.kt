@@ -53,6 +53,13 @@ class FakeDockerClient : DockerClient {
     /** Refs passed to [removeImage], in call order. */
     val removedImages = mutableListOf<String>()
 
+    /**
+     * `platform` passed to [pull] and [create], in call order, `null` entries included — "the daemon
+     * was left to pick" and "we pinned the wrong arch" must not read the same. Every call is recorded,
+     * including one that goes on to fail, so this list does not line up index-wise with [created].
+     */
+    val platforms = mutableListOf<String?>()
+
     /** Invoked from [pull]; lets a test mutate [images] to simulate a freshly-pulled (moved) tag. */
     var onPull: (repo: String, tag: String) -> Unit = { _, _ -> }
 
@@ -189,8 +196,9 @@ class FakeDockerClient : DockerClient {
         op("connect", "$network:$containerId") {}
     }
 
-    override fun create(name: String, body: JsonObject): String =
+    override fun create(name: String, body: JsonObject, platform: String?): String =
         op("create", name) {
+            platforms += platform
             if (name in failCreate) throw DockerException(500, "fake: create failure for '$name'")
             created += name to body
             "new-$name-${createSeq++}"
@@ -208,8 +216,11 @@ class FakeDockerClient : DockerClient {
         return obj("""{"Descriptor":{"digest":"$digest"}}""")
     }
 
-    override fun pull(fromImage: String, tag: String, registryAuth: String?) {
-        op("pull", "$fromImage:$tag") { onPull(fromImage, tag) }
+    override fun pull(fromImage: String, tag: String, registryAuth: String?, platform: String?) {
+        op("pull", "$fromImage:$tag") {
+            platforms += platform
+            onPull(fromImage, tag)
+        }
     }
 
     private companion object {

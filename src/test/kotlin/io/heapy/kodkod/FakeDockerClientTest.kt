@@ -108,7 +108,7 @@ class FakeDockerClientTest {
     fun a_failed_create_is_marked_and_records_no_body() {
         docker.failCreate += "web"
 
-        assertThrows(DockerException::class.java) { docker.create("web", json("""{"Image":"app:1"}""")) }
+        assertThrows(DockerException::class.java) { docker.create("web", json("""{"Image":"app:1"}"""), platform = null) }
 
         assertEquals(listOf("create!:web"), docker.ops)
         assertTrue(docker.created.isEmpty(), "a create that threw produced no body")
@@ -130,7 +130,7 @@ class FakeDockerClientTest {
 
     @Test
     fun successful_mutations_are_recorded_without_a_marker() {
-        docker.create("web", json("{}"))
+        docker.create("web", json("{}"), platform = null)
         docker.start("new-web-0")
         docker.rename("new-web-0", "web2")
         docker.remove("new-web-0", force = true)
