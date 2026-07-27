@@ -404,7 +404,7 @@ internal class E2eHarness {
         }
 
         println("==> (re)starting Docker-in-Docker from $dindImage")
-        hostDocker("rm", "-f", dindName, check = false)
+        removeDind()
         hostDocker(
             "run",
             "-d",
@@ -455,10 +455,29 @@ internal class E2eHarness {
                     println("==> KEEP=1: leaving '$dindName' up (export DOCKER_HOST=tcp://127.0.0.1:$dindPort)")
                 } else {
                     println("==> removing dind '$dindName'")
-                    hostDocker("rm", "-f", dindName, check = false)
+                    removeDind()
                 }
             }
         }
+    }
+
+    /**
+     * `docker:dind` declares `VOLUME /var/lib/docker` in its image config, so every `docker run` of it gets a
+     * fresh anonymous volume that ends up holding the inner daemon's whole image store (~1 GB: the `kodkod:e2e`
+     * build, `registry:2`, `busybox`, the testapp variants). Removing the container without `-v` orphans that
+     * volume on the **host**, and a handful of runs is enough to fill a Docker Desktop VM disk.
+     *
+     * Both callers matter: this also runs before the container is started, to reclaim a dind that outlived a
+     * previous run (`-Pkodkod.e2e.keepDind=true` / `KEEP=1`, or a JVM killed before [close] ran).
+     *
+     * Deliberately not a named volume mounted at `/var/lib/docker`: a persistent inner image store means the
+     * suite no longer starts from a clean image state, which changes the code path the recorded fixtures
+     * capture — with the image already present locally kodkod takes the registry-digest branch instead of
+     * pulling (see the note in `DockerReplayTest`). The disposable anonymous volume is the point; it just has
+     * to be reclaimed.
+     */
+    private fun removeDind() {
+        hostDocker("rm", "-f", "-v", dindName, check = false)
     }
 
     fun publishVariant(variant: String) {
@@ -590,10 +609,15 @@ internal class E2eHarness {
         println("cleanup done (kodkod:e2e kept)")
     }
 
+    /**
+     * `-v` matches the `compose down -v` above: the stacks mount anonymous volumes, and leftovers removed here
+     * (kodkod's `_kodkod_old_` backups included) would otherwise orphan them — on the host itself under
+     * `-Pkodkod.e2e.useCurrentDocker=true`. Named volumes are never touched by `docker rm -v`.
+     */
     private fun removeContainersByName(name: String) {
         val ids = containerIdsByName(name)
         if (ids.isNotEmpty()) {
-            docker(*((listOf("rm", "-f") + ids).toTypedArray()), check = false)
+            docker(*((listOf("rm", "-f", "-v") + ids).toTypedArray()), check = false)
         }
     }
 

@@ -27,6 +27,13 @@ daemon is used only to run the `docker:dind` container; the registry, test stack
 and kodkod itself run inside the disposable daemon. The dind container is removed
 after the suite unless `-Pkodkod.e2e.keepDind=true` is set.
 
+That removal uses `docker rm -f -v`, and so does the pre-start cleanup of a dind
+left over from an earlier run. This matters: `docker:dind` declares
+`VOLUME /var/lib/docker`, so each run gets an anonymous volume holding the inner
+daemon's entire image store (~1 GB). Without `-v` every run would orphan one on the
+host. Keeping the dind with `-Pkodkod.e2e.keepDind=true` keeps its volume too —
+the next run reclaims both.
+
 ## Prerequisites
 
 - Docker Engine + Compose v2 available on the host.
@@ -244,9 +251,16 @@ for f in autoheal update deps multinet container-mode rollback self digest; do
 done
 docker compose -f e2e/compose.registry.yml down -v --remove-orphans || true
 
-docker ps -aq --filter 'name=e2e-' | xargs -r docker rm -f
-docker ps -aq --filter 'name=_kodkod_old_' | xargs -r docker rm -f
+docker ps -aq --filter 'name=e2e-' | xargs -r docker rm -f -v
+docker ps -aq --filter 'name=_kodkod_old_' | xargs -r docker rm -f -v
 docker rmi 127.0.0.1:5000/testapp:latest 127.0.0.1:5000/testapp:v1 127.0.0.1:5000/testapp:v2 || true
+```
+
+To manually drop a dind left behind by `-Pkodkod.e2e.keepDind=true`, on the host
+daemon (`-v` also reclaims its ~1 GB `/var/lib/docker` volume):
+
+```bash
+docker rm -f -v kodkod-e2e-dind
 ```
 
 ## Files
