@@ -610,14 +610,23 @@ internal class E2eHarness {
     }
 
     /**
-     * `-v` matches the `compose down -v` above: the stacks mount anonymous volumes, and leftovers removed here
-     * (kodkod's `_kodkod_old_` backups included) would otherwise orphan them — on the host itself under
-     * `-Pkodkod.e2e.useCurrentDocker=true`. Named volumes are never touched by `docker rm -v`.
+     * Deliberately **without** `-v`, unlike [removeDind] and the `compose down -v` above.
+     *
+     * Containers are matched by name *substring* (`e2e-`, `_kodkod_old_`), and under
+     * `-Pkodkod.e2e.useCurrentDocker=true` — the mode re-recording fixtures runs in — every `docker` call goes
+     * to the host daemon, where a container whose name merely contains one of those fragments may well belong
+     * to somebody else. A `_kodkod_old_` backup in particular is the one container that is by construction the
+     * *sole remaining reference* to a real service's anonymous volumes: kodkod removes the pre-update container
+     * with `v=false` precisely so the data it carries survives the update (`DockerApi.remove`). Taking the
+     * container out with `-v` here would take that data with it — the leftover would be cleaned up either way,
+     * so the volume is all `-v` can add.
+     *
+     * The stacks' own anonymous volumes are already reclaimed by `compose down -v`, which knows what it created.
      */
     private fun removeContainersByName(name: String) {
         val ids = containerIdsByName(name)
         if (ids.isNotEmpty()) {
-            docker(*((listOf("rm", "-f", "-v") + ids).toTypedArray()), check = false)
+            docker(*((listOf("rm", "-f") + ids).toTypedArray()), check = false)
         }
     }
 

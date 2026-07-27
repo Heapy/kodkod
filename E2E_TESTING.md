@@ -251,10 +251,17 @@ for f in autoheal update deps multinet container-mode rollback self digest; do
 done
 docker compose -f e2e/compose.registry.yml down -v --remove-orphans || true
 
-docker ps -aq --filter 'name=e2e-' | xargs -r docker rm -f -v
-docker ps -aq --filter 'name=_kodkod_old_' | xargs -r docker rm -f -v
+docker ps -aq --filter 'name=e2e-' | xargs -r docker rm -f
+docker ps -aq --filter 'name=_kodkod_old_' | xargs -r docker rm -f
 docker rmi 127.0.0.1:5000/testapp:latest 127.0.0.1:5000/testapp:v1 127.0.0.1:5000/testapp:v2 || true
 ```
+
+Note the missing `-v` on those two: the filter is a name *substring*, and a
+`_kodkod_old_` backup is by construction the last container referencing a real
+service's anonymous volumes (kodkod removes the pre-update container with
+`v=false` so that data survives an update). Run against the host daemon, `-v`
+there deletes it. `compose down -v` above already reclaims what the stacks
+created.
 
 To manually drop a dind left behind by `-Pkodkod.e2e.keepDind=true`, on the host
 daemon (`-v` also reclaims its ~1 GB `/var/lib/docker` volume):
