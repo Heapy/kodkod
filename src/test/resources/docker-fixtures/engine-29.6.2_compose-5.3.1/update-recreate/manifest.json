@@ -18,17 +18,17 @@
         },
         {
             "method": "GET",
-            "path": "/containers/7316d50d77a2cab8e900faf0bb429633a2b503f88a92ee439712f72088ed7cbb/json",
+            "path": "/containers/79c9f72c597ff4c2463a4a2df93a793ba4ca8e6366bc81cb1ac89837d1fb240e/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0003.GET.containers-7316d50d77a2cab8e900faf0bb429.bin"
+            "responseFile": "0003.GET.containers-79c9f72c597ff4c2463a4a2df93a7.bin"
         },
         {
             "method": "GET",
-            "path": "/images/sha256:61397049d3a278324b4dd0788d08be797b01db546bb506141c83779540ad99a4/json",
+            "path": "/images/sha256:b7166d61885c429aa396b84fb7c8a906e584b808788b0733319069a3f6f1fa03/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0004.GET.images-sha256-61397049d3a278324b4dd0788d.bin"
+            "responseFile": "0004.GET.images-sha256-b7166d61885c429aa396b84fb7.bin"
         },
         {
             "method": "GET",
@@ -39,10 +39,10 @@
         },
         {
             "method": "GET",
-            "path": "/images/sha256:61397049d3a278324b4dd0788d08be797b01db546bb506141c83779540ad99a4/json",
+            "path": "/images/sha256:b7166d61885c429aa396b84fb7c8a906e584b808788b0733319069a3f6f1fa03/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0006.GET.images-sha256-61397049d3a278324b4dd0788d.bin"
+            "responseFile": "0006.GET.images-sha256-b7166d61885c429aa396b84fb7.bin"
         },
         {
             "method": "GET",
@@ -60,24 +60,24 @@
         },
         {
             "method": "POST",
-            "path": "/containers/7316d50d77a2cab8e900faf0bb429633a2b503f88a92ee439712f72088ed7cbb/stop",
+            "path": "/containers/79c9f72c597ff4c2463a4a2df93a793ba4ca8e6366bc81cb1ac89837d1fb240e/stop",
             "requestBodySummary": null,
             "status": 204,
-            "responseFile": "0009.POST.containers-7316d50d77a2cab8e900faf0bb429.bin"
+            "responseFile": "0009.POST.containers-79c9f72c597ff4c2463a4a2df93a7.bin"
         },
         {
             "method": "POST",
-            "path": "/containers/7316d50d77a2cab8e900faf0bb429633a2b503f88a92ee439712f72088ed7cbb/stop",
+            "path": "/containers/79c9f72c597ff4c2463a4a2df93a793ba4ca8e6366bc81cb1ac89837d1fb240e/stop",
             "requestBodySummary": null,
             "status": 304,
-            "responseFile": "0010.POST.containers-7316d50d77a2cab8e900faf0bb429.bin"
+            "responseFile": "0010.POST.containers-79c9f72c597ff4c2463a4a2df93a7.bin"
         },
         {
             "method": "POST",
-            "path": "/containers/7316d50d77a2cab8e900faf0bb429633a2b503f88a92ee439712f72088ed7cbb/rename?name=e2e-update-app-1_kodkod_old_7316d50d77a2",
+            "path": "/containers/79c9f72c597ff4c2463a4a2df93a793ba4ca8e6366bc81cb1ac89837d1fb240e/rename?name=e2e-update-app-1_kodkod_old_79c9f72c597f",
             "requestBodySummary": null,
             "status": 204,
-            "responseFile": "0011.POST.containers-7316d50d77a2cab8e900faf0bb429.bin"
+            "responseFile": "0011.POST.containers-79c9f72c597ff4c2463a4a2df93a7.bin"
         },
         {
             "method": "POST",
@@ -88,45 +88,52 @@
         },
         {
             "method": "POST",
-            "path": "/containers/bbbe7a55f56593154d2e5c190ace155fbed6088e0a936c64b6d2609725af819c/start",
+            "path": "/containers/e8a594d0a354403481f978cd24772dc482d819f371672537d37eb99f307020fa/start",
             "requestBodySummary": null,
             "status": 204,
-            "responseFile": "0013.POST.containers-bbbe7a55f56593154d2e5c190ace1.bin"
+            "responseFile": "0013.POST.containers-e8a594d0a354403481f978cd24772.bin"
         },
         {
             "method": "GET",
-            "path": "/containers/bbbe7a55f56593154d2e5c190ace155fbed6088e0a936c64b6d2609725af819c/json",
+            "path": "/containers/e8a594d0a354403481f978cd24772dc482d819f371672537d37eb99f307020fa/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0014.GET.containers-bbbe7a55f56593154d2e5c190ace1.bin"
+            "responseFile": "0014.GET.containers-e8a594d0a354403481f978cd24772.bin"
         },
         {
             "method": "GET",
-            "path": "/containers/bbbe7a55f56593154d2e5c190ace155fbed6088e0a936c64b6d2609725af819c/json",
+            "path": "/containers/e8a594d0a354403481f978cd24772dc482d819f371672537d37eb99f307020fa/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0015.GET.containers-bbbe7a55f56593154d2e5c190ace1.bin"
+            "responseFile": "0015.GET.containers-e8a594d0a354403481f978cd24772.bin"
         },
         {
             "method": "GET",
-            "path": "/containers/bbbe7a55f56593154d2e5c190ace155fbed6088e0a936c64b6d2609725af819c/json",
+            "path": "/containers/e8a594d0a354403481f978cd24772dc482d819f371672537d37eb99f307020fa/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0016.GET.containers-bbbe7a55f56593154d2e5c190ace1.bin"
+            "responseFile": "0016.GET.containers-e8a594d0a354403481f978cd24772.bin"
         },
         {
             "method": "DELETE",
-            "path": "/containers/7316d50d77a2cab8e900faf0bb429633a2b503f88a92ee439712f72088ed7cbb?force=true&v=false",
+            "path": "/containers/79c9f72c597ff4c2463a4a2df93a793ba4ca8e6366bc81cb1ac89837d1fb240e?force=true&v=false",
             "requestBodySummary": null,
             "status": 204,
-            "responseFile": "0017.DELETE.containers-7316d50d77a2cab8e900faf0bb429.bin"
+            "responseFile": "0017.DELETE.containers-79c9f72c597ff4c2463a4a2df93a7.bin"
         },
         {
             "method": "GET",
-            "path": "/images/sha256:61397049d3a278324b4dd0788d08be797b01db546bb506141c83779540ad99a4/json",
+            "path": "/images/sha256:b7166d61885c429aa396b84fb7c8a906e584b808788b0733319069a3f6f1fa03/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0018.GET.images-sha256-61397049d3a278324b4dd0788d.bin"
+            "responseFile": "0018.GET.images-sha256-b7166d61885c429aa396b84fb7.bin"
+        },
+        {
+            "method": "GET",
+            "path": "/containers/json?all=true&filters=%7B%22label%22%3A%5B%22com.docker.compose.project%3De2e-update%22%5D%7D",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0019.GET.containers-json.bin"
         }
     ]
 }

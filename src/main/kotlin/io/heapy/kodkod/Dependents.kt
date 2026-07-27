@@ -22,6 +22,16 @@ internal data class Dependent(
     val kind: DependencyKind,
     val state: String,
     val labels: JsonObject?,
+    /**
+     * Whether the reference is spelled as the provider's **id** (full or short) rather than its name —
+     * which is what compose writes for `network_mode: service:x`.
+     *
+     * An id dies with the container it names. Once the provider has been *replaced* rather than merely
+     * restarted, such a dependent cannot be started at all any more (`No such container`), so a restart
+     * would only add a stopped container to a broken network: it has to be recreated against the
+     * replacement. A reference by name still resolves, because the replacement takes the name over.
+     */
+    val pinnedToProviderId: Boolean = false,
 ) {
     val running: Boolean get() = state == "running"
     val short: String get() = id.take(12)
@@ -92,9 +102,11 @@ internal fun dependentsIn(summaries: JsonArray, provider: DependencyProvider): L
     summaries.mapNotNull { element ->
         val summary = element.jsonObject
         val id = summary.str("Id")?.takeIf { it != provider.id } ?: return@mapNotNull null
-        val kind = when {
-            netnsRef(summary.obj("HostConfig"))?.let(provider::matches) == true -> DependencyKind.NETNS
-            summary.linkSources().any(provider::matches) -> DependencyKind.LINK
+        val netns = netnsRef(summary.obj("HostConfig"))?.takeIf(provider::matches)
+        val link = summary.linkSources().firstOrNull(provider::matches)
+        val (kind, ref) = when {
+            netns != null -> DependencyKind.NETNS to netns
+            link != null -> DependencyKind.LINK to link
             else -> return@mapNotNull null
         }
         Dependent(
@@ -103,6 +115,7 @@ internal fun dependentsIn(summaries: JsonArray, provider: DependencyProvider): L
             kind = kind,
             state = summary.str("State") ?: "running",
             labels = summary.obj("Labels"),
+            pinnedToProviderId = ref !in provider.names,
         )
     }
 

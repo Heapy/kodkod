@@ -179,6 +179,13 @@ class KodkodE2eTest {
         }
     }
 
+    /**
+     * Both kinds of namespace consumer: `consumer` is labelled for kodkod (the dependency graph brings it
+     * along), `sidecar` is not labelled at all, so with the default `KODKOD_UPDATE_MONITOR_ALL=false` the
+     * update cycle never lists it. Only a real daemon can prove the difference that makes: a container
+     * whose provider was force-removed keeps reporting `Running` while its interfaces are gone, so the
+     * assertion that matters is not the recreate but `eth0` being there afterwards.
+     */
     @Test
     @Order(6)
     fun containerNetworkModeDependentIsRecreatedAfterProviderUpdate() = e2e.scenario("container-mode") {
@@ -186,19 +193,36 @@ class KodkodE2eTest {
         compose("container-mode", "up", "-d")
         waitUntil(30, "provider v1 up") { variant("e2e-cmode-provider-1") == "v1" }
         waitUntil(30, "consumer running") { running("e2e-cmode-consumer-1") }
+        waitUntil(30, "sidecar running") { running("e2e-cmode-sidecar-1") }
         val oldProviderId = inspect("{{.Id}}", "e2e-cmode-provider-1")
         val oldConsumerId = inspect("{{.Id}}", "e2e-cmode-consumer-1")
+        val oldSidecarId = inspect("{{.Id}}", "e2e-cmode-sidecar-1")
+        assertTrue(interfaces("e2e-cmode-sidecar-1").contains("eth0"), "the sidecar starts out on a live namespace")
 
         publishVariant("v2")
 
         waitUntil(90, "provider updated to v2") { variant("e2e-cmode-provider-1") == "v2" }
         waitUntil(60, "consumer recreated after provider update") { inspect("{{.Id}}", "e2e-cmode-consumer-1") != oldConsumerId }
+        waitUntil(60, "unlabelled sidecar recreated after provider update") {
+            inspect("{{.Id}}", "e2e-cmode-sidecar-1") != oldSidecarId
+        }
         val providerId = inspect("{{.Id}}", "e2e-cmode-provider-1")
         assertEquals("v2", variant("e2e-cmode-provider-1"))
         assertNotEquals(oldProviderId, providerId, "provider id should change")
         assertNotEquals(oldConsumerId, inspect("{{.Id}}", "e2e-cmode-consumer-1"), "consumer id should change")
         assertEquals("container:$providerId", inspect("{{.HostConfig.NetworkMode}}", "e2e-cmode-consumer-1"))
         assertTrue(running("e2e-cmode-consumer-1"))
+
+        // The sidecar carries no kodkod label, so nothing in the monitored set knows it exists; without
+        // the daemon-wide scan it would be running here with `lo` and nothing else.
+        assertEquals(
+            "container:$providerId",
+            inspect("{{.HostConfig.NetworkMode}}", "e2e-cmode-sidecar-1"),
+            "the unlabelled sidecar must be joined to the replacement's namespace, not the removed one",
+        )
+        waitUntil(30, "sidecar running again") { running("e2e-cmode-sidecar-1") }
+        val addresses = interfaces("e2e-cmode-sidecar-1")
+        assertTrue(addresses.contains("eth0"), "the sidecar must have a working network after the update: $addresses")
     }
 
     @Test
@@ -523,6 +547,14 @@ internal class E2eHarness {
     /** `Config.MacAddress`, i.e. the MAC the container asked for; empty on engines that dropped the field. */
     fun configMac(container: String): String =
         inspect("{{if index .Config \"MacAddress\"}}{{index .Config \"MacAddress\"}}{{end}}", container)
+
+    /**
+     * The network interfaces [container] can see from the inside. A container whose shared network
+     * namespace was destroyed still reports `Running` and still has a plausible `NetworkMode`, and this
+     * is the only place the difference shows: everything but `lo` is gone.
+     */
+    fun interfaces(container: String): String =
+        docker("exec", container, "ip", "-o", "addr", check = false).output
 
     /** Name of the volume mounted at [destination], as the daemon reports it in the top-level `Mounts`. */
     fun volumeName(container: String, destination: String): String =

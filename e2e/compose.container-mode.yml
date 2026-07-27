@@ -20,6 +20,18 @@ services:
     labels:
       kodkod.update.enable: "true"
 
+  # Same namespace sharing as `consumer`, but with NO kodkod label at all. With
+  # KODKOD_UPDATE_MONITOR_ALL=false (the documented default) discovery never sees this container, so the
+  # dependency graph cannot help it: when provider is replaced, the namespace this container is joined to
+  # is destroyed and it keeps reporting Running with no interfaces. Only the daemon-wide create-time
+  # dependent scan can save it (plan task 18).
+  sidecar:
+    image: busybox:1.36
+    command: ["sh", "-c", "echo '[sidecar] started'; while true; do sleep 1; done"]
+    network_mode: "service:provider"
+    depends_on:
+      - provider
+
   kodkod:
     image: kodkod:e2e
     volumes:

@@ -22,7 +22,8 @@ import java.time.Instant
  * stopped in reverse dependency order and brought back in forward order. Ordinary dependents are
  * restarted; create-time dependents (`--link` / `network_mode: container:`) are recreated so Docker
  * refreshes their references. Containers pinned to a digest (`image@sha256:...`) are never stale but can
- * still be restarted or recreated as a dependent.
+ * still be restarted or recreated as a dependent. Create-time dependents that are *not* monitored are
+ * searched for across the whole daemon once the cycle is done — see [refreshCreateTimeDependents].
  *
  * Compose's `depends_on` carries a condition and a `restart` flag per edge. `condition: service_healthy`
  * is always honoured — a dependent waits for its dependency's healthcheck to pass, bounded by
@@ -184,6 +185,107 @@ class Updater(
             } catch (e: Exception) {
                 Log.error("[${target.name}] ${if (target.toRecreate) "recreate" else "restart"} failed: ${e.message}")
             }
+        }
+        refreshCreateTimeDependents(ordered)
+    }
+
+    // --- create-time dependents outside the monitored set -----------------------------------
+
+    /**
+     * Refresh containers wired to this cycle's containers at create time that are **not** in the
+     * monitored set — the blind spot [resolveLinks] cannot cover, since it can only relate targets to
+     * each other.
+     *
+     * With the documented default `KODKOD_UPDATE_MONITOR_ALL=false`, discovery is pre-filtered by the
+     * daemon to kodkod-labelled containers, so an unlabelled sidecar on `network_mode: service:app` is
+     * invisible to the whole cycle: kodkod recreates `app`, force-removes the container whose namespace
+     * the sidecar is joined to, and the sidecar goes on reporting `Running` with no interfaces and
+     * nothing in its log. A `--link` dependent outside the set keeps a stale address the same way.
+     *
+     * Run after the whole bring-back pass, because a dependent may only be pointed at a replacement
+     * that is already up. What each dependent needs then depends on how its reference is spelled — see
+     * [Dependent.pinnedToProviderId]: an id that no longer exists has to be rebuilt, anything else is
+     * refreshed by a restart. Both are announced; a dependent kodkod finds but cannot fix is a WARN,
+     * because "sidecar with no network" is a state nothing else in the system reports.
+     */
+    private fun refreshCreateTimeDependents(targets: List<Target>) {
+        // Both ids of every target: what the cycle already handled must not be handled twice, and a
+        // dependent the graph recreated answers under a *new* id whose NetworkMode now names the
+        // provider by name — which would otherwise read as a fresh find and recreate it again.
+        val handled = targets.flatMapTo(HashSet()) { listOf(it.id, it.liveId) }
+        for (target in targets) {
+            if (!target.toRestart) continue
+            val provider = DependencyProvider(target.id, setOf(target.name), target.composeProject)
+            for (dependent in findDependents(api, provider)) {
+                if (!handled.add(dependent.id)) continue
+                if (isSelf(dependent.id, dependent.labels, selfId)) continue
+                refreshDependent(dependent, target)
+            }
+        }
+    }
+
+    private fun refreshDependent(dependent: Dependent, provider: Target) {
+        val where = "[${dependent.name} (${dependent.short})]"
+        val replaced = provider.liveId != provider.id
+        val relation = when (dependent.kind) {
+            DependencyKind.NETNS -> "shares the network namespace of ${provider.name}"
+            DependencyKind.LINK -> "is --link'ed to ${provider.name}"
+        }
+        val what = if (replaced) "replaced" else "restarted"
+        if (!dependent.running) {
+            // Starting a container somebody else stopped is not this cycle's call, but staying quiet
+            // about one whose create-time reference just died would leave the operator to find out from
+            // a container that refuses to start much later, for no visible reason.
+            val doomed = if (dependent.pinnedToProviderId && replaced) {
+                " — and it references that container by id, so it will refuse to start until it is recreated"
+            } else {
+                ""
+            }
+            Log.warn("$where $relation, which this cycle $what, but is ${dependent.state} — leaving it alone$doomed")
+            return
+        }
+        if (dependent.pinnedToProviderId && replaced) {
+            Log.warn(
+                "$where $relation by id and that container is gone — recreating it against the replacement " +
+                    "(it is outside the monitored set, so nothing else would)",
+            )
+            recreateForeignDependent(dependent, provider)
+            return
+        }
+        Log.warn("$where $relation, which this cycle $what, and would be left with a dead one — restarting it too")
+        try {
+            api.restart(dependent.id, stopTimeout(dependent.labels))
+            Log.info("$where restart successful")
+        } catch (e: Exception) {
+            Log.warn("$where restart failed — it may be left without a working network: ${e.message}")
+        }
+    }
+
+    /**
+     * Recreate a dependent that is not one of this cycle's targets, so its create-time reference is
+     * rebuilt against [provider]'s replacement — by *name*, the one reference that survives the change
+     * of id. Its own image did not move, so it goes down exactly the same non-stale recreate path an
+     * in-set netns consumer takes: same create body, same liveness gate, same rollback.
+     */
+    private fun recreateForeignDependent(dependent: Dependent, provider: Target) {
+        val where = "[${dependent.name} (${dependent.short})]"
+        val inspect = try {
+            api.inspectContainer(dependent.id)
+        } catch (e: Exception) {
+            Log.warn(
+                "$where cannot be recreated because it could not be inspected — it is left joined to a " +
+                    "network namespace that no longer exists and needs a human: ${e.message}",
+            )
+            return
+        }
+        val target = toTarget(dependent.id, inspect).also {
+            it.linkedToRecreate = true
+            it.networkModeContainerName = provider.name
+        }
+        try {
+            recreate(target)
+        } catch (e: Exception) {
+            Log.warn("$where could not be recreated and may be left without a working network: ${e.message}")
         }
     }
 
@@ -524,7 +626,10 @@ class Updater(
             } catch (e: Exception) {
                 Log.warn("[$name] could not remove old container $backupName: ${e.message}")
             }
-            if (config.updateCleanup && target.currentImageId.isNotEmpty()) {
+            // Only an image that was actually replaced can be pruned. A container recreated because a
+            // create-time dependency moved runs the *same* image its replacement now runs, so there is
+            // nothing to reclaim and asking the daemon to delete it is asking it to delete a live image.
+            if (config.updateCleanup && target.stale && target.currentImageId.isNotEmpty()) {
                 pruneOldImage(name, target.currentImageId, imageRef)
             }
         } catch (e: Exception) {
@@ -767,8 +872,11 @@ class Updater(
         api.stop(target.id, stopTimeout(target), expectedStopSeconds = effectiveStopTimeout(target))
 
     /** The explicit override: per-container label first, then `KODKOD_STOP_TIMEOUT`; `null` = none. */
-    private fun stopTimeout(target: Target): Int? =
-        target.composeLabels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
+    private fun stopTimeout(target: Target): Int? = stopTimeout(target.composeLabels)
+
+    /** Same, for a container the cycle only knows from a listing (a dependent outside the target set). */
+    private fun stopTimeout(labels: JsonObject?): Int? =
+        labels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
 
     /** How long the graceful stop will really take: the override, else the container's own timeout. */
     private fun effectiveStopTimeout(target: Target): Int? =

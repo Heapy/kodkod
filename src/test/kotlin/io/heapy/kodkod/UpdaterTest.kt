@@ -1023,6 +1023,131 @@ class UpdaterTest {
         )
     }
 
+    // --- create-time dependents outside the monitored set -----------------------------------
+
+    /**
+     * A labelled, stale `app` plus a sidecar joined to its network namespace the way compose writes it:
+     * `network_mode: service:app` resolved to `container:<app's id>`. The provider's id and name differ
+     * on purpose — an id is the one spelling of the reference that cannot survive a replacement.
+     *
+     * The sidecar is up to date (its registry digest is already on its running image) so nothing about
+     * it *but* the dependency can put it in motion, and it carries the compose project label without a
+     * kodkod one: the shape of every sidecar a compose stack has.
+     */
+    private fun staleProviderWithSidecar(
+        docker: FakeDockerClient,
+        sidecarLabels: String = """{"com.docker.compose.project":"proj"}""",
+        sidecarHostConfig: String = """{"NetworkMode":"container:$PROVIDER_ID"}""",
+        sidecarNetworks: String = "{}",
+        sidecarState: String = "running",
+    ) {
+        docker.container(
+            id = PROVIDER_ID, name = "app", imageRef = "app:1", currentImageId = "sha256:app-old",
+            labels = """{"kodkod.update.enable":"true","com.docker.compose.project":"proj",""" +
+                """"com.docker.compose.service":"app"}""",
+        )
+        docker.distribution["app:1"] = "sha256:app-remote"
+        docker.images["app:1"] = json("""{"Id":"sha256:app-new","Config":{},"RepoDigests":["app@sha256:app-remote"]}""")
+        docker.container(
+            id = "side", imageRef = "busybox:1", currentImageId = "sha256:side",
+            currentRepoDigests = listOf("busybox@sha256:side-remote"),
+            labels = sidecarLabels, hostConfig = sidecarHostConfig, networks = sidecarNetworks,
+            state = sidecarState,
+        )
+        docker.distribution["busybox:1"] = "sha256:side-remote"
+    }
+
+    @Test
+    fun an_unlabelled_netns_sidecar_is_recreated_when_its_provider_is_replaced() {
+        val docker = FakeDockerClient()
+        staleProviderWithSidecar(docker)
+
+        updater(docker, config(monitorAll = false)).runOnce()
+
+        assertTrue(docker.ops.contains("create:app"), "the provider itself has to be updated: ${docker.ops}")
+        assertTrue(
+            docker.ops.contains("create:side"),
+            "a sidecar joined to the provider's namespace by id cannot survive the provider being " +
+                "replaced, and nothing else is looking at it: ${docker.ops}",
+        )
+        val body = docker.created.single { (name, _) -> name == "side" }.second
+        assertEquals(
+            "container:app", body.obj("HostConfig")?.str("NetworkMode"),
+            "the replacement must join the namespace by the name the new provider holds: $body",
+        )
+        assertTrue(running(docker, "new-side-1"), "the sidecar must come back up: ${docker.ops}")
+    }
+
+    @Test
+    fun a_monitored_netns_sidecar_is_still_recreated_exactly_once() {
+        val docker = FakeDockerClient()
+        staleProviderWithSidecar(
+            docker,
+            sidecarLabels = """{"kodkod.update.enable":"true","com.docker.compose.project":"proj"}""",
+        )
+
+        updater(docker, config(monitorAll = false)).runOnce()
+
+        assertEquals(
+            1, docker.ops.count { it == "create:side" },
+            "the dependency graph already recreates a monitored consumer; the daemon-wide scan must not " +
+                "recreate the replacement it just made: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun a_legacy_link_dependent_outside_the_monitored_set_is_restarted() {
+        val docker = FakeDockerClient()
+        // `--link app:db`, which the daemon records by name — the replacement takes that name over, so
+        // a restart is all it takes to resolve the address again.
+        staleProviderWithSidecar(
+            docker,
+            sidecarHostConfig = "{}",
+            sidecarNetworks = """{"bridge":{"Links":["app:db"]}}""",
+        )
+
+        updater(docker, config(monitorAll = false)).runOnce()
+
+        assertTrue(docker.ops.contains("restart:side"), "a --link'ed dependent keeps a stale address: ${docker.ops}")
+        assertTrue(
+            docker.ops.none { it == "create:side" },
+            "the link names the provider and the name still resolves — recreating is not needed: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun a_stopped_sidecar_outside_the_monitored_set_is_reported_rather_than_started() {
+        val docker = FakeDockerClient()
+        staleProviderWithSidecar(docker, sidecarState = "exited")
+
+        val log = captureLog { updater(docker, config(monitorAll = false)).runOnce() }
+
+        assertTrue(
+            docker.ops.none { it.endsWith(":side") },
+            "a container somebody else stopped is not this cycle's to start: ${docker.ops}",
+        )
+        assertTrue(
+            log.contains("refuse to start until it is recreated"),
+            "a dependent left pointing at a container that is gone must be said out loud: $log",
+        )
+    }
+
+    @Test
+    fun a_sidecar_that_cannot_be_recreated_is_rolled_back_and_reported() {
+        val docker = FakeDockerClient()
+        staleProviderWithSidecar(docker)
+        docker.failCreate += "side"
+
+        val log = captureLog { updater(docker, config(monitorAll = false)).runOnce() }
+
+        assertTrue(
+            log.contains("may be left without a working network"),
+            "a dependent kodkod found and could not fix is exactly what must not be silent: $log",
+        )
+        assertTrue(running(docker, "side"), "the rollback has to put the sidecar back: ${docker.ops}")
+        assertEquals("/side", docker.inspectContainer("side").str("Name"), "under its own name: ${docker.ops}")
+    }
+
     // --- reconcile: backups orphaned by a kodkod that died mid-recreate ---------------------
 
     @Test
@@ -1173,6 +1298,13 @@ private class HealthFlip(
 }
 
 /**
+ * Id of the netns provider in the create-time-dependent tests. Deliberately unlike its name ("app"):
+ * a reference spelled as an id is the one that dies with the container, and a fake whose ids double as
+ * names could not tell the two cases apart.
+ */
+private const val PROVIDER_ID = "app1234567890abcdef"
+
+/**
  * Register a container the daemon knows under [name], with no kodkod labels of its own — the shape of
  * a bystander a reconcile pass has to reason about (who holds a name, and is it alive) rather than of
  * an update target.
@@ -1209,6 +1341,7 @@ private fun FakeDockerClient.container(
     configMacAddress: String? = null,
     configStopTimeout: Int? = null,
     imageManifestPlatform: String? = null,
+    state: String = "running",
 ) {
     val repoDigests = currentRepoDigests.joinToString(",", "[", "]") { "\"$it\"" }
     val mac = configMacAddress?.let { ",\"MacAddress\":\"$it\"" } ?: ""
@@ -1216,7 +1349,12 @@ private fun FakeDockerClient.container(
     val stopTimeout = configStopTimeout?.let { ",\"StopTimeout\":$it" } ?: ""
     // Engines that report it put the resolved manifest (and its platform) on the container inspect.
     val manifest = imageManifestPlatform?.let { ""","ImageManifestDescriptor":{"platform":$it}""" } ?: ""
-    listed += Json.parseToJsonElement("""{"Id":"$id","Labels":$labels}""").jsonObject
+    // The listing carries names, state, `HostConfig.NetworkMode` and the endpoints' `Links` as the
+    // daemon does — that is all a create-time dependency of another container can be recognised from.
+    listed += Json.parseToJsonElement(
+        """{"Id":"$id","Names":["/$name"],"State":"$state","Labels":$labels,""" +
+            """"HostConfig":$hostConfig,"NetworkSettings":{"Networks":$networks}}""",
+    ).jsonObject
     containers[id] = Json.parseToJsonElement(
         """{"Name":"/$name","Image":"$currentImageId",""" +
             """"Config":{"Image":"$imageRef","Labels":$labels$mac$stopTimeout},""" +
