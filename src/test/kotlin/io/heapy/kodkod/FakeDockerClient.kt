@@ -158,14 +158,14 @@ class FakeDockerClient : DockerClient {
         }
     }
 
-    override fun restart(id: String, timeout: Int) {
+    override fun restart(id: String, timeout: Int?, expectedStopSeconds: Int?) {
         op("restart", id) {
             restartTimeouts += timeout
             running[id] = id !in startedThenExits
         }
     }
 
-    override fun stop(id: String, timeout: Int) {
+    override fun stop(id: String, timeout: Int?, expectedStopSeconds: Int?) {
         op("stop", id) {
             stopTimeouts += timeout
             running[id] = false

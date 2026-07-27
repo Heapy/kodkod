@@ -52,7 +52,7 @@ class Updater(
         for (target in ordered.asReversed()) {
             if (!target.toRestart) continue
             try {
-                api.stop(target.id, stopTimeout(target))
+                stopGracefully(target)
             } catch (e: Exception) {
                 Log.error("[${target.name}] stop failed: ${e.message}")
             }
@@ -242,10 +242,9 @@ class Updater(
             newComposeImageId = if (target.stale) target.newImageId else null,
         )
         val backupName = "${name}_kodkod_old_${target.id.take(12)}"
-        val timeout = stopTimeout(target)
 
         try {
-            api.stop(target.id, timeout) // usually a no-op (already stopped in the reverse-order pass)
+            stopGracefully(target) // usually a no-op (already stopped in the reverse-order pass)
             api.rename(target.id, backupName)
             val newId = api.create(name, body, target.platform)
             try {
@@ -338,8 +337,21 @@ class Updater(
         }
     }
 
-    private fun stopTimeout(target: Target): Int =
+    /**
+     * Stop [target] with kodkod's override if there is one, and otherwise with no `?t=` at all so the
+     * daemon honours the container's own `Config.StopTimeout` — which we still read out of the inspect
+     * we already hold, to size the read timeout for the wait we are actually signing up for.
+     */
+    private fun stopGracefully(target: Target) =
+        api.stop(target.id, stopTimeout(target), expectedStopSeconds = effectiveStopTimeout(target))
+
+    /** The explicit override: per-container label first, then `KODKOD_STOP_TIMEOUT`; `null` = none. */
+    private fun stopTimeout(target: Target): Int? =
         target.composeLabels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
+
+    /** How long the graceful stop will really take: the override, else the container's own timeout. */
+    private fun effectiveStopTimeout(target: Target): Int? =
+        stopTimeout(target) ?: target.inspect.obj("Config")?.str("StopTimeout")?.toIntOrNull()
 
     private fun inspectOldImageConfig(target: Target): JsonObject? =
         if (target.currentImageId.isEmpty()) {

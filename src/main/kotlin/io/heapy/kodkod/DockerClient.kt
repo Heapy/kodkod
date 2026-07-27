@@ -23,11 +23,19 @@ interface DockerClient {
     /** `GET /containers/{id}/json` — the full inspect payload for one container. */
     fun inspectContainer(id: String): JsonObject
 
-    /** `POST /containers/{id}/restart` — stop then start, allowing [timeout]s for the graceful stop. */
-    fun restart(id: String, timeout: Int)
+    /**
+     * `POST /containers/{id}/restart` — stop then start. [timeout] is the graceful-stop window in
+     * seconds, sent as `?t=`; `null` sends no `?t=` at all so the daemon applies the container's own
+     * `Config.StopTimeout`. [expectedStopSeconds] is the caller's best knowledge of how long that
+     * window really is — it only sizes our own read timeout and is never sent to the daemon.
+     */
+    fun restart(id: String, timeout: Int?, expectedStopSeconds: Int? = timeout)
 
-    /** `POST /containers/{id}/stop` — graceful stop with a [timeout]s deadline; tolerates "already stopped". */
-    fun stop(id: String, timeout: Int)
+    /**
+     * `POST /containers/{id}/stop` — graceful stop; tolerates "already stopped". [timeout] and
+     * [expectedStopSeconds] behave exactly as in [restart].
+     */
+    fun stop(id: String, timeout: Int?, expectedStopSeconds: Int? = timeout)
 
     /** `POST /containers/{id}/start` — start a created/stopped container; tolerates "already started". */
     fun start(id: String)

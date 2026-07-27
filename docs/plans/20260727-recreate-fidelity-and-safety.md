@@ -400,17 +400,25 @@ max-adversarial ревью репозитория дало 15 подтвержд
 - Modify: `src/test/kotlin/io/heapy/kodkod/AutohealTest.kt`
 - Modify: `src/test/kotlin/io/heapy/kodkod/ConfigTest.kt`
 
-- [ ] сменить сигнатуры на `stop(id, timeout: Int?)` / `restart(id, timeout: Int?)`; в `DockerApi` не добавлять
-      `?t=`, когда `null` (порядок «сигнатура → тест → фикс», см. исключение в Development Approach)
-- [ ] тест: контейнер с `Config.StopTimeout=30` и без kodkod-лейбла → `stop`/`restart` вызывается с `null`, а не с 10
-- [ ] отличать «явно выставленный `KODKOD_STOP_TIMEOUT`» от дефолта (`defaultStopTimeout: Int?` в `Config`);
+- [x] сменить сигнатуры на `stop(id, timeout: Int?)` / `restart(id, timeout: Int?)`; в `DockerApi` не добавлять
+      `?t=`, когда `null` (порядок «сигнатура → тест → фикс», см. исключение в Development Approach) —
+      добавлен третий параметр `expectedStopSeconds: Int? = timeout`: он не уходит на демон, а только
+      определяет наш read timeout (`?t=` и «сколько ждать ответа» — разные величины, как только `?t=` не
+      отправляется вовсе)
+- [x] тест: контейнер с `Config.StopTimeout=30` и без kodkod-лейбла → `stop`/`restart` вызывается с `null`, а не с 10
+      (`UpdaterTest.without_an_override_the_container_decides_its_own_stop_timeout`,
+      `AutohealTest.without_an_override_the_container_decides_its_own_stop_timeout`)
+- [x] отличать «явно выставленный `KODKOD_STOP_TIMEOUT`» от дефолта (`defaultStopTimeout: Int?` в `Config`);
       `stopTimeout()` в `Updater` и его аналог в `Autoheal` возвращают `null`, если нет ни лейбла, ни env
-- [ ] per-call read timeout для `stop`/`restart`: `max(60s, (effectiveStopTimeout + 15)s)`, где
+- [x] per-call read timeout для `stop`/`restart`: `max(60s, (effectiveStopTimeout + 15)s)`, где
       `effectiveStopTimeout` — override либо `Config.StopTimeout` из inspect'а (`Updater` его уже имеет);
       для `Autoheal` зафиксировать компромисс в комментарии: без inspect'а он использует пол в 60s
-- [ ] тесты: лейбл побеждает `StopTimeout`; env побеждает `StopTimeout`; read timeout считается верно для 120s
-- [ ] перезаписать фикстуры (`?t=10` уходит из путей `stop`/`restart` — ключи replay меняются во всех сценариях)
-- [ ] прогнать тесты
+- [x] тесты: лейбл побеждает `StopTimeout`; env побеждает `StopTimeout`; read timeout считается верно для 120s
+      (`DockerApiParseTest.a_long_graceful_window_stretches_the_read_timeout` → 135 000 мс)
+- [x] перезаписать фикстуры (`?t=10` уходит из путей `stop`/`restart` — ключи replay меняются во всех сценариях) —
+      перезаписан тот же лейбл `engine-29.6.2_compose-5.3.1`; нормализованная сверка манифестов: число
+      обменов не изменилось (2/20/5/14), единственная разница — исчезнувший `?t=10` у `stop`/`restart`
+- [x] прогнать тесты
 
 ### Task 10: Liveness-гейт перед удалением старого контейнера
 

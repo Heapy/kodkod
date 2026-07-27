@@ -17,12 +17,13 @@ import org.junit.jupiter.api.Test
 class UpdaterTest {
     private fun json(s: String): JsonObject = Json.parseToJsonElement(s).jsonObject
 
-    private fun config(monitorAll: Boolean = true, cleanup: Boolean = true): Config =
+    private fun config(monitorAll: Boolean = true, cleanup: Boolean = true, stopTimeout: String? = null): Config =
         Config.fromEnv(
-            mapOf(
-                "KODKOD_UPDATE_MONITOR_ALL" to monitorAll.toString(),
-                "KODKOD_UPDATE_CLEANUP" to cleanup.toString(),
-            )::get,
+            buildMap {
+                put("KODKOD_UPDATE_MONITOR_ALL", monitorAll.toString())
+                put("KODKOD_UPDATE_CLEANUP", cleanup.toString())
+                stopTimeout?.let { put("KODKOD_STOP_TIMEOUT", it) }
+            }::get,
         )
 
     /** The endpoint config the create body asks for on [network]. */
@@ -411,6 +412,53 @@ class UpdaterTest {
         assertOrder(docker.ops, "stop:web", "stop:db", "create:db", "start:web")
         assertFalse(docker.ops.contains("create:web"), "web only depends on db; it is restarted, not recreated: ${docker.ops}")
     }
+
+    // --- stop timeout ---------------------------------------------------------------------
+
+    /** Make `web` stale so a full stop -> recreate -> stop cycle runs and records its timeouts. */
+    private fun staleWeb(docker: FakeDockerClient, labels: String = "{}", configStopTimeout: Int? = null) {
+        docker.container(
+            id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
+            labels = labels, configStopTimeout = configStopTimeout,
+        )
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+    }
+
+    @Test
+    fun without_an_override_the_container_decides_its_own_stop_timeout() {
+        val docker = FakeDockerClient()
+        staleWeb(docker, configStopTimeout = 30)
+
+        Updater(docker, config(), selfId = null).runOnce()
+
+        assertEquals(
+            listOf<Int?>(null, null), docker.stopTimeouts,
+            "with no label and no KODKOD_STOP_TIMEOUT nothing may be sent — the daemon applies Config.StopTimeout",
+        )
+    }
+
+    @Test
+    fun the_label_wins_over_the_containers_own_stop_timeout() {
+        val docker = FakeDockerClient()
+        staleWeb(docker, labels = """{"kodkod.stop.timeout":"45"}""", configStopTimeout = 30)
+
+        Updater(docker, config(), selfId = null).runOnce()
+
+        assertEquals(listOf<Int?>(45, 45), docker.stopTimeouts, "an explicit label is an override: ${docker.stopTimeouts}")
+    }
+
+    @Test
+    fun the_env_default_wins_over_the_containers_own_stop_timeout() {
+        val docker = FakeDockerClient()
+        staleWeb(docker, configStopTimeout = 30)
+
+        Updater(docker, config(stopTimeout = "25"), selfId = null).runOnce()
+
+        assertEquals(
+            listOf<Int?>(25, 25), docker.stopTimeouts,
+            "an explicitly set KODKOD_STOP_TIMEOUT is an override too: ${docker.stopTimeouts}",
+        )
+    }
 }
 
 /**
@@ -427,16 +475,19 @@ private fun FakeDockerClient.container(
     hostConfig: String = "{}",
     networks: String = "{}",
     configMacAddress: String? = null,
+    configStopTimeout: Int? = null,
     imageManifestPlatform: String? = null,
 ) {
     val repoDigests = currentRepoDigests.joinToString(",", "[", "]") { "\"$it\"" }
     val mac = configMacAddress?.let { ",\"MacAddress\":\"$it\"" } ?: ""
+    // `docker run --stop-timeout` / compose `stop_grace_period`, as the daemon records it.
+    val stopTimeout = configStopTimeout?.let { ",\"StopTimeout\":$it" } ?: ""
     // Engines that report it put the resolved manifest (and its platform) on the container inspect.
     val manifest = imageManifestPlatform?.let { ""","ImageManifestDescriptor":{"platform":$it}""" } ?: ""
     listed += Json.parseToJsonElement("""{"Id":"$id","Labels":$labels}""").jsonObject
     containers[id] = Json.parseToJsonElement(
         """{"Name":"/$name","Image":"$currentImageId",""" +
-            """"Config":{"Image":"$imageRef","Labels":$labels$mac},""" +
+            """"Config":{"Image":"$imageRef","Labels":$labels$mac$stopTimeout},""" +
             """"HostConfig":$hostConfig,"NetworkSettings":{"Networks":$networks}$manifest}""",
     ).jsonObject
     images[currentImageId] = Json.parseToJsonElement(

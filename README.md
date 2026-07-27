@@ -61,7 +61,7 @@ All configuration is via environment variables:
 |--------------------------------|--------------------------|------------------------------------------------------------------------|
 | `KODKOD_DOCKER_SOCKET`         | `/var/run/docker.sock`   | Path to the Docker Engine unix socket.                                 |
 | `KODKOD_LABEL_NAMESPACE`       | `kodkod`                 | Prefix for all labels (e.g. `kodkod.autoheal.enable`).                 |
-| `KODKOD_STOP_TIMEOUT`          | `10`                     | Default stop timeout (seconds) for restart/recreate.                   |
+| `KODKOD_STOP_TIMEOUT`          | —                        | Default stop timeout (seconds) for restart/recreate. Unset: each container's own stop timeout (`stop_grace_period`) applies. |
 | `KODKOD_AUTOHEAL_ENABLED`      | `true`                   | Enable the autoheal loop.                                              |
 | `KODKOD_AUTOHEAL_INTERVAL`     | `30`                     | Seconds between unhealthy-container checks.                            |
 | `KODKOD_AUTOHEAL_START_PERIOD` | `0`                      | Seconds to wait before the first autoheal check.                      |

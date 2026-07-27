@@ -18,13 +18,19 @@ class ConfigTest {
         val c = Config.fromEnv { null }
         assertEquals("/var/run/docker.sock", c.dockerSocket)
         assertEquals("kodkod", c.labelNamespace)
-        assertEquals(10, c.defaultStopTimeout)
+        assertNull(c.defaultStopTimeout, "unset means \"no opinion\": each container's own Config.StopTimeout applies")
         assertTrue(c.autohealEnabled)
         assertEquals(30, c.autohealInterval)
         assertEquals(3600, c.updateInterval)
         assertFalse(c.autohealMonitorAll)
         assertTrue(c.updateCleanup)
         assertNull(c.registryAuth)
+    }
+
+    @Test
+    fun keeps_an_explicitly_set_stop_timeout() {
+        assertEquals(25, Config.fromEnv(env("KODKOD_STOP_TIMEOUT" to "25")).defaultStopTimeout)
+        assertNull(Config.fromEnv(env("KODKOD_STOP_TIMEOUT" to "nonsense")).defaultStopTimeout)
     }
 
     @Test

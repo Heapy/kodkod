@@ -13,6 +13,8 @@ import java.nio.charset.StandardCharsets
 class DockerApiParseTest {
     private fun bytes(s: String) = s.toByteArray(StandardCharsets.UTF_8)
 
+    private val NO_CONTENT = "HTTP/1.1 204 No Content\r\n\r\n"
+
     @Test
     fun parse_plain_response() {
         val res = DockerApi.parse(bytes("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}"))
@@ -85,9 +87,55 @@ class DockerApiParseTest {
         assertEquals(listOf("POST /images/create?fromImage=nginx&tag=1.27"), transport.requests)
     }
 
-    /** Answers every exchange with the same canned response, recording `<method> <path>`. */
+    @Test
+    fun stop_without_a_timeout_sends_no_t_parameter() {
+        val transport = CapturingTransport(NO_CONTENT)
+
+        DockerApi(transport).stop("web", timeout = null)
+
+        assertEquals(
+            listOf("POST /containers/web/stop"),
+            transport.requests,
+            "no ?t= at all is what makes the daemon fall back to the container's own Config.StopTimeout",
+        )
+        assertEquals(listOf(60_000L), transport.readTimeouts, "nothing known about the window -> the 60s floor")
+    }
+
+    @Test
+    fun stop_sends_the_timeout_it_was_given() {
+        val transport = CapturingTransport(NO_CONTENT)
+
+        DockerApi(transport).stop("web", timeout = 30)
+
+        assertEquals(listOf("POST /containers/web/stop?t=30"), transport.requests)
+        assertEquals(listOf(60_000L), transport.readTimeouts, "30s + headroom is still under the floor")
+    }
+
+    @Test
+    fun a_long_graceful_window_stretches_the_read_timeout() {
+        val transport = CapturingTransport(NO_CONTENT)
+
+        // The container's own StopTimeout is 120s: not sent to the daemon, but we must wait for it.
+        DockerApi(transport).stop("web", timeout = null, expectedStopSeconds = 120)
+
+        assertEquals(listOf("POST /containers/web/stop"), transport.requests)
+        assertEquals(listOf(135_000L), transport.readTimeouts, "120s window + 15s headroom for SIGKILL and teardown")
+    }
+
+    @Test
+    fun restart_sizes_its_read_timeout_the_same_way() {
+        val transport = CapturingTransport(NO_CONTENT)
+
+        DockerApi(transport).restart("web", timeout = 120)
+
+        assertEquals(listOf("POST /containers/web/restart?t=120"), transport.requests)
+        assertEquals(listOf(135_000L), transport.readTimeouts)
+    }
+
+    /** Answers every exchange with the same canned response, recording `<method> <path>` and the timeout. */
     private class CapturingTransport(private val response: String) : DockerTransport {
         val requests = mutableListOf<String>()
+        val readTimeouts = mutableListOf<Long>()
 
         override fun exchange(
             method: String,
@@ -97,6 +145,7 @@ class DockerApiParseTest {
             readTimeoutMs: Long,
         ): ByteArray {
             requests += "$method $path"
+            readTimeouts += readTimeoutMs
             return response.toByteArray(StandardCharsets.UTF_8)
         }
     }

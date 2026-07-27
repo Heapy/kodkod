@@ -42,8 +42,15 @@ class Autoheal(
                 continue
             }
 
+            // No override means no `?t=`: the daemon then applies the container's own Config.StopTimeout.
+            // Autoheal works off the container list alone — deliberately no inspect per unhealthy
+            // container — so in that case it cannot know that value and the read timeout keeps its 60s
+            // floor. A container with a longer stop window may therefore report a read timeout while the
+            // daemon is still stopping it (the restart itself still completes); paying an inspect per
+            // unhealthy container just to size a timeout is not worth it.
             val timeout = labels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
-            Log.warn("[$name ($short)] unhealthy — restarting with ${timeout}s timeout")
+            val window = timeout?.let { "${it}s timeout" } ?: "its own stop timeout"
+            Log.warn("[$name ($short)] unhealthy — restarting with $window")
             try {
                 api.restart(id, timeout)
                 Log.info("[$name ($short)] restart successful")

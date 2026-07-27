@@ -11,17 +11,17 @@
         },
         {
             "method": "GET",
-            "path": "/containers/3b18f9e043d87dfb7c44e7dd36b33ac6b8a1a68bf98868c8209eb160f2dbbfb5/json",
+            "path": "/containers/48079c935f921bd3bcd14c771c549d4f4d01069d8c18b96f936e14b7407cef89/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0002.GET.containers-3b18f9e043d87dfb7c44e7dd36b33.bin"
+            "responseFile": "0002.GET.containers-48079c935f921bd3bcd14c771c549.bin"
         },
         {
             "method": "GET",
-            "path": "/images/sha256:3ef749b9a2755ebfd48c5aebfc0a756d8f6a40a142a05e4699b543f607819857/json",
+            "path": "/images/sha256:78050b44a17e10085cd464440c0eda7c8f07d6aace014f04c3ebed2c57bb6577/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0003.GET.images-sha256-3ef749b9a2755ebfd48c5aebfc.bin"
+            "responseFile": "0003.GET.images-sha256-78050b44a17e10085cd464440c.bin"
         },
         {
             "method": "GET",
@@ -32,10 +32,10 @@
         },
         {
             "method": "GET",
-            "path": "/images/sha256:3ef749b9a2755ebfd48c5aebfc0a756d8f6a40a142a05e4699b543f607819857/json",
+            "path": "/images/sha256:78050b44a17e10085cd464440c0eda7c8f07d6aace014f04c3ebed2c57bb6577/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0005.GET.images-sha256-3ef749b9a2755ebfd48c5aebfc.bin"
+            "responseFile": "0005.GET.images-sha256-78050b44a17e10085cd464440c.bin"
         }
     ]
 }

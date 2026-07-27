@@ -55,12 +55,12 @@ class OpLoggingClient(private val delegate: DockerClient) : DockerClient {
             }
         }
 
-    override fun restart(id: String, timeout: Int) {
-        op("restart", label(id), ops) { delegate.restart(id, timeout) }
+    override fun restart(id: String, timeout: Int?, expectedStopSeconds: Int?) {
+        op("restart", label(id), ops) { delegate.restart(id, timeout, expectedStopSeconds) }
     }
 
-    override fun stop(id: String, timeout: Int) {
-        op("stop", label(id), ops) { delegate.stop(id, timeout) }
+    override fun stop(id: String, timeout: Int?, expectedStopSeconds: Int?) {
+        op("stop", label(id), ops) { delegate.stop(id, timeout, expectedStopSeconds) }
     }
 
     override fun start(id: String) {

@@ -45,12 +45,14 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
 
     override fun inspectContainer(id: String): JsonObject = getJson("/containers/${enc(id)}/json").jsonObject
 
-    override fun restart(id: String, timeout: Int) {
-        ok(request("POST", "/containers/${enc(id)}/restart?t=$timeout"))
+    override fun restart(id: String, timeout: Int?, expectedStopSeconds: Int?) {
+        val path = "/containers/${enc(id)}/restart${timeoutParam(timeout)}"
+        ok(request("POST", path, readTimeoutMs = stopReadTimeoutMs(expectedStopSeconds)))
     }
 
-    override fun stop(id: String, timeout: Int) {
-        ok(request("POST", "/containers/${enc(id)}/stop?t=$timeout"), 304)
+    override fun stop(id: String, timeout: Int?, expectedStopSeconds: Int?) {
+        val path = "/containers/${enc(id)}/stop${timeoutParam(timeout)}"
+        ok(request("POST", path, readTimeoutMs = stopReadTimeoutMs(expectedStopSeconds)), 304)
     }
 
     override fun start(id: String) {
@@ -150,6 +152,20 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
     private fun platformParam(platform: String?): String =
         platform?.takeIf { it.isNotBlank() }?.let { "&platform=${enc(it)}" }.orEmpty()
 
+    /**
+     * `?t=<seconds>`, or nothing at all. Omitting the parameter is not the same as sending the API
+     * default: it makes the daemon fall back to the container's own `Config.StopTimeout`.
+     */
+    private fun timeoutParam(timeout: Int?): String = timeout?.let { "?t=$it" }.orEmpty()
+
+    /**
+     * How long to wait for a stop/restart response: the graceful window plus headroom for the
+     * SIGKILL and teardown that follow it, never below the default. Without this a container with a
+     * long `StopTimeout` would have its (perfectly healthy) stop reported as a read timeout.
+     */
+    private fun stopReadTimeoutMs(expectedStopSeconds: Int?): Long =
+        maxOf(DEFAULT_READ_TIMEOUT_MS, ((expectedStopSeconds ?: 0) + 15).toLong() * 1_000)
+
     // --- HTTP/1.1 request/response handling -----------------------------------------------
 
     internal class HttpResponse(val status: Int, val body: ByteArray) {
@@ -161,10 +177,13 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
         path: String,
         body: ByteArray? = null,
         headers: Map<String, String> = emptyMap(),
-        readTimeoutMs: Long = 60_000,
+        readTimeoutMs: Long = DEFAULT_READ_TIMEOUT_MS,
     ): HttpResponse = parse(transport.exchange(method, path, body, headers, readTimeoutMs))
 
     internal companion object {
+        /** Idle read timeout for calls that do not size their own, and the floor for those that do. */
+        private const val DEFAULT_READ_TIMEOUT_MS = 60_000L
+
         private val CRLF = "\r\n".toByteArray(StandardCharsets.US_ASCII)
         private val CRLF_CRLF = "\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
 

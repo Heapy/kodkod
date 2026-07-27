@@ -7,7 +7,13 @@ package io.heapy.kodkod
 data class Config(
     val dockerSocket: String,
     val labelNamespace: String,
-    val defaultStopTimeout: Int,
+    /**
+     * `KODKOD_STOP_TIMEOUT`, or `null` when the operator set nothing. `null` is not a synonym for
+     * some hardcoded default: it means kodkod has no opinion and each container's own
+     * `Config.StopTimeout` (as recorded by `docker run --stop-timeout` / compose `stop_grace_period`)
+     * decides how long its graceful stop gets.
+     */
+    val defaultStopTimeout: Int?,
     // Autoheal — restart unhealthy containers
     val autohealEnabled: Boolean,
     val autohealInterval: Long,
@@ -25,14 +31,13 @@ data class Config(
         fun fromEnv(get: (String) -> String? = System::getenv): Config {
             fun str(key: String, default: String) = get(key)?.takeIf { it.isNotBlank() } ?: default
             fun long(key: String, default: Long) = get(key)?.trim()?.toLongOrNull() ?: default
-            fun int(key: String, default: Int) = get(key)?.trim()?.toIntOrNull() ?: default
             fun bool(key: String, default: Boolean) =
                 get(key)?.trim()?.lowercase()?.let { it in TRUTHY } ?: default
 
             return Config(
                 dockerSocket = str("KODKOD_DOCKER_SOCKET", "/var/run/docker.sock"),
                 labelNamespace = str("KODKOD_LABEL_NAMESPACE", "kodkod"),
-                defaultStopTimeout = int("KODKOD_STOP_TIMEOUT", 10),
+                defaultStopTimeout = get("KODKOD_STOP_TIMEOUT")?.trim()?.toIntOrNull(),
                 autohealEnabled = bool("KODKOD_AUTOHEAL_ENABLED", true),
                 autohealInterval = long("KODKOD_AUTOHEAL_INTERVAL", 30),
                 autohealStartPeriod = long("KODKOD_AUTOHEAL_START_PERIOD", 0),
