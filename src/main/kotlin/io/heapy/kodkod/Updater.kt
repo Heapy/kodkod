@@ -77,12 +77,16 @@ class Updater(
      *
      * `holdBackUnsafeProviders` keeps the *likely* version of this failure from ever being set up, but a
      * recreate can still fail for a reason that has nothing to do with the image (a port the previous
-     * process has not released, a network being rewired, a daemon that stopped answering mid-way). When
-     * it does, the container that used to serve the name is joined to a network namespace this cycle
-     * destroyed and cannot be started by anybody — not by kodkod's rollback, not by a human's
-     * `docker start`. Only a recreate against the container now holding the provider's name can bring
-     * it back, and nothing else in the system would ever attempt one: discovery lists running containers
-     * only, and the name is held by the very container that is down.
+     * process has not released, a network being rewired, a daemon that stopped answering mid-way). What
+     * is left when it does is a stopped container that nothing else in the system will ever look at
+     * again: discovery lists running containers only, the reconcile pass looks for `_kodkod_old_*`
+     * names, and this one is stopped under its own name.
+     *
+     * That is true whether or not the namespace it is joined to is still alive, which is why both are
+     * kept here. A consumer whose provider was merely held back is one `start` from serving — but only
+     * until a later cycle updates that provider (the consumer is stopped, so nothing holds it back any
+     * more) and force-removes the container this one names by id. Forgetting it because it looks
+     * recoverable *today* is what turns a recoverable outage into a permanent, silent one.
      *
      * The same sentence is why this memory is process-local and cannot be rebuilt after a restart of
      * kodkod itself. What the daemon holds is a stopped container whose `HostConfig.NetworkMode` names
@@ -94,7 +98,11 @@ class Updater(
      */
     private val strandedDependents = LinkedHashMap<String, StrandedDependent>()
 
-    /** A container [recoverStrandedDependents] has to rebuild, and the provider name to rebuild it against. */
+    /**
+     * A container [recoverStrandedDependents] has to bring back, and the name of the container whose
+     * network namespace it belongs in — the one reference that survives the provider being replaced,
+     * and what says whether the namespace it is joined to right now is still the right one.
+     */
     private class StrandedDependent(val name: String, val providerName: String)
 
     /**
@@ -261,18 +269,27 @@ class Updater(
         }
 
     /**
-     * Rebuild the create-time dependents a failed recreate left stopped (see [strandedDependents]),
-     * against whatever holds their provider's name now.
+     * Bring back the create-time dependents a failed recreate left stopped (see [strandedDependents]),
+     * by whichever of the two means the container actually needs.
      *
-     * Retried every cycle rather than once: the container is already down, so an attempt that fails
-     * again costs nothing but a create and the liveness window it was going to spend anyway — and the
-     * most likely reason for the first failure (an image the tag has since moved on from, a daemon that
-     * was busy) is one that later cycles fix by themselves. An entry is dropped as soon as it stops
-     * meaning anything: the container came back up, somebody removed it, or the rebuild went through.
+     * Which one that is, is asked of the daemon **here**, every cycle, rather than decided once when the
+     * container was recorded: the same container is one `start` away while the namespace it names is
+     * alive, and beyond one the moment a later cycle replaces the container that provided it. A rebuild
+     * stops, renames, creates and verifies from an image ref that may well have moved on, so it is only
+     * spent where nothing cheaper can work — and a `start` is only offered where it can actually
+     * succeed, or a container joined to a dead namespace would be "retried" forever with the daemon
+     * refusing every attempt.
      *
-     * A rollback that failed for any *other* reason is deliberately not remembered here: that container
-     * is intact and under its own name, so `docker start` puts it back, whereas one joined to a
-     * destroyed namespace cannot be started by anybody.
+     * Either way it is retried every cycle rather than once: the container is already down, so an
+     * attempt that fails again costs nothing it was not going to spend anyway — and the most likely
+     * reason for the first failure (a port the previous process still held, a daemon that was busy, an
+     * image the tag has since moved on from) is one that later cycles fix by themselves. An entry is
+     * dropped as soon as it stops meaning anything: the container came back up, somebody removed it, or
+     * kodkod put it back.
+     *
+     * A rollback that failed for a container with no create-time reference at all is deliberately not
+     * remembered: that one is intact under its own name and startable by anybody, today and in a week,
+     * so it is a human's call rather than a memory that dies with this process.
      */
     private fun recoverStrandedDependents() {
         if (strandedDependents.isEmpty()) return
@@ -297,24 +314,70 @@ class Updater(
                 strandedDependents.remove(id)
                 continue
             }
-            Log.warn(
-                "[${stranded.name}] was left stopped by a recreate that could not be rolled back, and its " +
-                    "network namespace is gone — rebuilding it against ${stranded.providerName}",
+            if (netnsStillHeldBy(inspect, stranded.providerName)) {
+                startStranded(id, stranded)
+            } else {
+                rebuildStranded(id, inspect, stranded)
+            }
+        }
+    }
+
+    /**
+     * Whether the network namespace the container described by [inspect] is joined to is still the one
+     * [providerName] serves — that is, whether a plain `start` can put this container back as it stands.
+     *
+     * The reference is followed exactly as the daemon resolves it (full id, short id or name), and the
+     * container it lands on has to still answer to the provider's name: an old container kodkod renamed
+     * to `<name>_kodkod_old_...` and then could not delete is still there, and being joined to a corpse's
+     * namespace is not the same as being served by the provider.
+     *
+     * Only a `404` is read as "gone". A probe that could not be read says nothing at all, and when we
+     * cannot tell, the cheap half of the answer is the one to give: a `start` the daemon refuses costs a
+     * log line and is retried next cycle, while a rebuild destroys the container it is trying to save.
+     */
+    private fun netnsStillHeldBy(inspect: JsonObject, providerName: String): Boolean {
+        val ref = netnsRef(inspect.obj("HostConfig")) ?: return true
+        val provider = try {
+            api.inspectContainer(ref)
+        } catch (e: Exception) {
+            return !(e is DockerException && e.status == 404)
+        }
+        return provider.str("Name")?.trimStart('/') == providerName
+    }
+
+    /** The `start` the rollback could not make, for a container whose namespace is still there. */
+    private fun startStranded(id: String, stranded: StrandedDependent) {
+        try {
+            api.start(id)
+            Log.info(
+                "[${stranded.name}] started again — it was left stopped by a recreate that could not be " +
+                    "rolled back, and the namespace it is joined to is still ${stranded.providerName}'s",
             )
-            val target = toTarget(id, inspect).also {
-                it.linkedToRecreate = true
-                it.networkModeContainerName = stranded.providerName
-                // It is here precisely because the namespace it names is gone; a rebuild that fails
-                // again leaves it exactly as stranded as it already is.
-                it.netnsProviderGone = true
-            }
-            try {
-                recreate(target)
-                strandedDependents.remove(id)
-                Log.info("[${stranded.name}] is serving again")
-            } catch (e: Exception) {
-                Log.error("[${stranded.name}] could not be rebuilt and is still DOWN: ${e.message}")
-            }
+            strandedDependents.remove(id)
+        } catch (e: Exception) {
+            Log.error(
+                "[${stranded.name}] is still DOWN — kodkod left it stopped and starting it again failed, so it " +
+                    "will be tried on every cycle: ${e.message}",
+            )
+        }
+    }
+
+    /** The only thing left for a container whose namespace died with the container that provided it. */
+    private fun rebuildStranded(id: String, inspect: JsonObject, stranded: StrandedDependent) {
+        Log.warn(
+            "[${stranded.name}] was left stopped by a recreate that could not be rolled back, and its " +
+                "network namespace is gone — rebuilding it against ${stranded.providerName}",
+        )
+        val target = toTarget(id, inspect).also {
+            it.linkedToRecreate = true
+            it.networkModeContainerName = stranded.providerName
+        }
+        try {
+            recreate(target)
+            strandedDependents.remove(id)
+            Log.info("[${stranded.name}] is serving again")
+        } catch (e: Exception) {
+            Log.error("[${stranded.name}] could not be rebuilt and is still DOWN: ${e.message}")
         }
     }
 
@@ -443,34 +506,12 @@ class Updater(
             if (!target.toRestart) continue
             awaitHealthyDependencies(target, byId)
             try {
-                if (target.toRecreate) {
-                    // Decided here, where the providers this target waited for have already been
-                    // brought back, so "was it replaced?" has an answer (see [rememberStranded]).
-                    target.netnsProviderGone = netnsProviderReplaced(target, byId)
-                    recreate(target)
-                } else {
-                    startDependent(target)
-                }
+                if (target.toRecreate) recreate(target) else startDependent(target)
             } catch (e: Exception) {
                 Log.error("[${target.name}] ${if (target.toRecreate) "recreate" else "restart"} failed: ${e.message}")
             }
         }
         refreshCreateTimeDependents(ordered)
-    }
-
-    /**
-     * Whether the container [target] joins the network namespace of **by id** was replaced earlier in
-     * this cycle — the one shape whose original container no `start` can bring back, because the id in
-     * its `HostConfig.NetworkMode` now names nothing at all.
-     *
-     * A reference spelled as a *name* is deliberately not one: the replacement takes the name over, so
-     * the original still resolves it and starts. Neither is a provider that was merely restarted — same
-     * container, same id, and the dependent joins the namespace it came back with.
-     */
-    private fun netnsProviderReplaced(target: Target, byId: Map<String, Target>): Boolean {
-        val ref = netnsRef(target.inspect.obj("HostConfig")) ?: return false
-        val provider = byId.values.firstOrNull { it.id == ref || (ref.length >= 4 && it.id.startsWith(ref)) }
-        return provider != null && provider.liveId != provider.id
     }
 
     /**
@@ -601,11 +642,14 @@ class Updater(
         if (!dependent.running) {
             // Starting a container somebody else stopped is not this cycle's call, but staying quiet
             // about one whose create-time reference just died would leave the operator to find out from
-            // a container that refuses to start much later, for no visible reason.
-            val doomed = if (dependent.pinnedToProviderId && replaced) {
-                " — and it references that container by id, so it will refuse to start until it is recreated"
-            } else {
-                ""
+            // a container that refuses to start much later, for no visible reason. One kodkod itself
+            // left stopped is a different sentence: it is tracked, and the next cycle rebuilds it.
+            val doomed = when {
+                dependent.id in strandedDependents ->
+                    " — kodkod left it stopped itself and will rebuild it against ${provider.name} next cycle"
+                dependent.pinnedToProviderId && replaced ->
+                    " — and it references that container by id, so it will refuse to start until it is recreated"
+                else -> ""
             }
             Log.warn("$where $relation, which this cycle $what, but is ${dependent.state} — leaving it alone$doomed")
             return null
@@ -659,9 +703,6 @@ class Updater(
         val target = toTarget(dependent.id, inspect).also {
             it.linkedToRecreate = true
             it.networkModeContainerName = provider.name
-            // This path is only taken for a dependent that names its provider by an id the cycle has
-            // just destroyed (see [refreshDependent]), so its original cannot be started by anybody.
-            it.netnsProviderGone = true
         }
         return try {
             recreate(target)
@@ -1057,30 +1098,42 @@ class Updater(
 
     /**
      * Remember a create-time dependent whose rollback did not land, so [recoverStrandedDependents] keeps
-     * trying to rebuild it.
+     * bringing it back until it is serving again.
      *
-     * Only a container joined to a namespace **this cycle destroyed** is recorded, which is
-     * [Target.netnsProviderGone] and nothing else. [Target.networkModeContainerName] does not say that:
-     * `resolveLinks` sets it for every container with a `container:<ref>` network mode, moved provider
-     * or not — so gating on it recorded a consumer whose provider `holdBackUnsafeProviders` had
-     * deliberately kept out of the cycle. That container is stopped under its own name with its
-     * namespace still alive: `docker start` fixes it, while a rebuild stops, renames, creates and
-     * verifies it from an image ref that has just failed here, every cycle, forever — and announces it
-     * with an ERROR saying its network namespace is gone, which is not true.
+     * *Every* netns consumer left stopped this way is recorded, whether or not its provider moved. What
+     * differs between the two is the action, and that is decided per cycle from the daemon
+     * ([netnsStillHeldBy]) rather than fixed here — because it changes: recording only the consumers
+     * whose provider had already been replaced ended the same way as recording none. A consumer whose
+     * provider `holdBackUnsafeProviders` had deliberately kept out of the cycle is a `start` away *at
+     * that moment*, but the hold-back only protects it while it is still a target, and a stopped
+     * container is in no listing the next cycle makes. That cycle then updates the provider unopposed,
+     * force-removes the container this one names by id, and leaves it unstartable with nothing tracking
+     * it and nothing that would ever look at it again.
+     *
+     * Which of the two it is *is* still said out loud, because it is what an operator needs to fix it by
+     * hand — the retry lives in this process only, and there is no way to leave a marker on a container
+     * that already exists.
      */
     private fun rememberStranded(target: Target) {
-        if (!target.netnsProviderGone) return
         val provider = target.networkModeContainerName ?: return
         if (netnsRef(target.inspect.obj("HostConfig")) == null) return
-        strandedDependents[target.id] = StrandedDependent(target.name, provider)
+        val name = target.name
+        strandedDependents[target.id] = StrandedDependent(name, provider)
+        val (state, byHand) = if (netnsStillHeldBy(target.inspect, provider)) {
+            "it is stopped under its own name and the namespace it is joined to is still $provider's, so a " +
+                "`start` is all it needs — kodkod will retry that on every cycle until it is serving again" to
+                "start it by hand (`docker start $name`)"
+        } else {
+            "it is joined to the network namespace of a container this cycle replaced, which no `start` can " +
+                "bring back — kodkod will rebuild it against $provider on every cycle until it is serving " +
+                "again" to
+                "recreate it by hand (`docker rm $name`, then bring it back up the way it was created, e.g. " +
+                "`docker compose up -d`)"
+        }
         Log.error(
-            "[${target.name}] cannot be put back as it was — it is joined to the network namespace of a " +
-                "container this cycle replaced, which no `start` can bring back. kodkod will rebuild it " +
-                "against $provider on every cycle until it is serving again — but only for as long as " +
-                "THIS kodkod process lives: a stopped container is in no listing kodkod makes, so a " +
-                "kodkod that restarts before this is resolved will never look at it again. If that " +
-                "happens, recreate it by hand (`docker rm ${target.name}`, then bring it back up the way " +
-                "it was created, e.g. `docker compose up -d`)",
+            "[$name] is DOWN and could not be put back as it was: $state. But only for as long as THIS " +
+                "kodkod process lives: a stopped container is in no listing kodkod makes, so a kodkod that " +
+                "restarts before this is resolved will never look at it again — if that happens, $byHand",
         )
     }
 
@@ -1589,16 +1642,6 @@ internal class Target(
 
     /** Name captured before updates for `HostConfig.NetworkMode=container:<id|name>`. */
     var networkModeContainerName: String? = null
-
-    /**
-     * The container this one is joined to by **id** was replaced, so its own original container can no
-     * longer be started by anybody — the daemon answers `No such container`. Set only where that is
-     * actually known (see `netnsProviderReplaced` and the two foreign-dependent paths), and read only by
-     * `rememberStranded`, which must not confuse this with the far more common shape:
-     * [networkModeContainerName] is set for *every* netns consumer, including one whose provider kodkod
-     * deliberately did not touch.
-     */
-    var netnsProviderGone: Boolean = false
 
     /** The running image's defaults, captured before pulling so a moved tag cannot erase them. */
     var oldImageConfig: JsonObject? = null

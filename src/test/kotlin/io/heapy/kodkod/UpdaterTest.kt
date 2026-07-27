@@ -1811,20 +1811,17 @@ class UpdaterTest {
     }
 
     /**
-     * The other half of the stranding decision, and the half that used to be decided wrong. A netns
-     * consumer whose provider `holdBackUnsafeProviders` deliberately kept out of the cycle is recreated
-     * **alone**, against a namespace that is still there — that is the entire point of holding the
-     * provider back. If that solo recreate fails and the rollback does not land either (a port the
+     * A netns consumer whose provider `holdBackUnsafeProviders` deliberately kept out of the cycle is
+     * recreated **alone**, against a namespace that is still there — that is the entire point of holding
+     * the provider back. If that solo recreate fails and the rollback does not land either (a port the
      * previous process has not released is enough), what is left is a stopped container under its own
      * name whose namespace is alive: one `docker start` away.
      *
-     * Recording it as stranded instead means kodkod stops, renames, creates and verifies it from the
-     * image ref that has just failed here — every cycle, uncapped — and announces it with an ERROR
-     * saying its network namespace is gone, which is not true of this container at all.
+     * So a `start` is what it gets. Rebuilding it instead means kodkod stops, renames, creates and
+     * verifies it from the image ref that has just failed here — every cycle, uncapped — and announces
+     * it with an ERROR saying its network namespace is gone, which is not true of this container at all.
      */
-    @Test
-    fun a_consumer_whose_provider_never_moved_is_not_recorded_as_stranded() {
-        val docker = FakeDockerClient()
+    private fun consumerHeldBackFromItsProvider(docker: FakeDockerClient) {
         docker.container(
             id = PROVIDER_ID, name = "app", imageRef = "app:1", currentImageId = "sha256:app-old",
             labels = """{"kodkod.update.enable":"true"}""",
@@ -1838,8 +1835,14 @@ class UpdaterTest {
             hostConfig = """{"NetworkMode":"container:$PROVIDER_ID"}""",
         )
         docker.images["busybox:1"] = json("""{"Id":"sha256:side-new","Config":{},"RepoDigests":[]}""")
-        docker.failCreate += "side"
-        docker.failStart += "side"
+        docker.failCreate += "side" // the solo recreate fails...
+        docker.failStart += "side" // ...and the rollback's start does not land either
+    }
+
+    @Test
+    fun a_consumer_whose_provider_never_moved_is_started_again_rather_than_rebuilt() {
+        val docker = FakeDockerClient()
+        consumerHeldBackFromItsProvider(docker)
         val updater = updater(docker, config(monitorAll = false))
 
         val log = captureLog { updater.runOnce() }
@@ -1848,19 +1851,107 @@ class UpdaterTest {
             docker.ops.none { it.startsWith("create:app") },
             "the test is worthless unless the provider really was held back: ${docker.ops}",
         )
+        assertTrue(
+            log.contains("a `start` is all it needs"),
+            "the namespace it is joined to is still there, and that is what decides what it needs: $log",
+        )
         assertFalse(
-            log.contains("network namespace is gone"),
-            "the provider was never touched, so saying its namespace is gone is a falsehood: $log",
+            log.contains("no `start` can bring back"),
+            "the provider was never touched, so saying it cannot be started is a falsehood: $log",
         )
 
         val afterFirstCycle = docker.ops.size
+        val second = captureLog { updater.runOnce() }
+
+        assertEquals(
+            listOf("start!:side"), docker.ops.drop(afterFirstCycle).filter { it.endsWith(":side") },
+            "a container a `docker start` would fix must be started, not destroyed and rebuilt from an " +
+                "image ref that has just failed here: ${docker.ops}",
+        )
+        assertTrue(
+            second.contains("starting it again failed"),
+            "and the retry that did not land is the operator's only sign it is still down: $second",
+        )
+    }
+
+    /**
+     * The consequence of leaving that container stopped, and the reason it is remembered anyway: the
+     * hold-back only protects a consumer while it is still a *target*. This one is stopped, so the next
+     * cycle's discovery (`status=running`) does not see it, nothing keeps the provider back any more,
+     * and the update that follows force-removes the very container this one names by id.
+     *
+     * From that moment a `start` is refused by the daemon and only a rebuild can bring it back — which
+     * is exactly what nothing else in the system would ever attempt.
+     */
+    @Test
+    fun a_consumer_left_stopped_is_rebuilt_once_its_provider_moves_after_all() {
+        val docker = FakeDockerClient()
+        consumerHeldBackFromItsProvider(docker)
+        val updater = updater(docker, config(monitorAll = false))
+
         updater.runOnce()
+        updater.runOnce() // the consumer is not a target any more, so the provider is updated here
+        val afterProviderMoved = docker.ops.size
 
         assertTrue(
-            docker.ops.drop(afterFirstCycle).none { it.contains(":side") },
-            "a container that a `docker start` would fix must not be destroyed and rebuilt every " +
-                "cycle instead: ${docker.ops}",
+            docker.ops.contains("create:app") && docker.ops.contains("remove:$PROVIDER_ID"),
+            "the test is worthless unless the namespace the consumer names really died: ${docker.ops}",
         )
+        docker.failCreate -= "side" // whatever refused the create the first time is over
+        val log = captureLog { updater.runOnce() }
+
+        assertTrue(
+            docker.ops.drop(afterProviderMoved).contains("create:side"),
+            "a `start` cannot join a namespace that no longer exists — the container has to be rebuilt, " +
+                "and only kodkod's own memory of it is left to do that: ${docker.ops}",
+        )
+        assertEquals(
+            "container:app", docker.created.last { (name, _) -> name == "side" }.second
+                .obj("HostConfig")?.str("NetworkMode"),
+            "against the container holding the provider's name now: ${docker.created}",
+        )
+        val rebuilt = docker.ops.last { it.startsWith("start:new-side-") }.removePrefix("start:")
+        assertTrue(running(docker, rebuilt), "and it has to be serving again: ${docker.ops}")
+        assertTrue(log.contains("is serving again"), "which is the one thing the operator waits for: $log")
+    }
+
+    /**
+     * "The container it names still exists" is not the same question as "its namespace is still the
+     * provider's". A recreate whose final `remove` the daemon refused leaves the old provider behind,
+     * stopped, under its `_kodkod_old_` backup name — so the consumer's reference still resolves, to a
+     * corpse. A `start` against that is refused by the daemon for as long as the corpse is there, and
+     * offering one every cycle would leave the service down while the one thing that fixes it (a rebuild
+     * against the container actually serving the name) is never attempted.
+     */
+    @Test
+    fun a_consumer_joined_to_a_corpse_the_daemon_would_not_delete_is_rebuilt() {
+        val docker = FakeDockerClient()
+        staleProviderWithSidecar(docker)
+        docker.failRemove += PROVIDER_ID // the old provider survives its own replacement, renamed
+        docker.failCreate += "side"
+        val updater = updater(docker, config(monitorAll = false))
+
+        val log = captureLog { updater.runOnce() }
+
+        assertTrue(
+            docker.ops.contains("rename:$PROVIDER_ID->app_kodkod_old_${PROVIDER_ID.take(12)}"),
+            "the test is worthless unless the old provider is still there under another name: ${docker.ops}",
+        )
+        assertTrue(
+            log.contains("no `start` can bring back"),
+            "the reference resolves, but not to the provider — a `start` the daemon refuses every cycle " +
+                "is not a recovery: $log",
+        )
+
+        val afterFirstCycle = docker.ops.size
+        docker.failCreate -= "side"
+        val second = captureLog { updater.runOnce() }
+
+        assertTrue(
+            docker.ops.drop(afterFirstCycle).contains("create:side"),
+            "and the rebuild against the container serving the name is what brings it back: ${docker.ops}",
+        )
+        assertTrue(second.contains("is serving again"), "which is the outcome the operator waits for: $second")
     }
 
     // --- reconcile: backups orphaned by a kodkod that died mid-recreate ---------------------

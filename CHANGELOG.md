@@ -68,13 +68,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   joined to a namespace that no longer exists). The provider is therefore kept out of the cycle until
   the dependent's own image has settled, one update per cycle instead of an outage with no way back.
 - A create-time dependent that could not be recreated *and* could not be rolled back is remembered and
-  rebuilt against its provider on every later cycle, instead of being left stopped under its own name
-  where neither discovery (`status=running`) nor the backup reconcile (`_kodkod_old_*`) would ever look
-  at it again. Only a dependent joined **by id** to a container this cycle actually replaced counts: one
-  whose provider was held back is stopped with its namespace still alive and a `docker start` away, and
-  rebuilding it every cycle would destroy and re-create a container for nothing. Like the cooldown, this
-  memory lives in the process — the log line says so, and names the command to run by hand if kodkod
-  restarts before the rebuild goes through.
+  brought back on every later cycle, instead of being left stopped under its own name where neither
+  discovery (`status=running`) nor the backup reconcile (`_kodkod_old_*`) would ever look at it again.
+  What it takes is decided each cycle from the daemon: while the namespace it names is still its
+  provider's, a `start` is issued and nothing is destroyed; once that container is gone — which a later
+  cycle can do at any time, since a stopped dependent no longer holds its provider back — only a rebuild
+  against the container serving the provider's name can work, and that is what it gets. Like the
+  cooldown, this memory lives in the process: the log line says so, and names the command to run by hand
+  if kodkod restarts before the container is serving again.
 - Recreate create-time dependents (`--link` / `network_mode: container:`) when a dependency is updated,
   and resolve `network_mode: container:<id>` to a container name before any old ids are removed. This
   now also covers dependents kodkod does not monitor itself.
