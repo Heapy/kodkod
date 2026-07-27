@@ -94,11 +94,11 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
         return json.parseToJsonElement(response.bodyText).jsonObject["Id"]!!.jsonPrimitive.content
     }
 
-    /** `GET /images/{ref}/json` — note the ref (repo/tag) is kept raw; its slashes/colons are valid path chars. */
-    override fun inspectImage(ref: String): JsonObject = getJson("/images/$ref/json").jsonObject
+    /** `GET /images/{ref}/json` — the ref keeps its slashes and colons, which are valid path chars. */
+    override fun inspectImage(ref: String): JsonObject = getJson("/images/${encRef(ref)}/json").jsonObject
 
     override fun removeImage(ref: String) {
-        ok(request("DELETE", "/images/$ref?force=false&noprune=false"), 404, 409)
+        ok(request("DELETE", "/images/${encRef(ref)}?force=false&noprune=false"), 404, 409)
     }
 
     /** `GET /distribution/{ref}/json` — fetch registry manifest metadata without pulling layers. */
@@ -106,7 +106,7 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
         val headers = buildMap {
             if (registryAuth != null) put("X-Registry-Auth", registryAuth)
         }
-        val response = request("GET", "/distribution/$ref/json", headers = headers)
+        val response = request("GET", "/distribution/${encRef(ref)}/json", headers = headers)
         ok(response)
         return json.parseToJsonElement(response.bodyText).jsonObject
     }
@@ -146,6 +146,19 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
     private fun enc(value: String): String = URLEncoder.encode(value, StandardCharsets.UTF_8)
 
     /**
+     * An image reference as a *path* segment. Unlike [enc] this keeps the characters a reference is
+     * made of — `/`, `:`, `@`, `.`, `_`, `-`, `+` — since the engine routes on `{name:.*}` and expects
+     * them literally. Everything else is percent-encoded: a reference comes from a container's
+     * `Config.Image`, so a space or a `?` in it would otherwise end up rewriting the request target.
+     */
+    private fun encRef(ref: String): String = buildString(ref.length) {
+        for (byte in ref.toByteArray(StandardCharsets.UTF_8)) {
+            val char = byte.toInt().toChar()
+            if (byte >= 0 && (char.isLetterOrDigit() || char in REF_SAFE)) append(char) else append("%%%02X".format(byte))
+        }
+    }
+
+    /**
      * `&platform=os%2Farch`, or nothing at all. The parameter is omitted rather than sent empty: an
      * empty `platform=` is a malformed platform spec to the daemon, not "no preference".
      */
@@ -183,6 +196,9 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
     internal companion object {
         /** Idle read timeout for calls that do not size their own, and the floor for those that do. */
         private const val DEFAULT_READ_TIMEOUT_MS = 60_000L
+
+        /** Non-alphanumeric characters an image reference may carry into a request path unencoded. */
+        private const val REF_SAFE = "/:@._-+~"
 
         private val CRLF = "\r\n".toByteArray(StandardCharsets.US_ASCII)
         private val CRLF_CRLF = "\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)

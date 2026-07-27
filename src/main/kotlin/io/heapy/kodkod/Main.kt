@@ -28,10 +28,10 @@ fun main() {
             "monitorAll=${config.updateMonitorAll} cleanup=${config.updateCleanup}",
     )
 
-    if (!config.autohealEnabled && !config.updateEnabled) {
-        Log.warn("both autoheal and update are disabled — nothing to do, exiting")
-        return
-    }
+    // Even with both loops off there is one thing left to do: recover a container a previous kodkod
+    // left parked under its `_kodkod_old_` backup name. That is a service that is down right now, and
+    // switching the updater off after being burned by it is exactly when it needs recovering.
+    val nothingScheduled = !config.autohealEnabled && !config.updateEnabled
 
     val api = DockerApi(config.dockerSocket)
     try {
@@ -39,6 +39,9 @@ fun main() {
         Log.info("connected to docker engine (version ${version.str("Version")}, API ${version.str("ApiVersion")})")
     } catch (e: Exception) {
         Log.error("cannot reach docker at ${config.dockerSocket}: ${e.message}")
+        // With nothing scheduled, an unreachable daemon leaves nothing undone — exiting cleanly beats
+        // a restart loop over a process that was asked to do nothing anyway.
+        if (nothingScheduled) return
         exitProcess(1)
     }
 
@@ -56,6 +59,11 @@ fun main() {
     // left parked under its `_kodkod_old_` backup name by a previous process that died mid-recreate is
     // down *right now*, and with the updater switched off no cycle would ever come looking for it.
     guarded("reconcile", cycleLock, updater::reconcileOrphanedBackups).run()
+
+    if (nothingScheduled) {
+        Log.warn("both autoheal and update are disabled — nothing left to do after the reconcile, exiting")
+        return
+    }
 
     // scheduleWithFixedDelay prevents a job from overlapping with itself; the shared lock also
     // serializes autoheal and update cycles so restart/recreate operations cannot race.

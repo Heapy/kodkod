@@ -91,8 +91,10 @@ data class Config(
         fun fromEnv(get: (String) -> String? = System::getenv): Config {
             fun str(key: String, default: String) = get(key)?.takeIf { it.isNotBlank() } ?: default
             fun long(key: String, default: Long) = get(key)?.trim()?.toLongOrNull() ?: default
+            // An empty value is an *unset* variable, not `false`: `KODKOD_UPDATE_VERIFY_HEALTH=` in a
+            // compose file (or an unresolved `${...}`) must not silently switch a safety check off.
             fun bool(key: String, default: Boolean) =
-                get(key)?.trim()?.lowercase()?.let { it in TRUTHY } ?: default
+                get(key)?.trim()?.takeIf { it.isNotEmpty() }?.lowercase()?.let { it in TRUTHY } ?: default
 
             // Read up front: the backoff ceiling is expressed relative to it.
             val autohealInterval = long("KODKOD_AUTOHEAL_INTERVAL", 30)

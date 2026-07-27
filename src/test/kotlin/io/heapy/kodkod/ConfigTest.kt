@@ -128,6 +128,20 @@ class ConfigTest {
         assertFalse(Config.fromEnv(env("KODKOD_UPDATE_MONITOR_ALL" to "nope")).updateMonitorAll)
     }
 
+    /**
+     * `KODKOD_UPDATE_VERIFY_HEALTH:` in a compose file, or an `${...}` that resolved to nothing, is an
+     * unset variable — not a request to switch half the liveness gate off.
+     */
+    @Test
+    fun an_empty_value_falls_back_to_the_default_rather_than_to_false() {
+        assertTrue(Config.fromEnv(env("KODKOD_UPDATE_VERIFY_HEALTH" to "")).updateVerifyHealth)
+        assertTrue(Config.fromEnv(env("KODKOD_UPDATE_CLEANUP" to "   ")).updateCleanup)
+        assertFalse(
+            Config.fromEnv(env("KODKOD_UPDATE_MONITOR_ALL" to "")).updateMonitorAll,
+            "and a default of false stays false — the point is that the default decides",
+        )
+    }
+
     @Test
     fun reads_the_autoheal_backoff_ceiling() {
         assertEquals(300, Config.fromEnv(env("KODKOD_AUTOHEAL_MAX_INTERVAL" to "300")).autohealMaxInterval)

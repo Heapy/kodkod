@@ -103,7 +103,16 @@ internal class FixtureWriter(
     private fun promote(staging: Path, target: Path): Path {
         val backup = target.resolveSibling("${target.fileName}.backup-${UUID.randomUUID()}")
         val hadPrevious = Files.exists(target)
-        if (hadPrevious) Files.move(target, backup)
+        if (hadPrevious) {
+            try {
+                Files.move(target, backup)
+            } catch (e: Throwable) {
+                // The committed copy is untouched, so the only thing left to clean up is the staging
+                // directory — leaving it behind would put a half-written scenario next to the corpus.
+                staging.toFile().deleteRecursively()
+                throw e
+            }
+        }
         try {
             Files.move(staging, target)
         } catch (e: Throwable) {

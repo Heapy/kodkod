@@ -244,6 +244,29 @@ class UpdaterTest {
         assertEquals(listOf("sha256:old"), docker.removedImages, "an untagged image is ours to reclaim: ${docker.removedImages}")
     }
 
+    /**
+     * `RepoTags` is what the daemon normalised the tag to (`nginx:1.27`), while the ref being updated
+     * is whatever the container's `Config.Image` says. Compared raw, the one tag on the image never
+     * matches the ref it belongs to, every prune stands down, and `KODKOD_UPDATE_CLEANUP=true` does
+     * nothing at all.
+     */
+    @Test
+    fun a_hub_reference_matches_the_tag_the_daemon_recorded_for_it() {
+        val docker = FakeDockerClient()
+        docker.container(id = "web", imageRef = "docker.io/library/nginx:1.27", currentImageId = "sha256:old")
+        docker.images["sha256:old"] =
+            json("""{"Id":"sha256:old","Config":{},"RepoDigests":[],"RepoTags":["nginx:1.27"]}""")
+        docker.images["docker.io/library/nginx:1.27"] =
+            json("""{"Id":"sha256:new","Config":{},"RepoDigests":[],"RepoTags":["nginx:1.27"]}""")
+
+        updater(docker, config(cleanup = true)).runOnce()
+
+        assertEquals(
+            listOf("sha256:old"), docker.removedImages,
+            "the only tag left on the old image is the one that moved to the new one: ${docker.removedImages}",
+        )
+    }
+
     @Test
     fun an_unreadable_old_image_is_left_alone() {
         val docker = FakeDockerClient()
@@ -942,6 +965,30 @@ class UpdaterTest {
         assertTrue(log.contains("left out of this cycle's dependency restarts"), "and it has to say so: $log")
     }
 
+    /**
+     * The memory is about the *image*, and only a replacement that was actually asked to run says
+     * anything about it. A name conflict, a refused stop or a create the daemon rejected happen with
+     * any image — remembering those would freeze a perfectly good update for six hours over a blip.
+     */
+    @Test
+    fun a_failure_before_the_image_ever_ran_is_not_held_against_it() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.failCreate += "web"
+        val updater = updater(docker)
+
+        updater.runOnce()
+        val afterFirstCycle = docker.ops.size
+
+        val log = captureLog { updater.runOnce() }
+
+        assertTrue(
+            docker.ops.drop(afterFirstCycle).contains("create!:web"),
+            "the update has to be attempted again next cycle: ${docker.ops}",
+        )
+        assertFalse(log.contains("skipping this update"), "nothing was learned about the image: $log")
+    }
+
     @Test
     fun a_zero_cooldown_gives_back_the_retry_every_cycle_behaviour() {
         val docker = FakeDockerClient()
@@ -1351,6 +1398,30 @@ class UpdaterTest {
         )
     }
 
+    /**
+     * Namespaces chain: `second` is joined to `side`, which is joined to `app`. Recreating `side` tears
+     * its namespace down exactly as replacing `app` tore down `app`'s, so a pass that stops at the
+     * first link leaves `second` reporting `Running` with no interfaces at all.
+     */
+    @Test
+    fun a_chain_of_shared_namespaces_is_followed_past_the_first_link() {
+        val docker = FakeDockerClient()
+        staleProviderWithSidecar(docker)
+        docker.container(
+            id = "second0000000", name = "second", imageRef = "busybox:1", currentImageId = "sha256:second",
+            labels = """{"com.docker.compose.project":"proj"}""",
+            hostConfig = """{"NetworkMode":"container:side"}""",
+        )
+
+        updater(docker, config(monitorAll = false)).runOnce()
+
+        assertTrue(docker.ops.contains("create:side"), "the first link is recreated as before: ${docker.ops}")
+        assertTrue(
+            docker.ops.contains("restart:second0000000"),
+            "and whatever was joined to *that* one has to be refreshed too: ${docker.ops}",
+        )
+    }
+
     @Test
     fun a_legacy_link_dependent_outside_the_monitored_set_is_restarted() {
         val docker = FakeDockerClient()
@@ -1576,6 +1647,51 @@ class UpdaterTest {
             "the container already runs the new image — recreating it now is an outage for nothing: ${docker.ops}",
         )
         assertTrue(log.contains("dropping this cycle's plan"), "a dropped plan must say so: $log")
+    }
+
+    /**
+     * Discovery only ever lists running containers, so every target was running when the plan was
+     * made. One that is not any more was stopped by somebody else during the pull — and stopping,
+     * renaming, recreating and *starting* it would put it back up behind whoever stopped it.
+     */
+    @Test
+    fun a_plan_whose_container_was_stopped_meanwhile_is_dropped() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        val kodkod = updater(docker)
+        val plan = kodkod.plan()
+
+        docker.stop("web", timeout = null) // an operator took it down while the image was downloading
+        val before = docker.ops.size
+        val log = captureLog { kodkod.apply(plan) }
+
+        assertTrue(docker.ops.drop(before).isEmpty(), "a container somebody stopped stays stopped: ${docker.ops}")
+        assertTrue(log.contains("no longer running"), "and the reason has to be in the log: $log")
+    }
+
+    /**
+     * Minutes of image download sit between the two halves, and the create body is built from what the
+     * container looked like. Building it from the *plan's* snapshot silently reverts everything done in
+     * between — a `docker update`, a `docker network connect`, a label edit.
+     */
+    @Test
+    fun the_replacement_is_built_from_the_container_as_it_is_at_apply_time() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        val kodkod = updater(docker)
+        val plan = kodkod.plan()
+
+        // An operator raises the memory limit while the new image downloads.
+        docker.containers["web"] = json(
+            """{"Name":"/web","Image":"sha256:old","Config":{"Image":"nginx:1.27","Labels":{}},
+               "HostConfig":{"Memory":536870912},"NetworkSettings":{"Networks":{}}}""",
+        )
+        kodkod.apply(plan)
+
+        assertEquals(
+            "536870912", docker.created.single().second.obj("HostConfig")?.str("Memory"),
+            "the replacement must carry the configuration the container actually had: ${docker.created}",
+        )
     }
 
     /**

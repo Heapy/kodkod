@@ -132,6 +132,30 @@ class DockerApiParseTest {
         assertEquals(listOf(135_000L), transport.readTimeouts)
     }
 
+    /**
+     * An image reference comes out of a container's own `Config.Image`, which kodkod never validated —
+     * so it must not be able to rewrite the request target. Its own punctuation still has to survive:
+     * the engine routes these on `{name:.*}` and resolves `registry:5000/repo:tag` literally.
+     */
+    @Test
+    fun an_image_reference_keeps_its_own_punctuation_and_nothing_else() {
+        val transport = CapturingTransport("HTTP/1.1 200 OK\r\n\r\n{}")
+        val api = DockerApi(transport)
+
+        api.inspectImage("127.0.0.1:5000/team/app:v1.2_beta")
+        api.inspectImage("sha256:abc123")
+        api.removeImage("app:1 --force ?x=y")
+
+        assertEquals(
+            listOf(
+                "GET /images/127.0.0.1:5000/team/app:v1.2_beta/json",
+                "GET /images/sha256:abc123/json",
+                "DELETE /images/app:1%20--force%20%3Fx%3Dy?force=false&noprune=false",
+            ),
+            transport.requests,
+        )
+    }
+
     /** Answers every exchange with the same canned response, recording `<method> <path>` and the timeout. */
     private class CapturingTransport(private val response: String) : DockerTransport {
         val requests = mutableListOf<String>()

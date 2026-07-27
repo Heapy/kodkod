@@ -186,6 +186,10 @@ class Updater(
      * applies (see [suppressedByCooldown]).
      */
     internal fun plan(): UpdatePlan {
+        // A memory whose window has run out no longer decides anything, and a container that was
+        // removed never comes back to have its entry dropped at check time — so the map is swept here
+        // rather than growing by one entry per container that ever failed an update.
+        failedUpdates.values.removeIf { clock.millis() - it.attemptedAt >= cooldownMs }
         val targets = collectTargets()
         if (targets.isEmpty()) return UpdatePlan.NOTHING
 
@@ -247,6 +251,11 @@ class Updater(
      * dropped **whole**: the targets are a dependency graph, and going ahead with the half of it that
      * still checks out means stopping containers for a dependency that is no longer being updated. The
      * next cycle re-plans from the state that actually exists, one interval later.
+     *
+     * The fresh inspect is also **kept**, because it is what the replacement is built from: a
+     * `docker update`, a `docker network connect` or a label change made while the image downloaded
+     * would otherwise be quietly reverted by a create body describing the container as it was before
+     * the pull.
      */
     private fun isCurrent(plan: UpdatePlan): Boolean {
         for (target in plan.work) {
@@ -268,6 +277,18 @@ class Updater(
                 )
                 return false
             }
+            // Discovery only ever lists running containers, so every target was running when the plan
+            // was made. One that is not any more was stopped by somebody else during the pull, and
+            // stopping, renaming, recreating and *starting* it would silently undo that decision.
+            if (inspect.obj("State")?.str("Running") != "true") {
+                Log.warn(
+                    "update: dropping this cycle's plan — ${target.name} (${target.id.take(12)}) is no longer " +
+                        "running, so it was stopped while kodkod was planning and recreating it would start it " +
+                        "again behind whoever stopped it",
+                )
+                return false
+            }
+            target.inspect = inspect
         }
         return true
     }
@@ -296,20 +317,42 @@ class Updater(
         // dependent the graph recreated answers under a *new* id whose NetworkMode now names the
         // provider by name — which would otherwise read as a fresh find and recreate it again.
         val handled = targets.flatMapTo(HashSet()) { listOf(it.id, it.liveId) }
-        for (target in targets) {
-            if (!target.toRestart) continue
-            val provider = DependencyProvider(target.id, setOf(target.name), target.composeProject)
-            for (dependent in findDependents(api, provider)) {
+        // A dependent that had to be refreshed becomes a provider in its own right: `c` joined to `b`
+        // joined to `a` loses its namespace when `b` is recreated, exactly as `b` lost it when `a` was.
+        // Chains are short in practice, so the queue is bounded rather than cycle-detected.
+        val queue = ArrayDeque<RefreshedProvider>()
+        targets.filter { it.toRestart }.mapTo(queue) {
+            RefreshedProvider(it.id, it.name, it.liveId, it.composeProject)
+        }
+        var scans = 0
+        while (queue.isNotEmpty() && scans++ < MAX_DEPENDENT_SCANS) {
+            val provider = queue.removeFirst()
+            val asProvider = DependencyProvider(provider.id, setOf(provider.name), provider.composeProject)
+            for (dependent in findDependents(api, asProvider)) {
                 if (!handled.add(dependent.id)) continue
                 if (isSelf(dependent.id, dependent.labels, selfId)) continue
-                refreshDependent(dependent, target)
+                val liveId = refreshDependent(dependent, provider) ?: continue
+                handled += liveId
+                queue += RefreshedProvider(
+                    dependent.id,
+                    dependent.name,
+                    liveId,
+                    dependent.labels.label(COMPOSE_PROJECT_LABEL),
+                )
             }
+        }
+        if (queue.isNotEmpty()) {
+            Log.warn(
+                "stopped following create-time dependents after $MAX_DEPENDENT_SCANS containers — " +
+                    "${queue.joinToString(", ") { it.name }} may be left on a dead network namespace",
+            )
         }
     }
 
-    private fun refreshDependent(dependent: Dependent, provider: Target) {
+    /** The id serving [dependent] once it was refreshed, or `null` when nothing was (or could be) done. */
+    private fun refreshDependent(dependent: Dependent, provider: RefreshedProvider): String? {
         val where = "[${dependent.name} (${dependent.short})]"
-        val replaced = provider.liveId != provider.id
+        val replaced = provider.replaced
         val relation = when (dependent.kind) {
             DependencyKind.NETNS -> "shares the network namespace of ${provider.name}"
             DependencyKind.LINK -> "is --link'ed to ${provider.name}"
@@ -325,23 +368,39 @@ class Updater(
                 ""
             }
             Log.warn("$where $relation, which this cycle $what, but is ${dependent.state} — leaving it alone$doomed")
-            return
+            return null
         }
         if (dependent.pinnedToProviderId && replaced) {
             Log.warn(
                 "$where $relation by id and that container is gone — recreating it against the replacement " +
                     "(it is outside the monitored set, so nothing else would)",
             )
-            recreateForeignDependent(dependent, provider)
-            return
+            return recreateForeignDependent(dependent, provider)
         }
         Log.warn("$where $relation, which this cycle $what, and would be left with a dead one — restarting it too")
-        try {
+        return try {
             api.restart(dependent.id, stopTimeout(dependent.labels))
             Log.info("$where restart successful")
+            dependent.id
         } catch (e: Exception) {
             Log.warn("$where restart failed — it may be left without a working network: ${e.message}")
+            null
         }
+    }
+
+    /**
+     * A container this cycle restarted or replaced, seen from the point of view of whatever was wired
+     * to it at create time. Targets and foreign dependents both become one, which is what lets a chain
+     * of shared namespaces be followed with the same code.
+     */
+    private class RefreshedProvider(
+        val id: String,
+        val name: String,
+        val liveId: String,
+        val composeProject: String?,
+    ) {
+        /** Whether the container answering to [name] now is a different one than [id]. */
+        val replaced: Boolean get() = liveId != id
     }
 
     /**
@@ -350,7 +409,7 @@ class Updater(
      * of id. Its own image did not move, so it goes down exactly the same non-stale recreate path an
      * in-set netns consumer takes: same create body, same liveness gate, same rollback.
      */
-    private fun recreateForeignDependent(dependent: Dependent, provider: Target) {
+    private fun recreateForeignDependent(dependent: Dependent, provider: RefreshedProvider): String? {
         val where = "[${dependent.name} (${dependent.short})]"
         val inspect = try {
             api.inspectContainer(dependent.id)
@@ -359,16 +418,18 @@ class Updater(
                 "$where cannot be recreated because it could not be inspected — it is left joined to a " +
                     "network namespace that no longer exists and needs a human: ${e.message}",
             )
-            return
+            return null
         }
         val target = toTarget(dependent.id, inspect).also {
             it.linkedToRecreate = true
             it.networkModeContainerName = provider.name
         }
-        try {
+        return try {
             recreate(target)
+            target.liveId
         } catch (e: Exception) {
             Log.warn("$where could not be recreated and may be left without a working network: ${e.message}")
+            null
         }
     }
 
@@ -397,9 +458,16 @@ class Updater(
     private fun awaitHealthy(target: Target, dep: Target) {
         val deadline = clock.millis() + config.dependencyHealthTimeout * 1000L
         var announced = false
+        var unreadable = 0
         while (true) {
             val state = runCatching { api.inspectContainer(dep.liveId).obj("State") }
-                .onFailure { Log.warn("[${target.name}] could not read the health of ${dep.name}: ${it.message}") }
+                .onFailure {
+                    // Once per wait, not once per probe: a dependency that cannot be inspected cannot
+                    // be inspected 240 times either, and the log is a report, not a transcript.
+                    if (unreadable++ == 0) {
+                        Log.warn("[${target.name}] could not read the health of ${dep.name}: ${it.message}")
+                    }
+                }
                 .getOrNull()
             // No `Health` at all means the image declares no healthcheck, so `healthy` is a state this
             // container can never reach: compose would have refused the stack, and waiting out the whole
@@ -600,6 +668,8 @@ class Updater(
      *
      * Only an actual image update is remembered: a recreate that failed while following a dependency
      * has no new image to blame, and suppressing it would leave a container pinned to a dead namespace.
+     * The caller decides *when* there is something to blame the image for — only a replacement that
+     * was actually started can have failed because of it.
      */
     private fun rememberFailedUpdate(target: Target) {
         val imageId = target.newImageId?.takeIf { target.stale } ?: return
@@ -687,6 +757,12 @@ class Updater(
         // Whether the name was actually taken away from the old container yet.
         var parked = false
 
+        // Whether the failure (if any) is evidence about the *image*. Only a replacement that was
+        // actually asked to run says anything about it: a refused stop, a name conflict or a create
+        // the daemon rejected happen with any image, and remembering them would freeze the update for
+        // `KODKOD_UPDATE_FAILURE_COOLDOWN` over a blip that never let the image run at all.
+        var imageBlamed = false
+
         try {
             stopGracefully(target) // usually a no-op (already stopped in the reverse-order pass)
             api.rename(target.id, backupName)
@@ -694,6 +770,7 @@ class Updater(
             val newId = api.create(name, body, target.platform)
             try {
                 networks.drop(1).forEach { (net, endpoint) -> api.connectNetwork(net, newId, endpoint) }
+                imageBlamed = true
                 api.start(newId)
                 // Everything past this point destroys the only copy of the previous state, so the
                 // replacement has to prove it is actually up first.
@@ -726,7 +803,7 @@ class Updater(
         } catch (e: Exception) {
             // Any failure after we stopped the container must restore the original, running container.
             Log.error("[$name] recreate failed — rolling back: ${e.message}")
-            rememberFailedUpdate(target)
+            if (imageBlamed) rememberFailedUpdate(target)
             rollback(target.id, name, stranded, parked)
             throw e
         }
@@ -1033,6 +1110,12 @@ class Updater(
      * pinned rollback tag with it, which is why the tags are read first and any tag other than the ref
      * we just updated ([updatedRef]) cancels the prune.
      *
+     * The comparison goes through [canonicalImageRef] because the two sides are spelled differently:
+     * `RepoTags` is what the daemon normalised the tag to (`nginx:1.27`), while [updatedRef] is
+     * whatever the container's `Config.Image` says, which may well be `docker.io/library/nginx:1.27`.
+     * Compared raw, the only tag on the image never matches the ref it belongs to, every prune stands
+     * down, and `KODKOD_UPDATE_CLEANUP=true` quietly does nothing at all.
+     *
      * An image we cannot inspect is left in place: a stale image costs disk, an untagged one costs a
      * rollback path.
      */
@@ -1043,7 +1126,8 @@ class Updater(
             Log.warn("[$name] could not inspect old image ${imageId.shortId()} — keeping it: ${e.message}")
             return
         }
-        val foreignTags = tags - normalizeImageRef(updatedRef)
+        val updated = canonicalImageRef(updatedRef)
+        val foreignTags = tags.filterNot { canonicalImageRef(it) == updated }
         if (foreignTags.isNotEmpty()) {
             Log.info("[$name] keeping old image ${imageId.shortId()} — still tagged ${foreignTags.joinToString(", ")}")
             return
@@ -1077,6 +1161,13 @@ class Updater(
 
         /** Pause between those attempts — long enough for a port or a network to be released. */
         const val START_RETRY_INTERVAL_MS = 1_000L
+
+        /**
+         * Containers whose create-time dependents are searched for in one cycle. A bound rather than a
+         * cycle check: each scan costs a listing, and a namespace chain deeper than this is not a
+         * shape kodkod should keep paying for.
+         */
+        const val MAX_DEPENDENT_SCANS = 32
     }
 }
 
@@ -1121,7 +1212,11 @@ internal class UpdatePlan(val targets: List<Target>) {
 internal class Target(
     val id: String,
     val name: String,
-    val inspect: JsonObject,
+    /**
+     * The container as the daemon last described it — and what the replacement is built from. Refreshed
+     * at the start of the mutating phase, since minutes of image download can sit between the two.
+     */
+    var inspect: JsonObject,
     val imageRef: String?,
     val currentImageId: String,
     /** `os/arch` this container's image was resolved for, or null when the engine does not report it. */
@@ -1338,6 +1433,24 @@ internal fun topoSort(targets: List<Target>): List<Target> {
 
 /** `repo:tag`, with the implicit `:latest` spelled out so a ref compares equal to a `RepoTags` entry. */
 internal fun normalizeImageRef(ref: String): String = splitImageRef(ref).let { (repo, tag) -> "$repo:$tag" }
+
+/**
+ * [normalizeImageRef] plus the implicit Docker Hub prefixes spelled *out*: `docker.io/library/nginx`,
+ * `library/nginx` and `nginx` all name the same image, but only the last is what the daemon puts in
+ * `RepoTags`. Any other registry is left exactly as it is — `myreg:5000/library/app` is a different
+ * image from `library/app`.
+ */
+internal fun canonicalImageRef(ref: String): String {
+    val normalized = normalizeImageRef(ref)
+    val withoutRegistry = HUB_PREFIXES.firstOrNull(normalized::startsWith)
+        ?.let { normalized.removePrefix(it) }
+        ?: normalized
+    // `library/` is Docker Hub's namespace for official images, and only theirs.
+    return if (withoutRegistry.count { it == '/' } == 1) withoutRegistry.removePrefix("library/") else withoutRegistry
+}
+
+/** How a Docker Hub ref may spell the registry that is otherwise implicit. */
+private val HUB_PREFIXES = listOf("docker.io/", "index.docker.io/", "registry-1.docker.io/")
 
 /** Split `registry:5000/repo:tag` into (`registry:5000/repo`, `tag`), defaulting the tag to `latest`. */
 internal fun splitImageRef(ref: String): Pair<String, String> {
