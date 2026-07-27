@@ -770,14 +770,123 @@ max-adversarial ревью репозитория дало 15 подтвержд
 
 ### Task 20: Verify acceptance criteria
 
-- [ ] проверить, что все 15 находок ревью закрыты — пройтись по списку и сопоставить с тестами
-- [ ] проверить граничные случаи: контейнер без compose-лейблов, digest-pinned образ, host/none network mode,
+**Files:**
+- Modify: `src/test/kotlin/io/heapy/kodkod/UpdaterTest.kt` (➕ недостающий граничный случай host/none)
+- Modify: `src/test/resources/docker-fixtures/engine-29.6.2_compose-5.3.1/**` (финальная перезапись)
+
+- [x] проверить, что все 15 находок ревью закрыты — пройтись по списку и сопоставить с тестами.
+      13 из 15 закрыты полностью, 2 — частично (обе частичности уже зафиксированы в задачах 7 и 10).
+      Сопоставление «находка → тест, который покраснеет при регрессе»:
+      - **fidelity 1, `com.docker.compose.image`** → `ImageDefaultsTest.buildContainerConfig_restamps_the_compose_image_label_with_the_new_id`,
+        `UpdaterTest.recreate_stamps_the_new_image_id_into_the_compose_image_label`,
+        `...the_compose_image_label_is_stamped_on_the_registry_digest_path_too`,
+        e2e `composeUpAfterKodkodUpdateKeepsTheContainer`
+      - **fidelity 2, анонимные volume** → `ImageDefaultsTest.resolveMounts_*` (6 тестов),
+        e2e `anonymousVolumeIsInheritedByTheRecreatedContainer`
+      - **fidelity 3, `MacAddress`/`GwPriority`** → `UpdaterTest.recreate_keeps_an_explicit_mac_address_and_the_gateway_priority`,
+        `recreate_does_not_pin_a_daemon_generated_mac_address`, `an_empty_config_mac_address_counts_as_unset`,
+        e2e `multiNetworkContainerIsReconnectedToEveryNetwork`. ⚠️ **частично:** `GwPriority` закрыт полностью,
+        а дискриминатор явного MAC на Docker ≥27 не срабатывает — `Config.MacAddress` отсутствует в inspect'е
+        (задача 7). Явно заданный `mac_address:` на 29.x при recreate теряется; безопасно (случайный MAC не
+        пинуется), но исходная находка на современных движках не закрыта
+      - **fidelity 4, `platform`** → `UpdaterGraphTest.imagePlatform_reads_os_and_arch_and_drops_the_variant`,
+        `imagePlatform_is_null_without_a_usable_descriptor`,
+        `UpdaterTest.the_running_image_platform_is_pinned_on_both_pull_and_create` + 2,
+        `DockerApiParseTest.{create,pull}_{pins,omits}_the_platform*` (4), плюс `&platform=linux/arm64`
+        в пути `create` во всех recreate-фикстурах
+      - **fidelity 5, `Config.StopTimeout`** → `UpdaterTest.without_an_override_the_container_decides_its_own_stop_timeout`
+        + `the_label_wins_...` + `the_env_default_wins_...`, `AutohealTest` (те же три),
+        `DockerApiParseTest.stop_without_a_timeout_sends_no_t_parameter`,
+        `a_long_graceful_window_stretches_the_read_timeout`, `restart_sizes_its_read_timeout_the_same_way`
+      - **safety 6, удаление до проверки живости** → `UpdaterTest.a_replacement_that_starts_and_exits_is_rolled_back_and_destroys_nothing`,
+        `a_live_replacement_ends_the_wait_early`, `a_restart_looping_replacement_is_rolled_back`,
+        `an_unhealthy_replacement_is_rolled_back`, `..._is_accepted_when_health_verification_is_off`,
+        `a_replacement_still_inside_its_start_period_is_accepted_at_the_end_of_the_window`,
+        e2e `aReplacementThatStartsAndThenDiesIsRolledBack`. ⚠️ **частично:** health-ветка гейта
+        (`unhealthy` / `starting`) покрыта только юнитами — и рекордер, и e2e идут с
+        `KODKOD_UPDATE_VERIFY_HEALTH=false`, потому что число проб иначе гонка с healthcheck'ом замены
+      - **safety 7, снятие чужих тегов** → `UpdaterTest.a_single_remaining_user_tag_saves_the_old_image_from_the_prune`,
+        `only_the_updated_tag_left_on_the_old_image_still_prunes`, `a_dangling_old_image_is_pruned`,
+        `an_unreadable_old_image_is_left_alone`, плюс `DockerReplayTest` (`update-recreate`: реальный движок
+        отдаёт `RepoTags:[…/testapp:v1]`, и `removeImage` в корпусе отсутствует)
+      - **safety 8, SIGTERM ломает rollback / осиротевший бэкап** → `UpdaterTest.a_rollback_on_an_interrupted_thread_still_restores_the_service`,
+        `an_orphaned_backup_with_nothing_serving_the_name_is_restored`, `..._is_removed_once_its_replacement_is_running`,
+        `..._is_restored_over_a_replacement_that_is_not_running`, `a_backup_suffix_carrying_someone_elses_id_is_left_alone`,
+        `reconcile_does_not_depend_on_the_updater_being_enabled`, `a_dropped_plan_does_not_take_the_reconcile_with_it`,
+        e2e `aBackupOrphanedByAKilledKodkodIsRecoveredOnRestart`. ⚠️ **не покрыт тестом** сам grace-хук в
+        `Main.kt` (`awaitTermination` → `shutdownNow`): `main()` не разбирается на тестируемые части, из него
+        проверен только `ConfigTest.reads_the_shutdown_grace_period`. Восстановление после SIGKILL — та часть,
+        что реально ломалась, — покрыто reconcile'ом выше
+      - **safety 9, проглоченные ошибки `start`** → `UpdaterTest.a_dependent_whose_start_is_refused_is_retried_until_it_comes_up`,
+        `a_dependent_that_never_starts_is_reported_as_left_stopped`,
+        `a_rollback_that_cannot_restore_the_name_says_so_instead_of_reporting_success`,
+        `a_replacement_that_cannot_be_removed_is_moved_off_the_service_name`,
+        `a_sidecar_that_cannot_be_recreated_is_rolled_back_and_reported`
+      - **safety 10, память об «отравленном» образе** → `UpdaterTest.an_image_that_could_not_come_up_is_not_tried_again_next_cycle`,
+        `the_cooldown_running_out_lets_the_update_be_tried_again`, `a_tag_moving_to_another_image_clears_the_memory_at_once`,
+        `an_update_that_finally_worked_is_not_remembered_as_a_failure`, `a_zero_cooldown_gives_back_the_retry_every_cycle_behaviour`
+      - **соседи 11, `depends_on` по первому полю** → `UpdaterGraphTest.parseDependsOn_reads_all_three_fields`,
+        `parseDependsOn_tolerates_labels_with_fewer_fields`, `resolveLinks_keeps_the_condition_and_the_restart_flag_of_each_edge`,
+        `propagateLinkedRestart_obeys_restart_false_only_when_asked_to`, `..._never_lets_restart_false_suppress_a_recreate`,
+        `UpdaterTest.a_dependency_with_condition_service_healthy_is_awaited_before_its_dependent_starts` + 5,
+        e2e `dependencyUpdateRestartsDependentAfterProvider`, replay-сценарий `deps-ordered`
+      - **соседи 12, autoheal без учёта netns** → `AutohealTest.restarts_the_containers_sharing_the_unhealthy_container_s_network_namespace`,
+        `restarts_a_consumer_that_is_not_monitored_itself`, `leaves_a_consumer_that_is_not_running_alone`,
+        `does_not_restart_consumers_when_the_provider_itself_failed_to_restart`, `never_restarts_itself_as_a_consumer`,
+        весь `DependentsTest` (13 тестов), e2e `autohealRestartsUnhealthyContainer`
+      - **соседи 13, немониторимые sidecar'ы** → `UpdaterTest.an_unlabelled_netns_sidecar_is_recreated_when_its_provider_is_replaced`,
+        `a_monitored_netns_sidecar_is_still_recreated_exactly_once`,
+        `a_legacy_link_dependent_outside_the_monitored_set_is_restarted`,
+        `a_stopped_sidecar_outside_the_monitored_set_is_reported_rather_than_started`,
+        `a_sidecar_that_cannot_be_recreated_is_rolled_back_and_reported`,
+        e2e `containerNetworkModeDependentIsRecreatedAfterProviderUpdate`
+      - **соседи 14, `cycleLock` через pull'ы** → `UpdaterTest.planning_pulls_but_changes_nothing`,
+        `applying_the_plan_is_what_recreates_the_container`, `a_plan_whose_container_disappeared_is_dropped`,
+        `a_plan_whose_image_moved_under_it_is_dropped`, `a_dropped_plan_does_not_take_the_reconcile_with_it`
+      - **находка 15, обвязка не может упасть** → `DockerReplayTest.harness_fails_when_the_code_under_test_hits_an_unrecorded_request`,
+        `harness_fails_when_a_recorded_response_is_never_used`, весь `ReplayDockerTransportTest` (9),
+        `OpLoggingClientTest` (5), `FixtureWriterTest` (10, в `e2eTest` и без Docker)
+- [x] проверить граничные случаи: контейнер без compose-лейблов, digest-pinned образ, host/none network mode,
       контейнер без healthcheck
-- [ ] прогнать полный тестовый набор: `./gradlew test`
-- [ ] прогнать e2e: `./gradlew e2eTest`
-- [ ] финальная перезапись фикстур на актуальном движке и зелёный replay:
+      - без compose-лейблов → `UpdaterTest.a_container_without_compose_labels_does_not_get_one_invented`,
+        `ImageDefaultsTest.buildContainerConfig_does_not_invent_a_compose_image_label`,
+        `UpdaterTest.unlabelled_containers_are_ignored_when_not_monitoring_all` — покрыт
+      - digest-pinned → `UpdaterTest.digest_pinned_images_are_never_checked_or_recreated`,
+        e2e `digestPinnedContainerIsSkipped`, плюс синтетическая фикстура в `DockerReplayTest` — покрыт
+      - контейнер без healthcheck → `UpdaterTest.a_live_replacement_ends_the_wait_early` (гейт с дефолтным
+        `VERIFY_HEALTH=true` принимает контейнер, у которого `State.Health` нет вовсе),
+        `a_health_gated_dependency_without_a_healthcheck_is_not_waited_for`,
+        `FakeDockerClientTest.the_health_filter_selects_containers_whose_health_is_modelled` — покрыт
+      - ⚠️ **host/none network mode покрыт не был** — добавлены
+        `UpdaterTest.a_host_network_container_is_recreated_without_any_endpoint` и
+        `a_none_network_container_is_recreated_without_any_endpoint`. Оба идут от реального inspect'а с
+        движка 29.6.2: `host`/`none` видны в `NetworkSettings.Networks` как псевдосети с `EndpointID` и
+        `GwPriority`, так что без отсечки в `networkEndpoints` create-body получил бы
+        `EndpointsConfig={"host":{"GwPriority":0}}` рядом с `NetworkMode=host` — сочетание, которое демон
+        отвергает. Краснота подтверждена снятием отсечки `mode == "host" || mode == "none"`: падают ровно
+        эти два теста
+- [x] прогнать полный тестовый набор: `./gradlew test` — **206/206 зелёных**, 0 падений, 0 пропусков
+      (204 до задачи 20 + 2 новых на host/none)
+- [x] прогнать e2e: `./gradlew e2eTest` — **26 тестов: 22 зелёных, 4 пропущено, 0 падений** за 10 минут
+      с первого прогона, без флаки (пропущены четыре `DockerFixtureRecorder`, они гейтятся
+      `-Pkodkod.e2e.record=true`; `KodkodE2eTest` 12/12, `FixtureWriterTest` 10/10)
+- [x] финальная перезапись фикстур на актуальном движке и зелёный replay:
       `./gradlew e2eTest -Pkodkod.e2e.useCurrentDocker=true -Pkodkod.e2e.record=true --tests '*DockerFixtureRecorder*'`
-- [ ] вручную проверить главный сценарий: `compose up` → обновление kodkod'ом → `compose up` без пересоздания
+      — перезаписан тот же лейбл `engine-29.6.2_compose-5.3.1` (движок 29.6.2, API 1.55, compose 5.3.1).
+      Нормализованная сверка манифестов (id контейнеров/образов → плейсхолдеры): число обменов не изменилось
+      нигде (20/6/3/28), `autoheal-restart` идентичен побайтово по структуре, в `update-recreate` и
+      `deps-ordered` единственная разница — короткий id в имени бэкапа (`_kodkod_old_<12 hex>`, он новый на
+      каждый прогон). В `update-noop` листинг reconcile переехал с первого места на последнее: задача 19
+      перенесла reconcile в `apply`, но перезаписала только `update-recreate`/`deps-ordered`, а replay
+      ключуется по `"<method> <path>"` и порядок **между разными ключами** не проверяет — поэтому старая
+      запись оставалась зелёной. Теперь корпус соответствует фактическому порядку вызовов.
+      После перезаписи `./gradlew test --rerun-tasks` — 206/206, все 4 replay-сценария зелёные
+      (строгость `DockerReplayTest` не трогалась: `misses.isEmpty()` + `isFullyConsumed()` на месте)
+- [x] вручную проверить главный сценарий: `compose up` → обновление kodkod'ом → `compose up` без пересоздания
+      — вручную не выполнялось: сценарий полностью автоматизирован e2e-тестом
+      `KodkodE2eTest.composeUpAfterKodkodUpdateKeepsTheContainer` (задача 5), который сверяет id контейнера
+      до и после второго `compose up` и требует от compose вывода `Running`, а не `Recreated`. Зелёный
+      в прогоне выше
 
 ### Task 21: [Final] Update documentation
 

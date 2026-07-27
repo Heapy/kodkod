@@ -337,6 +337,51 @@ class UpdaterTest {
         assertNull(endpoint.str("MacAddress"), "an empty `Config.MacAddress` is not an explicit MAC: $endpoint")
     }
 
+    /**
+     * `host` and `none` are reported as pseudo-networks in `NetworkSettings.Networks` (with a real
+     * `EndpointID` and a `GwPriority`, verified against Docker 29.6.2), so copying endpoints blindly
+     * would put `EndpointsConfig={"host":{"GwPriority":0}}` next to `NetworkMode=host` in the create
+     * body — a combination the daemon refuses. `HostConfig.NetworkMode` alone is authoritative here.
+     */
+    @Test
+    fun a_host_network_container_is_recreated_without_any_endpoint() {
+        val docker = FakeDockerClient()
+        docker.container(
+            id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
+            hostConfig = """{"NetworkMode":"host"}""",
+            networks = """{"host":{"GwPriority":0,"EndpointID":"dc17b7805866"}}""",
+        )
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+
+        updater(docker).runOnce()
+
+        val body = docker.created.single().second
+        assertNull(body["NetworkingConfig"], "a host-mode container has no endpoint to attach: $body")
+        assertEquals(
+            "host", body.obj("HostConfig")?.str("NetworkMode"),
+            "the network mode is the whole networking configuration of such a container: $body",
+        )
+        assertTrue(docker.ops.none { it.startsWith("connect:") }, "nothing to connect afterwards: ${docker.ops}")
+    }
+
+    @Test
+    fun a_none_network_container_is_recreated_without_any_endpoint() {
+        val docker = FakeDockerClient()
+        docker.container(
+            id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
+            hostConfig = """{"NetworkMode":"none"}""",
+            networks = """{"none":{"GwPriority":0,"EndpointID":"859033cefdd1"}}""",
+        )
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+
+        updater(docker).runOnce()
+
+        val body = docker.created.single().second
+        assertNull(body["NetworkingConfig"], "`none` means the replacement stays off every network: $body")
+        assertEquals("none", body.obj("HostConfig")?.str("NetworkMode"), "the mode itself must survive: $body")
+        assertTrue(docker.ops.none { it.startsWith("connect:") }, "nothing to connect afterwards: ${docker.ops}")
+    }
+
     // --- com.docker.compose.image ---------------------------------------------------------
 
     @Test
