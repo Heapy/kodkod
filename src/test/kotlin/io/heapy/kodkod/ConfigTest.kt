@@ -26,6 +26,7 @@ class ConfigTest {
         assertTrue(c.updateCleanup)
         assertEquals(15, c.updateVerifySeconds)
         assertTrue(c.updateVerifyHealth)
+        assertEquals(21600, c.updateFailureCooldown)
         assertNull(c.registryAuth)
         assertEquals(30, c.shutdownGrace)
     }
@@ -63,6 +64,23 @@ class ConfigTest {
             "unparseable values fall back to the default rather than disabling the gate",
         )
         assertFalse(Config.fromEnv(env("KODKOD_UPDATE_VERIFY_HEALTH" to "false")).updateVerifyHealth)
+    }
+
+    @Test
+    fun reads_the_failed_update_cooldown() {
+        assertEquals(60, Config.fromEnv(env("KODKOD_UPDATE_FAILURE_COOLDOWN" to "60")).updateFailureCooldown)
+        assertEquals(
+            0, Config.fromEnv(env("KODKOD_UPDATE_FAILURE_COOLDOWN" to "0")).updateFailureCooldown,
+            "0 is the off switch: retry a known-bad image every cycle, as kodkod did before it remembered",
+        )
+        assertEquals(
+            0, Config.fromEnv(env("KODKOD_UPDATE_FAILURE_COOLDOWN" to "-1")).updateFailureCooldown,
+            "a negative cooldown cannot mean \"wait backwards\" — it degrades to no memory at all",
+        )
+        assertEquals(
+            21600, Config.fromEnv(env("KODKOD_UPDATE_FAILURE_COOLDOWN" to "a while")).updateFailureCooldown,
+            "an unparseable value falls back to the default rather than to retrying an outage every cycle",
+        )
     }
 
     @Test

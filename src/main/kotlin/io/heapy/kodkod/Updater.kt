@@ -7,6 +7,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import java.time.Instant
 
 /**
  * Keeps containers up to date by pulling their image tag and, when the resolved image id changes,
@@ -24,7 +25,9 @@ import kotlinx.serialization.json.put
  * still be restarted or recreated as a dependent.
  *
  * A replacement container is watched for a short window after `start` (see `verifyStarted`) and the
- * container and image it replaced are destroyed only once it has proven it stays up.
+ * container and image it replaced are destroyed only once it has proven it stays up. An update that
+ * failed that gate is remembered for `KODKOD_UPDATE_FAILURE_COOLDOWN` so a broken `:latest` costs one
+ * interrupted service instead of one per cycle.
  *
  * [clock] and [sleeper] default to the real ones and exist so waiting logic can be driven from tests
  * without spending the wall-clock time it describes.
@@ -37,6 +40,21 @@ class Updater(
     private val sleeper: Sleeper = Sleeper.SYSTEM,
 ) {
     private val ns = config.labelNamespace
+
+    /**
+     * Updates that already took a service down, by container id. The [FailedUpdate.imageId] is part of
+     * the memory rather than of the key so that a tag moving on to *another* image is an obvious reset
+     * rather than a second entry: the container is only ever suppressed for the exact image that failed.
+     *
+     * This is the only state [Updater] keeps between cycles, which is what makes it necessary at all —
+     * a cycle that knows nothing about the previous one repeats a failed recreate (stop, rename, create,
+     * fail, roll back) every `KODKOD_UPDATE_INTERVAL`, forever. An entry is dropped the moment it stops
+     * applying: the tag moved on, the cooldown ran out, or the update went through after all.
+     */
+    private val failedUpdates = HashMap<String, FailedUpdate>()
+
+    /** An image that failed to come up on a container, and when that was last attempted. */
+    private class FailedUpdate(val imageId: String, val attemptedAt: Long)
 
     /**
      * Bring back containers a kodkod that died mid-recreate left parked under their
@@ -266,9 +284,7 @@ class Updater(
                         Log.info("[${target.name}] already up to date (digest ${remoteDigest.shortId()})")
                         continue
                     } else {
-                        Log.warn("[${target.name}] update available (${target.currentImageId.shortId()} -> ${localImageId.shortId()})")
-                        target.newImageId = localImageId
-                        target.stale = true
+                        markUpdateAvailable(target, localImageId)
                         continue
                     }
                 }
@@ -280,17 +296,67 @@ class Updater(
                         Log.warn("[${target.name}] could not inspect pulled image $imageRef — skipping")
                     newImageId == target.currentImageId ->
                         Log.info("[${target.name}] already up to date")
-                    else -> {
-                        Log.warn("[${target.name}] update available (${target.currentImageId.shortId()} -> ${newImageId.shortId()})")
-                        target.newImageId = newImageId
-                        target.stale = true
-                    }
+                    else -> markUpdateAvailable(target, newImageId)
                 }
             } catch (e: Exception) {
                 Log.error("[${target.name}] update check failed: ${e.message}")
             }
         }
     }
+
+    /**
+     * Record that [target] can be updated to [newImageId] — unless that exact update is the one that
+     * already took this container down and its cooldown has not run out. The availability is logged
+     * either way: the update *is* available, and an operator watching for it must not have to guess
+     * whether kodkod saw it or decided not to act on it.
+     */
+    private fun markUpdateAvailable(target: Target, newImageId: String) {
+        Log.warn("[${target.name}] update available (${target.currentImageId.shortId()} -> ${newImageId.shortId()})")
+        if (suppressedByCooldown(target, newImageId)) return
+        target.newImageId = newImageId
+        target.stale = true
+    }
+
+    /**
+     * Whether updating [target] to [newImageId] is being held back by a previous failed attempt. A
+     * memory that no longer applies — the tag has moved on to a different image, or the cooldown has
+     * run out — is forgotten here rather than merely ignored, so the next failure starts a fresh window.
+     */
+    private fun suppressedByCooldown(target: Target, newImageId: String): Boolean {
+        val failure = failedUpdates[target.id] ?: return false
+        val nextAttempt = failure.attemptedAt + cooldownMs
+        if (failure.imageId != newImageId || clock.millis() >= nextAttempt) {
+            failedUpdates.remove(target.id)
+            return false
+        }
+        Log.warn(
+            "[${target.name}] skipping this update: ${newImageId.shortId()} already failed to come up on " +
+                "this container, and retrying it means stopping a healthy container for nothing — " +
+                "next attempt no earlier than ${Instant.ofEpochMilli(nextAttempt)} " +
+                "(KODKOD_UPDATE_FAILURE_COOLDOWN=${config.updateFailureCooldown}s)",
+        )
+        return true
+    }
+
+    /**
+     * Remember that the image [target] was being updated to could not be brought up, so the next cycles
+     * leave the (still running, still healthy) container alone instead of taking it down again.
+     *
+     * Only an actual image update is remembered: a recreate that failed while following a dependency
+     * has no new image to blame, and suppressing it would leave a container pinned to a dead namespace.
+     */
+    private fun rememberFailedUpdate(target: Target) {
+        val imageId = target.newImageId?.takeIf { target.stale } ?: return
+        if (cooldownMs <= 0) return
+        val now = clock.millis()
+        failedUpdates[target.id] = FailedUpdate(imageId, now)
+        Log.warn(
+            "[${target.name}] not trying ${imageId.shortId()} again before " +
+                "${Instant.ofEpochMilli(now + cooldownMs)} — a repeat of this update is a repeat of this outage",
+        )
+    }
+
+    private val cooldownMs: Long get() = config.updateFailureCooldown * 1000L
 
     private fun remoteDigest(imageRef: String, target: Target): String? {
         val digest = runCatching {
@@ -376,6 +442,8 @@ class Updater(
                 stranded = discardReplacement(name, newId)
                 throw e
             }
+            // The image proved it can run here, so whatever this container was suppressed for is history.
+            failedUpdates.remove(target.id)
             if (target.stale) {
                 Log.info("[$name] update complete")
             } else {
@@ -392,6 +460,7 @@ class Updater(
         } catch (e: Exception) {
             // Any failure after we stopped the container must restore the original, running container.
             Log.error("[$name] recreate failed — rolling back: ${e.message}")
+            rememberFailedUpdate(target)
             rollback(target.id, name, stranded)
             throw e
         }

@@ -38,6 +38,15 @@ data class Config(
      * does: that period is the image author's own statement about acceptable startup time.
      */
     val updateVerifyHealth: Boolean,
+    /**
+     * `KODKOD_UPDATE_FAILURE_COOLDOWN` — how many seconds an image that already failed to come up on a
+     * container is left alone before that exact update is tried again. Without it a `:latest` that
+     * cannot start makes every single cycle stop the healthy container, rename it, fail, and roll back:
+     * a self-inflicted outage once per `KODKOD_UPDATE_INTERVAL`, forever. One flat window, no backoff —
+     * the point is to stop repeating a known outage, not to model the failure. `0` disables the memory
+     * and restores the retry-every-cycle behaviour.
+     */
+    val updateFailureCooldown: Long,
     val registryAuth: String?,
     /**
      * `KODKOD_SHUTDOWN_GRACE` — how many seconds a stopping kodkod gives the cycle in flight to
@@ -71,6 +80,7 @@ data class Config(
                 updateCleanup = bool("KODKOD_UPDATE_CLEANUP", true),
                 updateVerifySeconds = long("KODKOD_UPDATE_VERIFY_SECONDS", 15).coerceAtLeast(0),
                 updateVerifyHealth = bool("KODKOD_UPDATE_VERIFY_HEALTH", true),
+                updateFailureCooldown = long("KODKOD_UPDATE_FAILURE_COOLDOWN", 21600).coerceAtLeast(0),
                 registryAuth = get("KODKOD_REGISTRY_AUTH")?.takeIf { it.isNotBlank() },
                 shutdownGrace = long("KODKOD_SHUTDOWN_GRACE", 30).coerceAtLeast(0),
             ).also {

@@ -52,6 +52,7 @@ class UpdaterTest {
         stopTimeout: String? = null,
         verifySeconds: String? = null,
         verifyHealth: Boolean? = null,
+        failureCooldown: String? = null,
     ): Config =
         Config.fromEnv(
             buildMap {
@@ -60,6 +61,7 @@ class UpdaterTest {
                 stopTimeout?.let { put("KODKOD_STOP_TIMEOUT", it) }
                 verifySeconds?.let { put("KODKOD_UPDATE_VERIFY_SECONDS", it) }
                 verifyHealth?.let { put("KODKOD_UPDATE_VERIFY_HEALTH", it.toString()) }
+                failureCooldown?.let { put("KODKOD_UPDATE_FAILURE_COOLDOWN", it) }
             }::get,
         )
 
@@ -649,6 +651,118 @@ class UpdaterTest {
         assertEquals(
             4, clock.sleeps.size,
             "a container that never settles must be waited out to the end of the 2s window: ${clock.sleeps}",
+        )
+    }
+
+    // --- memory of an image that cannot start ---------------------------------------------
+
+    /** A stale `web` whose replacement starts and dies, so the first cycle ends in a rollback. */
+    private fun poisonedWeb(docker: FakeDockerClient) {
+        staleWeb(docker)
+        docker.startedThenExits += "new-web-0"
+    }
+
+    /** The default `KODKOD_UPDATE_FAILURE_COOLDOWN`, in milliseconds. */
+    private val cooldown = 6 * 60 * 60 * 1000L
+
+    /**
+     * The defect this memory exists for: [Updater] kept nothing between cycles, so an image that cannot
+     * start made *every* cycle stop the healthy container, rename it, create a replacement, fail and
+     * roll back — a self-inflicted outage once per `KODKOD_UPDATE_INTERVAL`, forever.
+     */
+    @Test
+    fun an_image_that_could_not_come_up_is_not_tried_again_next_cycle() {
+        val docker = FakeDockerClient()
+        poisonedWeb(docker)
+        val updater = updater(docker)
+
+        updater.runOnce()
+        val afterFirstCycle = docker.ops.size
+        val log = captureLog { updater.runOnce() }
+
+        assertEquals(
+            listOf("pull:nginx:1.27"), docker.ops.drop(afterFirstCycle),
+            "checking the registry again is fine; stopping and renaming a healthy container to repeat a " +
+                "failure kodkod already caused is the outage itself: ${docker.ops}",
+        )
+        assertTrue(running(docker, "web"), "the container that survived the first attempt keeps serving")
+        assertTrue(log.contains("skipping this update"), "a skipped update must not be silent: $log")
+        assertTrue(log.contains("next attempt no earlier than"), "and it has to say for how long: $log")
+    }
+
+    @Test
+    fun the_cooldown_running_out_lets_the_update_be_tried_again() {
+        val docker = FakeDockerClient()
+        poisonedWeb(docker)
+        val updater = updater(docker)
+
+        updater.runOnce()
+        val afterFirstCycle = docker.ops.size
+        clock.advance(cooldown)
+
+        updater.runOnce()
+
+        assertTrue(
+            docker.ops.drop(afterFirstCycle).contains("create:web"),
+            "this is a cooldown, not a blacklist — an image fixed in place has to be picked up: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun a_tag_moving_to_another_image_clears_the_memory_at_once() {
+        val docker = FakeDockerClient()
+        poisonedWeb(docker)
+        val updater = updater(docker)
+
+        updater.runOnce()
+        val afterFirstCycle = docker.ops.size
+        // The operator pushed a fix: the tag no longer resolves to the image that failed.
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:fixed","Config":{},"RepoDigests":[]}""")
+
+        updater.runOnce()
+
+        assertTrue(
+            docker.ops.drop(afterFirstCycle).contains("create:web"),
+            "only the exact image that failed is suppressed; making the fix for an outage wait out the " +
+                "cooldown of the outage would be worse than not remembering at all: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun an_update_that_finally_worked_is_not_remembered_as_a_failure() {
+        val docker = FakeDockerClient()
+        poisonedWeb(docker)
+        val updater = updater(docker)
+
+        updater.runOnce()
+        clock.advance(cooldown)
+        updater.runOnce() // the retry comes up this time and the update completes
+        val afterSuccess = docker.ops.size
+
+        updater.runOnce()
+
+        assertTrue(docker.ops.contains("remove:web"), "the retry has to have actually gone through: ${docker.ops}")
+        assertTrue(
+            docker.ops.drop(afterSuccess).any { it.startsWith("create:") },
+            "the memory records failures, not attempts: a container whose update went through carries no " +
+                "cooldown into later cycles: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun a_zero_cooldown_gives_back_the_retry_every_cycle_behaviour() {
+        val docker = FakeDockerClient()
+        poisonedWeb(docker)
+        val updater = updater(docker, config(failureCooldown = "0"))
+
+        updater.runOnce()
+        val afterFirstCycle = docker.ops.size
+
+        updater.runOnce()
+
+        assertTrue(
+            docker.ops.drop(afterFirstCycle).contains("create:web"),
+            "0 is the documented off switch for the memory: ${docker.ops}",
         )
     }
 
