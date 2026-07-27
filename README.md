@@ -180,9 +180,12 @@ kodkod updates the whole monitored set together so it can respect dependencies:
   failed recreate has nothing to roll back to: the dependent's original container is joined to a
   namespace that no longer exists. So the dependent updates alone first — where a failure *can* be
   rolled back — and the provider follows on a later cycle. The delay is logged every cycle;
-- a create-time dependent kodkod could neither recreate nor roll back is **rebuilt on every later
+- a create-time dependent kodkod could neither recreate nor roll back is **brought back on every later
   cycle** until it serves again: it is the one container nothing else would ever look at, since
-  discovery lists running containers only;
+  discovery lists running containers only. What that takes is checked against the daemon each cycle —
+  a `start` while the namespace it names is still its provider's, a rebuild against the provider's
+  name once that container is gone (which a later cycle can do at any time: a stopped dependent no
+  longer holds its provider back);
 - a dependency compose marked `condition: service_healthy` is **waited for** before its dependent is
   started, bounded by `KODKOD_DEPENDENCY_HEALTH_TIMEOUT`. Only dependencies this cycle brought back
   are waited for, and the timeout starts the dependent anyway: the condition may delay a container,
