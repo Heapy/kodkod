@@ -11,10 +11,17 @@
         },
         {
             "method": "POST",
-            "path": "/containers/8251476fa8df408ef229bead60f85e065c41f619bf2bb457476127283e6d5d89/restart",
+            "path": "/containers/8e167cf95217129a7f3e3dab1ad4a5b63d32b18df397c6e1fb41cdedd2a8ab81/restart",
             "requestBodySummary": null,
             "status": 204,
-            "responseFile": "0002.POST.containers-8251476fa8df408ef229bead60f85.bin"
+            "responseFile": "0002.POST.containers-8e167cf95217129a7f3e3dab1ad4a.bin"
+        },
+        {
+            "method": "GET",
+            "path": "/containers/json?all=true&filters=%7B%22label%22%3A%5B%22com.docker.compose.project%3De2e-autoheal%22%5D%7D",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0003.GET.containers-json.bin"
         }
     ]
 }

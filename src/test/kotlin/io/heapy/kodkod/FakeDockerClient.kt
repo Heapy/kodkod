@@ -73,6 +73,9 @@ class FakeDockerClient : DockerClient {
     /** Container ids for which [remove] should throw — used to strand a replacement during rollback. */
     val failRemove = mutableSetOf<String>()
 
+    /** Container ids for which [restart] should throw — used to drive autoheal's failure path. */
+    val failRestart = mutableSetOf<String>()
+
     /**
      * New names for which [rename] should throw 409 unconditionally. A name another *live* container
      * already holds is refused with 409 anyway (see [rename]), so this set is only needed for a daemon
@@ -114,8 +117,17 @@ class FakeDockerClient : DockerClient {
 
     override fun version(): JsonObject = obj("""{"Version":"0.0.0-fake","ApiVersion":"1.45"}""")
 
-    override fun listContainers(all: Boolean, filters: Map<String, List<String>>): JsonArray =
-        JsonArray(listed.filter { matches(it, all, filters) })
+    /** When set, [listContainers] throws — the daemon being unreachable mid-cycle. */
+    var failList = false
+
+    /** Filter maps passed to [listContainers], in call order — proof of how wide a scan really was. */
+    val listFilters = mutableListOf<Map<String, List<String>>>()
+
+    override fun listContainers(all: Boolean, filters: Map<String, List<String>>): JsonArray {
+        listFilters += filters
+        if (failList) throw DockerException(500, "fake: list failure")
+        return JsonArray(listed.filter { matches(it, all, filters) })
+    }
 
     /**
      * The daemon's own filtering, modelled only as far as kodkod uses it: values within one filter are
@@ -178,6 +190,7 @@ class FakeDockerClient : DockerClient {
     override fun restart(id: String, timeout: Int?, expectedStopSeconds: Int?) {
         op("restart", id) {
             restartTimeouts += timeout
+            if (id in failRestart) throw DockerException(500, "fake: restart failure for '$id'")
             running[id] = id !in startedThenExits
         }
     }

@@ -1,5 +1,6 @@
 package io.heapy.kodkod
 
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 
 /**
@@ -8,6 +9,10 @@ import kotlinx.serialization.json.jsonObject
  *
  *  - `<ns>.autoheal.enable=true|false` — opt in/out (default follows [Config.autohealMonitorAll])
  *  - `<ns>.stop.timeout=<seconds>`     — per-container stop timeout override
+ *
+ * A restart is never issued in isolation: containers wired to the restarted one at create time
+ * (`network_mode: service:x`, legacy `--link`) are restarted after it — see [findDependents] — and
+ * they are looked up across the whole daemon, not just the labelled set.
  *
  * [clock] and [sleeper] default to the real ones and exist so waiting logic can be driven from tests
  * without spending the wall-clock time it describes.
@@ -48,7 +53,7 @@ class Autoheal(
             // floor. A container with a longer stop window may therefore report a read timeout while the
             // daemon is still stopping it (the restart itself still completes); paying an inspect per
             // unhealthy container just to size a timeout is not worth it.
-            val timeout = labels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
+            val timeout = stopTimeout(labels)
             val window = timeout?.let { "${it}s timeout" } ?: "its own stop timeout"
             Log.warn("[$name ($short)] unhealthy — restarting with $window")
             try {
@@ -56,7 +61,44 @@ class Autoheal(
                 Log.info("[$name ($short)] restart successful")
             } catch (e: Exception) {
                 Log.error("[$name ($short)] restart failed: ${e.message}")
+                continue
+            }
+            restartDependents(container, name)
+        }
+    }
+
+    /**
+     * Restart what the container we just restarted was holding up.
+     *
+     * Restarting a container tears down its network namespace, so every container joined to it
+     * (`network_mode: service:x`) comes back without interfaces — no `eth0`, no egress — while still
+     * reporting `Running`, which is precisely the state nothing else notices. Legacy `--link`
+     * dependents keep a stale address for the same reason. Only meaningful once the provider is
+     * actually back, hence after a successful restart.
+     */
+    private fun restartDependents(summary: JsonObject, providerName: String) {
+        val provider = providerOf(summary) ?: return
+        for (dependent in findDependents(api, provider)) {
+            if (isSelf(dependent.id, dependent.labels, selfId)) continue
+            val where = "[${dependent.name} (${dependent.short})]"
+            if (!dependent.running) {
+                Log.info("$where depends on $providerName but is ${dependent.state} — leaving it alone")
+                continue
+            }
+            val reason = when (dependent.kind) {
+                DependencyKind.NETNS -> "shares the network namespace of $providerName"
+                DependencyKind.LINK -> "is --link'ed to $providerName"
+            }
+            Log.warn("$where $reason and would be left with a dead one — restarting it too")
+            try {
+                api.restart(dependent.id, stopTimeout(dependent.labels))
+                Log.info("$where restart successful")
+            } catch (e: Exception) {
+                Log.error("$where restart failed — it may have no working network: ${e.message}")
             }
         }
     }
+
+    private fun stopTimeout(labels: JsonObject?): Int? =
+        labels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
 }

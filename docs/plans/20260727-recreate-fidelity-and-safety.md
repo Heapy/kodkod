@@ -571,16 +571,37 @@ max-adversarial ревью репозитория дало 15 подтвержд
 - Create: `src/test/kotlin/io/heapy/kodkod/DependentsTest.kt`
 - Modify: `src/main/kotlin/io/heapy/kodkod/Autoheal.kt`
 - Modify: `src/test/kotlin/io/heapy/kodkod/AutohealTest.kt`
+- Modify: `src/main/kotlin/io/heapy/kodkod/Updater.kt` (переиспользует `netnsRef`/`linkSource` вместо своих копий)
+- Modify: `src/test/kotlin/io/heapy/kodkod/FakeDockerClient.kt` (`failRestart`, `failList`, `listFilters`)
+- Modify: `src/test/resources/docker-fixtures/engine-29.6.2_compose-5.3.1/autoheal-restart/*`
 
-- [ ] тест-на-баг: рестарт контейнера, к чьему netns подключён другой контейнер, обязан перезапустить и
+- [x] тест-на-баг: рестарт контейнера, к чьему netns подключён другой контейнер, обязан перезапустить и
       потребителя (сейчас потребитель остаётся с мёртвым namespace и продолжает считаться `Running`)
-- [ ] вынести поиск зависимых в `Dependents.kt`: netns-потребители (`HostConfig.NetworkMode=container:<id|name>`)
+      (`restarts_the_containers_sharing_the_unhealthy_container_s_network_namespace` — красный на текущем
+      коде: `ops` содержал только рестарт провайдера)
+- [x] вынести поиск зависимых в `Dependents.kt`: netns-потребители (`HostConfig.NetworkMode=container:<id|name>`)
       и legacy `--link`; поиск по `all=true`, а не по мониторимому набору
-- [ ] в `Autoheal` после успешного рестарта перезапускать найденных потребителей
-- [ ] тесты `DependentsTest`: потребитель по id, по имени, по короткому id; `--link`; контейнер без потребителей
-- [ ] тесты `AutohealTest`: порядок операций, потребитель вне мониторимого набора тоже перезапускается
-- [ ] перезаписать фикстуры (в autoheal-сценарии появился `all=true` листинг)
-- [ ] прогнать тесты
+      (`findDependents` + чистый `dependentsIn`; примитивы `netnsRef`/`linkSource` переиспользует `Updater`.
+      **Ширина скана:** compose-провайдер сначала пробуется листингом, сужённым `label=com.docker.compose.project`
+      — как reconcile сужает по `name` — и только проект, где netns-шеринг реально есть, дочитывается
+      нефильтрованным `all=true`. Иначе рекордер утащил бы в корпус все контейнеры машины записи, а автохил
+      платил бы полным листингом за каждый рестарт. Провайдер без compose-проекта сканируется по всему демону
+      сразу. Слепое пятно (потребитель вне проекта у стека без внутрипроектных потребителей) — осознанное
+      и задокументировано в KDoc)
+- [x] в `Autoheal` после успешного рестарта перезапускать найденных потребителей (только `running`, не себя,
+      с их собственным `<ns>.stop.timeout`; при провале рестарта провайдера потребители не трогаются)
+- [x] тесты `DependentsTest`: потребитель по id, по имени, по короткому id; `--link`; контейнер без потребителей
+      (плюс: остановленный потребитель, расширение скана за пределы проекта, узкий листинг в общем случае,
+      провайдер не зависит сам от себя, ошибка листинга, разбор обоих написаний `--link`)
+- [x] тесты `AutohealTest`: порядок операций, потребитель вне мониторимого набора тоже перезапускается
+      (плюс: не-`running` потребитель, провал рестарта провайдера, kodkod не рестартует сам себя как потребителя)
+- [x] перезаписать фикстуры (в autoheal-сценарии появился `all=true` листинг) — перезаписан только сценарий
+      `autoheal-restart` в том же лейбле `engine-29.6.2_compose-5.3.1` (движок не менялся, остальные сценарии
+      не трогают новый путь): в манифесте ровно один новый обмен
+      `GET /containers/json?all=true&filters={"label":["com.docker.compose.project=e2e-autoheal"]}`,
+      в теле — только контейнер сценария
+- [x] прогнать тесты (`./gradlew test` 174/174 и `compileE2eTestKotlin` — зелёные; до перезаписи фикстуры
+      `DockerReplayTest` падал именно на незаписанном листинге, то есть строгость обвязки не ослаблена)
 
 ### Task 16: Backoff для «хлопающего» unhealthy
 

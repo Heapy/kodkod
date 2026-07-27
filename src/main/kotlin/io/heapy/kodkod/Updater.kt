@@ -250,7 +250,7 @@ class Updater(
             currentImageId = inspect.str("Image").orEmpty(),
             platform = inspect.imagePlatform(),
             composeLabels = labels,
-            composeProject = labels.label("com.docker.compose.project"),
+            composeProject = labels.label(COMPOSE_PROJECT_LABEL),
             composeService = labels.label("com.docker.compose.service"),
         )
     }
@@ -641,14 +641,12 @@ class Updater(
      */
     private fun resolveHostConfig(hostConfig: JsonObject?, resolvedContainerName: String?): JsonObject? {
         if (hostConfig == null) return null
-        val mode = hostConfig.str("NetworkMode") ?: return hostConfig
-        if (!mode.startsWith("container:")) return hostConfig
-        val ref = mode.removePrefix("container:")
+        val ref = netnsRef(hostConfig) ?: return hostConfig
         val resolvedName = resolvedContainerName ?: return hostConfig
-        Log.info("resolved network_mode container:$ref -> container:$resolvedName")
+        Log.info("resolved network_mode $NETNS_PREFIX$ref -> $NETNS_PREFIX$resolvedName")
         return buildJsonObject {
             hostConfig.forEach { (key, value) -> if (key != "NetworkMode") put(key, value) }
-            put("NetworkMode", "container:$resolvedName")
+            put("NetworkMode", "$NETNS_PREFIX$resolvedName")
         }
     }
 
@@ -866,13 +864,12 @@ internal fun resolveLinks(
         }
         // Legacy --link: "/source:/container/alias".
         target.inspect.obj("HostConfig")?.arr("Links")?.forEach { link ->
-            val source = (link.jsonPrimitive.contentOrNull ?: return@forEach).removePrefix("/").substringBefore(':')
+            val source = linkSource(link.jsonPrimitive.contentOrNull ?: return@forEach)
             addDep(byName[source], createTime = true)
         }
         // network_mode: container:<id|name>.
-        val mode = target.inspect.obj("HostConfig")?.str("NetworkMode").orEmpty()
-        if (mode.startsWith("container:")) {
-            val ref = mode.removePrefix("container:")
+        val ref = netnsRef(target.inspect.obj("HostConfig"))
+        if (ref != null) {
             val depId = byName[ref] ?: targets.firstOrNull { it.id.startsWith(ref) }?.id
             addDep(depId, createTime = true)
             target.networkModeContainerName = depId?.let { byId[it]?.name } ?: externalContainerName(ref)
