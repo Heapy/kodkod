@@ -309,11 +309,16 @@ class Updater(
         val networks = inspect.obj("NetworkSettings")?.obj("Networks") ?: return emptyList()
         val mode = hostConfig?.str("NetworkMode").orEmpty()
         if (networks.isEmpty() || mode == "host" || mode == "none" || mode.startsWith("container:")) return emptyList()
-        return networks.map { (netName, endpoint) -> netName to cleanEndpoint(endpoint.jsonObject, oldId) }
+        // `--mac-address` / compose `mac_address:` is what fills `Config.MacAddress`, and only such an
+        // explicitly requested MAC may be carried over. `NetworkSettings.Networks[*].MacAddress` is always
+        // populated — in Docker >= 26 with a randomly generated address — so it cannot tell the two apart on
+        // its own, and pinning a generated MAC onto the replacement would invent configuration.
+        val keepMac = !inspect.obj("Config")?.str("MacAddress").isNullOrEmpty()
+        return networks.map { (netName, endpoint) -> netName to cleanEndpoint(endpoint.jsonObject, oldId, keepMac) }
     }
 
     /** Keep only the create-relevant endpoint fields and drop the auto-generated container-id alias. */
-    private fun cleanEndpoint(endpoint: JsonObject, oldId: String): JsonObject {
+    private fun cleanEndpoint(endpoint: JsonObject, oldId: String, keepMacAddress: Boolean): JsonObject {
         val short = oldId.take(12)
         return buildJsonObject {
             endpoint.arr("Aliases")?.let { aliases ->
@@ -326,6 +331,9 @@ class Updater(
             endpoint.obj("IPAMConfig")?.let { put("IPAMConfig", it) }
             endpoint.arr("Links")?.let { put("Links", it) }
             endpoint.obj("DriverOpts")?.let { put("DriverOpts", it) }
+            // Which network provides the default route; losing it silently re-routes egress traffic.
+            endpoint["GwPriority"]?.let { put("GwPriority", it) }
+            if (keepMacAddress) endpoint.str("MacAddress")?.takeIf { it.isNotEmpty() }?.let { put("MacAddress", it) }
         }
     }
 

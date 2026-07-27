@@ -16,6 +16,17 @@ services:
     labels:
       kodkod.update.enable: "true"
 
+  # A live source for the MacAddress rule: an explicitly requested MAC is the only one kodkod may carry
+  # into the replacement. Only engines that still report `Config.MacAddress` (removed in Docker >= 27)
+  # let kodkod tell it from the endpoint MAC the daemon generates for every container.
+  mac:
+    image: 127.0.0.1:5000/testapp:latest
+    mac_address: "02:42:ac:1f:00:63"
+    networks:
+      - neta
+    labels:
+      kodkod.update.enable: "true"
+
   kodkod:
     image: kodkod:e2e
     volumes:
