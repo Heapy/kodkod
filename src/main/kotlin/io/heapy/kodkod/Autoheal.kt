@@ -81,6 +81,8 @@ class Autoheal(
             // floor. A container with a longer stop window therefore reports a read timeout while the
             // daemon is still restarting it; that outcome is read back from the daemon rather than
             // believed (see [restartLanded]), which is cheaper than an inspect per unhealthy container.
+            // The read-back is where the value is finally learned — from the inspect it was going to
+            // make anyway — and it is what sizes its own budget, so the saving costs no fidelity.
             val where = "[$name ($short)]"
             if (backoffHolds(id, where)) continue
 
@@ -136,23 +138,61 @@ class Autoheal(
      */
     private fun restartLanded(id: String, where: String, issuedAt: Long, failure: Exception): Boolean {
         if (failure is DockerException && failure.status >= 400) return false
-        val deadline = clock.nanos() + millisToNanos(RESTART_VERIFY_MS)
+        var deadline = clock.nanos() + millisToNanos(RESTART_VERIFY_MS)
+        var sized = false
         Log.warn("$where the daemon gave no usable answer — reading back whether the restart landed")
         while (true) {
-            val state = runCatching { api.inspectContainer(id).obj("State") }.getOrNull()
+            val inspect = runCatching { api.inspectContainer(id) }.getOrNull()
+            // The first answer that comes back is also the first chance to learn how long this
+            // container is entitled to take. Free by construction: the read-back is already inspecting.
+            if (inspect != null && !sized) {
+                sized = true
+                deadline = maxOf(deadline, stopWindowDeadline(inspect, where) ?: deadline)
+            }
+            val state = inspect?.obj("State")
             if (state != null && state.startedSince(issuedAt)) {
                 Log.warn("$where it started again — treating the restart as done and refreshing its dependents")
                 return true
             }
             if (clock.nanos() >= deadline) {
                 Log.error(
-                    "$where has not started again ${RESTART_VERIFY_MS / 1000}s later — leaving its dependents " +
-                        "alone, restarting them against a container that is down would only spread the outage",
+                    "$where has not started again — leaving its dependents alone, restarting them against a " +
+                        "container that is down would only spread the outage",
                 )
                 return false
             }
             sleeper.sleep(PROBE_INTERVAL_MS)
         }
+    }
+
+    /**
+     * The deadline this container's **own** stop window earns the read-back, or `null` when the flat
+     * [RESTART_VERIFY_MS] already covers it (or the daemon does not report one).
+     *
+     * Without this the budget was the one thing in the chain that did not scale with the wait it exists
+     * for. Autoheal deliberately works off the container listing alone, so it passes no
+     * `expectedStopSeconds` and the restart's read timeout keeps its 60s floor; the read-back then
+     * allowed another 60s. A container with `stop_grace_period: 120s` — an ordinary Postgres or
+     * Elasticsearch setting, and precisely the configuration that makes the answer go missing in the
+     * first place — finishes its restart at ~2 minutes, just past that deadline. The restart was then
+     * recorded as "did not land" while it was landing, and the containers sharing its network namespace
+     * were left on a namespace being torn down as the decision was made: `Running`, no interfaces, and
+     * nothing in the log about it.
+     *
+     * The window is measured from here rather than from the restart, so it is granted in full on top of
+     * the read timeout that already ran out — which is the safe direction: the cost of waiting too long
+     * is one autoheal cycle spent on a container that is restarting, and the cost of waiting too little
+     * is the silent failure above.
+     */
+    private fun stopWindowDeadline(inspect: JsonObject, where: String): Long? {
+        val stopSeconds = inspect.obj("Config")?.str("StopTimeout")?.toIntOrNull()?.takeIf { it > 0 } ?: return null
+        val window = stopSeconds * 1000L + RESTART_VERIFY_HEADROOM_MS
+        if (window <= RESTART_VERIFY_MS) return null
+        Log.info(
+            "$where its own stop timeout is ${stopSeconds}s, so the restart is given ${window / 1000}s to " +
+                "show up rather than ${RESTART_VERIFY_MS / 1000}s",
+        )
+        return clock.nanos() + millisToNanos(window)
     }
 
     /** Whether this `State` describes a container that came up again at or after [issuedAt]. */
@@ -275,9 +315,13 @@ class Autoheal(
 
         /**
          * How long a restart that reported a transport failure is given to show up as a running
-         * container. Generous on purpose: what is being waited out is a graceful stop window that
-         * already outlasted the socket's own read timeout.
+         * container, when nothing better is known. Generous on purpose: what is being waited out is a
+         * graceful stop window that already outlasted the socket's own read timeout. A container whose
+         * own `Config.StopTimeout` needs more than this gets more — see [stopWindowDeadline].
          */
         const val RESTART_VERIFY_MS = 60_000L
+
+        /** Room for the SIGKILL and the teardown that follow a stop window, plus the start after them. */
+        const val RESTART_VERIFY_HEADROOM_MS = 15_000L
     }
 }

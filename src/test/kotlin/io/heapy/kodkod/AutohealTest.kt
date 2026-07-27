@@ -2,7 +2,9 @@ package io.heapy.kodkod
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -343,6 +345,58 @@ class AutohealTest {
         assertTrue(clock.sleeps.isNotEmpty(), "the outcome has to have been waited for, not assumed: ${clock.sleeps}")
     }
 
+    /**
+     * The read-back has to outlast the wait it exists for. Autoheal passes no `expectedStopSeconds`
+     * (it deliberately makes no inspect per unhealthy container), so the restart's own read timeout
+     * keeps its 60s floor and fires while the daemon is still inside a `stop_grace_period: 120s` — an
+     * ordinary Postgres or Elasticsearch setting. A flat 60s budget on top of that expires at ~2
+     * minutes, just before the container comes back, and the netns consumers are then left on a
+     * namespace that is being torn down as the decision is made. The container's own `StopTimeout` is
+     * what the budget has to be sized from — and it is right there in the inspect the read-back makes.
+     */
+    @Test
+    fun a_restart_is_given_the_time_the_containers_own_stop_window_needs() {
+        val docker = FakeDockerClient()
+        docker.listed += summary("app000000000000", "app")
+        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
+        docker.health["app000000000000"] = "unhealthy"
+        docker.health["side00000000000"] = "healthy"
+        docker.containers["app000000000000"] =
+            json("""{"Name":"/app","Config":{"StopTimeout":120},"State":{"StartedAt":"$LONG_AGO"}}""")
+        val clock = FakeClock(now = NOW)
+        docker.clock = clock
+        // 120s of graceful stop, then the start: the daemon answers at ~t=125s, the socket at t=60s.
+        val late = LateRestart(docker, "app000000000000", landsAfterMs = 125_000, clock = clock)
+
+        Autoheal(late, config(monitorAll = true), null, clock, clock).runOnce()
+
+        assertEquals(
+            listOf("restart!:app000000000000", "restart:side00000000000"), docker.ops,
+            "the restart landed, late — giving up on it strands the sidecar on a dead namespace: ${docker.ops}",
+        )
+    }
+
+    /** A container that says nothing about its stop window keeps the flat budget, and no more. */
+    @Test
+    fun a_restart_that_lands_past_every_budget_is_still_treated_as_lost() {
+        val docker = FakeDockerClient()
+        docker.listed += summary("app000000000000", "app")
+        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
+        docker.health["app000000000000"] = "unhealthy"
+        docker.health["side00000000000"] = "healthy"
+        docker.containers["app000000000000"] = json("""{"Name":"/app","State":{"StartedAt":"$LONG_AGO"}}""")
+        val clock = FakeClock(now = NOW)
+        docker.clock = clock
+        val late = LateRestart(docker, "app000000000000", landsAfterMs = 125_000, clock = clock)
+
+        Autoheal(late, config(monitorAll = true), null, clock, clock).runOnce()
+
+        assertEquals(
+            listOf("restart!:app000000000000"), docker.ops,
+            "nothing said this container needs longer, and waiting forever holds up every other one: ${docker.ops}",
+        )
+    }
+
     @Test
     fun does_not_restart_a_still_unhealthy_container_every_interval() {
         val docker = FakeDockerClient()
@@ -517,6 +571,46 @@ private class ReadTimeout(
     override fun restart(id: String, timeout: Int?, expectedStopSeconds: Int?) {
         if (carriedOut || id != target) runCatching { delegate.restart(id, timeout, expectedStopSeconds) }
         if (id == target) throw DockerException(-1, "read timed out after 60000ms")
+    }
+}
+
+/**
+ * A [FakeDockerClient] whose [restart] of [target] reports a read timeout and whose daemon then takes
+ * [landsAfterMs] to finish the job — a graceful stop that outlasts the socket by a long way, followed
+ * by the start. Until that instant the container reads exactly as it did before the restart (up, from
+ * its previous run), which is the only honest way to model a restart still in progress.
+ */
+private class LateRestart(
+    private val delegate: FakeDockerClient,
+    private val target: String,
+    private val landsAfterMs: Long,
+    private val clock: WallClock,
+) : DockerClient by delegate {
+    private var landsAt = Long.MAX_VALUE
+
+    override fun restart(id: String, timeout: Int?, expectedStopSeconds: Int?) {
+        if (id != target) {
+            delegate.restart(id, timeout, expectedStopSeconds)
+            return
+        }
+        landsAt = clock.millis() + landsAfterMs
+        delegate.ops += "restart!:$id"
+        throw DockerException(-1, "read timed out after 60000ms")
+    }
+
+    override fun inspectContainer(id: String): JsonObject {
+        val inspect = delegate.inspectContainer(id)
+        if (id != target || clock.millis() < landsAt) return inspect
+        return buildJsonObject {
+            inspect.forEach { (key, value) -> if (key != "State") put(key, value) }
+            put(
+                "State",
+                buildJsonObject {
+                    put("Running", true)
+                    put("StartedAt", Instant.ofEpochMilli(landsAt).toString())
+                },
+            )
+        }
     }
 }
 

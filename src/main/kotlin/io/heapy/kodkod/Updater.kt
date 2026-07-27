@@ -171,7 +171,8 @@ class Updater(
             false -> {
                 Log.error(
                     "[$name] '$backupName' is a leftover backup and the container holding '$name' " +
-                        "(${holderId.take(12)}) never stayed up — putting the backup back in its place",
+                        "(${holderId.take(12)}) never ran the ${provenUptimeMs / 1000}s a replacement has to " +
+                        "survive to be accepted — REMOVING it and putting the backup back in its place",
                 )
                 if (freeName(name, holderId)) restoreBackup(id, name)
             }
@@ -193,9 +194,19 @@ class Updater(
      * The discriminator is the container's own uptime against the window a replacement has to survive to
      * be accepted ([Config.updateVerifySeconds]) — the same measure `verifyStarted` applies live, which is
      * what makes this the completion of that decision rather than a new one. The floor underneath it
-     * matters because that window can be configured down to zero: a container that did not survive a
-     * minute never served anything, while an operator stopping one on purpose has by construction watched
-     * it run for longer.
+     * ([MIN_PROVEN_UPTIME_MS]) matters because that window can be configured down to zero.
+     *
+     * The daemon records nothing that separates the two histories outright — both leave a stopped
+     * container holding the name, created and finished within seconds of the backup either way, and an
+     * exit code that is as likely to be non-zero for a `docker stop` (143) as for a crash. So this is a
+     * verdict on the only evidence there is, and it can be wrong in one direction: an operator who stops
+     * a *completed* update inside that same window, in the narrower window where kodkod also failed to
+     * delete the backup, has that replacement removed and the previous container started in its place.
+     * That is deliberate. The mistake costs one container (its volumes survive — `remove`
+     * sends `v=false`) and is undone by the next cycle, which updates the restored container to the
+     * same image again; the opposite mistake — leaving a crashing replacement on the name — costs a
+     * service that stays down until a human notices, which is what this whole pass exists to prevent.
+     * The removal is logged at ERROR, naming the container and the threshold it missed.
      */
     private fun holderEverStayedUp(holderId: String, name: String): Boolean? {
         val state = try {
@@ -208,8 +219,12 @@ class Updater(
         // run, which only a recreate cut short between `create` and `start` leaves behind.
         val startedAt = state.dockerTime("StartedAt") ?: return false
         val finishedAt = state.dockerTime("FinishedAt") ?: return null
-        return finishedAt - startedAt >= maxOf(config.updateVerifySeconds * 1000L, MIN_PROVEN_UPTIME_MS)
+        return finishedAt - startedAt >= provenUptimeMs
     }
+
+    /** How long a container must have run to count as one kodkod would have accepted. */
+    private val provenUptimeMs: Long
+        get() = maxOf(config.updateVerifySeconds * 1000L, MIN_PROVEN_UPTIME_MS)
 
     /** Give [id] the service name back and start it; a rename that fails leaves the container alone. */
     private fun restoreBackup(id: String, name: String) {

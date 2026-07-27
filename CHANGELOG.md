@@ -104,7 +104,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `network connect` or a label change made while the image downloaded is no longer reverted.
 - An autoheal restart whose answer never arrived (a `stop_grace_period` longer than the socket's read
   timeout) is read back from the daemon instead of assumed failed, so the containers sharing its network
-  namespace are still refreshed.
+  namespace are still refreshed. The read-back is given as long as the container's own
+  `Config.StopTimeout` needs — read from the inspect it was making anyway — instead of a flat minute
+  that expired just short of a `stop_grace_period: 120s` restart, which is exactly the configuration
+  that makes the answer go missing in the first place.
 - A rollback that failed before the container was renamed no longer asks the daemon to rename it onto
   its own name, which was refused and reported as two ERRORs about a container that never moved.
 - Chunked responses that were cut off mid-body are reported as transport errors instead of being
