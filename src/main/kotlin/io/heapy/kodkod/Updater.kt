@@ -60,7 +60,8 @@ class Updater(
      * This is the only state [Updater] keeps between cycles, which is what makes it necessary at all —
      * a cycle that knows nothing about the previous one repeats a failed recreate (stop, rename, create,
      * fail, roll back) every `KODKOD_UPDATE_INTERVAL`, forever. An entry is dropped the moment it stops
-     * applying: the tag moved on, the cooldown ran out, or the update went through after all.
+     * applying: the tag moved on, the cooldown ran out, the update went through after all, or an attempt
+     * ended without learning anything against the image ([ImageBlame.NONE]).
      */
     private val failedUpdates = HashMap<String, FailedUpdate>()
 
@@ -105,7 +106,11 @@ class Updater(
      * per cycle forever.
      */
     private enum class ImageBlame {
-        /** Whatever failed, the replacement was never asked to run. Nothing was learned. */
+        /**
+         * Nothing was learned about the image: either the replacement was never asked to run, or it ran
+         * and only the *verdict* could not be read. Not evidence — and therefore not a link in a chain
+         * of consecutive ones either, which is why it clears what earlier cycles recorded.
+         */
         NONE,
 
         /** The daemon refused to start it. Evidence, but only once it repeats. */
@@ -1027,16 +1032,26 @@ class Updater(
      * has no new image to blame, and suppressing it would leave a container pinned to a dead namespace.
      * How much the failure says about the image is the caller's to decide and arrives as [blame]; a
      * refused start only holds the update back once it is the [START_FAILURES_BEFORE_BLAME]th in a row,
-     * so the first one is recorded without suppressing anything.
+     * so the first one is recorded without suppressing anything — and an attempt that ends in
+     * [ImageBlame.NONE] *forgets* the ones before it, because "in a row" is the whole argument.
      */
     private fun rememberFailedUpdate(target: Target, blame: ImageBlame) {
-        if (blame == ImageBlame.NONE) return
         val imageId = target.newImageId?.takeIf { target.stale } ?: return
         if (cooldownMs <= 0) return
-        val now = clock.millis()
         // Only a failure of the *same* image on this container adds to the previous one. Anything else in
         // the map by now is about another image, and `suppressedByCooldown` would have dropped it.
         val previous = failedUpdates[target.id]?.takeIf { it.imageId == imageId }
+        if (blame == ImageBlame.NONE) {
+            // This attempt is not a refusal, so it cannot be one of the [START_FAILURES_BEFORE_BLAME]
+            // *consecutive* ones — and leaving the earlier strike standing would let two refusals a whole
+            // cooldown apart, with anything at all between them, add up to a six-hour hold on an image
+            // neither of them convicted. Dropped rather than zeroed: an entry that survives would have
+            // `suppressedByCooldown` announce a refusal that did not happen last cycle, and on the
+            // [UnverifiableReplacement] path the image actually *started* — evidence for it, not against.
+            if (previous != null) failedUpdates.remove(target.id)
+            return
+        }
+        val now = clock.millis()
         val entry = FailedUpdate(
             imageId = imageId,
             attemptedAtNanos = clock.nanos(),

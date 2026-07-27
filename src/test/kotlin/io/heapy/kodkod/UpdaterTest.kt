@@ -1014,6 +1014,42 @@ class UpdaterTest {
         assertTrue(log.contains("refused a start twice"), "and it has to say what it is holding back on: $log")
     }
 
+    /**
+     * "Twice running" has to mean *running*. The whole argument for spending a second rollback before
+     * blaming an image is that a transient cause (a port in teardown, a daemon blip) has an entire update
+     * interval to clear while a broken image does not — which holds for two refusals in a row and for
+     * nothing else. A cycle that learned nothing used to leave the first strike standing, so an isolated
+     * refusal up to `KODKOD_UPDATE_FAILURE_COOLDOWN` later was counted as the second one.
+     *
+     * The cycle in between here is the strongest possible "learned nothing": the image *started*, and
+     * only the liveness gate could not be read. That is evidence the image can start, which makes the
+     * later refusal even less likely to be its fault.
+     */
+    @Test
+    fun a_refusal_the_image_has_started_since_is_not_the_first_of_two() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.failStart += "new-web-0" // cycle 1: the daemon refuses the start
+        docker.failInspect += "new-web-1" // cycle 2: it starts, and only the gate cannot be read
+        docker.failStart += "new-web-2" // cycle 3: an isolated refusal, cycles away from the first
+        val updater = updater(docker, config(verifySeconds = "0"))
+
+        updater.runOnce()
+        updater.runOnce()
+        updater.runOnce()
+        val afterThirdCycle = docker.ops.size
+
+        val log = captureLog { updater.runOnce() }
+
+        assertTrue(
+            docker.ops.drop(afterThirdCycle).contains("create:web"),
+            "a start the image came up on is evidence for it, not the first half of a pair against it — " +
+                "adding two unrelated refusals together holds a perfectly good update back for six " +
+                "hours: ${docker.ops}",
+        )
+        assertFalse(log.contains("skipping this update"), "so nothing may say the update was skipped: $log")
+    }
+
     @Test
     fun the_cooldown_running_out_lets_the_update_be_tried_again() {
         val docker = FakeDockerClient()
