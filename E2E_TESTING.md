@@ -186,6 +186,16 @@ the recording was taken from the host daemon. The result would be a plausible-lo
 cycle that saw nothing. The recorder therefore refuses to run when the CLI and the recorder do not
 share a daemon (`recorderDaemonMismatch`), rather than silently recording the wrong one.
 
+`DOCKER_HOST` is not the only way the two can be pointed apart: the CLI also follows `DOCKER_CONTEXT`
+and whatever context `docker context use` left active, neither of which kodkod's unix-socket transport
+can see. So the guard does not compare addresses — it asks both sides which daemon they are
+(`docker info --format '{{.ID}}'`, once as the harness runs it and once pinned to the recorder's socket
+with `-H`) and refuses unless the two ids are equal. Addresses would get it wrong in both directions:
+on Docker Desktop the active context is `unix://$HOME/.docker/run/docker.sock` while the recorder reads
+`/var/run/docker.sock`, which is one daemon under two names. A probe that cannot be answered at all is a
+refusal too, since a corpus taken from the wrong daemon is indistinguishable from a correct one
+afterwards. Set `KODKOD_DOCKER_SOCKET` to record from the daemon the CLI is actually on.
+
 Recording is additive and versioned. Fixtures are written to:
 
 ```text

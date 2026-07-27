@@ -188,31 +188,99 @@ class FixtureWriterTest {
 
     // --- daemon guard -----------------------------------------------------------------------
 
+    private fun mismatch(
+        useCurrentDocker: Boolean = true,
+        cli: DaemonProbe = DaemonProbe("the Docker CLI", HOST_DAEMON),
+        recorded: DaemonProbe = DaemonProbe(SOCKET, HOST_DAEMON),
+    ): String? = recorderDaemonMismatch(useCurrentDocker, SOCKET, { cli }, { recorded })
+
     @Test
     fun recording_without_use_current_docker_is_refused() {
-        val reason = recorderDaemonMismatch(useCurrentDocker = false, dockerHost = null, socket = SOCKET)
+        val reason = mismatch(useCurrentDocker = false)
 
         assertNotNull(reason)
         assertTrue(reason!!.contains("-Pkodkod.e2e.useCurrentDocker=true"), "the message must name the missing flag: $reason")
     }
 
+    /**
+     * Measured against real daemons on the development host: with `DOCKER_HOST` unset — all the previous
+     * guard looked at — `DOCKER_CONTEXT=<a context on another daemon> docker info` reports
+     * `8f7858a0-…` while `docker -H unix:///var/run/docker.sock info` reports `2e3f723b-…`. The scenario's
+     * containers are created on the first and the fixture is recorded from the second.
+     */
     @Test
-    fun recording_against_a_docker_host_the_recorder_cannot_reach_is_refused() {
-        val reason = recorderDaemonMismatch(useCurrentDocker = true, dockerHost = "tcp://127.0.0.1:12375", socket = SOCKET)
+    fun recording_while_the_cli_drives_another_daemon_is_refused() {
+        val reason = mismatch(
+            cli = DaemonProbe("the Docker CLI", "8f7858a0-aa67-484b-8757-5a8565c294d7"),
+            recorded = DaemonProbe(SOCKET, HOST_DAEMON),
+        )
 
         assertNotNull(reason)
-        assertTrue(reason!!.contains("tcp://127.0.0.1:12375"), "the message must name the daemon it would miss: $reason")
+        assertTrue(reason!!.contains("8f7858a0-aa67-484b-8757-5a8565c294d7"), "name the daemon the CLI drives: $reason")
+        assertTrue(reason.contains(HOST_DAEMON), "and the one that would be recorded: $reason")
+        assertTrue(reason.contains("DOCKER_CONTEXT"), "and where to look, which is more than DOCKER_HOST: $reason")
+    }
+
+    /**
+     * The whole point of the guard is that a corpus from the wrong daemon is indistinguishable from a
+     * correct one once it is on disk, so "we could not tell" is not allowed to read as "go ahead".
+     */
+    @Test
+    fun a_daemon_that_could_not_be_asked_refuses_rather_than_assumes() {
+        val unreachable = DaemonProbe("the Docker CLI", "", "`docker info` exited 1: Cannot connect")
+
+        val cliUnreadable = mismatch(cli = unreachable)
+        val socketUnreadable = mismatch(recorded = DaemonProbe(SOCKET, "", "`docker info` exited 1: no such file"))
+
+        assertNotNull(cliUnreadable)
+        assertTrue(cliUnreadable!!.contains("Cannot connect"), "the message must carry what the CLI said: $cliUnreadable")
+        assertNotNull(socketUnreadable)
+        assertTrue(socketUnreadable!!.contains("no such file"), "for either side: $socketUnreadable")
     }
 
     @Test
-    fun recording_against_the_local_daemon_is_allowed() {
-        assertNull(recorderDaemonMismatch(useCurrentDocker = true, dockerHost = null, socket = SOCKET))
-        assertNull(recorderDaemonMismatch(useCurrentDocker = true, dockerHost = "  ", socket = SOCKET))
-        assertNull(recorderDaemonMismatch(useCurrentDocker = true, dockerHost = "unix://$SOCKET", socket = SOCKET))
+    fun a_daemon_id_is_read_out_of_what_the_cli_answered() {
+        val clean = daemonProbe("cli", CommandResult(0, "$HOST_DAEMON\n"))
+        val refused = daemonProbe("cli", CommandResult(1, "Cannot connect to the Docker daemon at tcp://x. Is it running?"))
+        val silent = daemonProbe("cli", CommandResult(0, "   \n"))
+
+        assertEquals(HOST_DAEMON, clean.id)
+        assertEquals("", refused.id, "an exit code of 1 is not an id, whatever was on stdout")
+        assertTrue(refused.detail.contains("Cannot connect"), "and the reason has to survive: ${refused.detail}")
+        assertEquals("", silent.id, "nor is blank output, which would otherwise match the other side's blank")
+    }
+
+    /**
+     * The harness merges stderr into stdout, so whatever the CLI says for itself lands in the same
+     * capture as the template's result — which it precedes.
+     */
+    @Test
+    fun a_warning_the_cli_printed_is_not_mistaken_for_the_id() {
+        val probe = daemonProbe("cli", CommandResult(0, "WARNING: No swap limit support\n$HOST_DAEMON\n"))
+
+        assertEquals(HOST_DAEMON, probe.id)
+    }
+
+    /**
+     * The ordinary case on a Docker Desktop host, and the reason addresses are not what is compared: the
+     * active context is `unix:///Users/<me>/.docker/run/docker.sock`, the recorder reads
+     * `/var/run/docker.sock`, and both are the same daemon (measured: id `2e3f723b-…` from either).
+     */
+    @Test
+    fun two_spellings_of_one_daemon_are_not_a_mismatch() {
+        assertNull(
+            mismatch(
+                cli = DaemonProbe("unix:///Users/me/.docker/run/docker.sock", HOST_DAEMON),
+                recorded = DaemonProbe(SOCKET, HOST_DAEMON),
+            ),
+        )
     }
 
     private companion object {
         const val SOCKET = "/var/run/docker.sock"
+
+        /** A real `GET /info` `ID`, from the daemon these tests' expectations were measured against. */
+        const val HOST_DAEMON = "2e3f723b-a307-4bf3-9145-93e2c4625449"
 
         /** What the recorder stamps a label with; irrelevant to every assertion but required to commit. */
         val META = FixtureMeta("29.5.2", "1.52", "5.1.4", "2026-07-27T00:00:00Z")

@@ -51,8 +51,10 @@ class DockerFixtureRecorder {
     fun setupSuite() {
         recorderDaemonMismatch(
             useCurrentDocker = boolProperty("kodkod.e2e.useCurrentDocker"),
-            dockerHost = System.getenv("DOCKER_HOST"),
             socket = socket,
+            // Exactly the invocation every scenario's setup uses, environment and all.
+            probeCli = { daemonId("the Docker CLI as the harness runs it") },
+            probeSocket = { daemonId(socket, "-H", "unix://$socket") },
         )?.let { error(it) }
 
         e2e.startDocker()
@@ -102,6 +104,15 @@ class DockerFixtureRecorder {
         e2e.publishVariant("v2") // only db uses testapp; web (busybox) is an unchanged dependent
         Updater(api, updateConfig(), selfId = null).runOnce()
     }
+
+    /**
+     * Ask the daemon reached by `docker [globalArgs] info` what its own id is. [globalArgs] go before the
+     * subcommand, which is where `-H` belongs: an explicit host wins over `DOCKER_HOST`, over
+     * `DOCKER_CONTEXT` and over the active context, so it is how one *specific* daemon gets asked while
+     * the same call without it reports whichever daemon the environment actually points at.
+     */
+    private fun daemonId(via: String, vararg globalArgs: String): DaemonProbe =
+        daemonProbe(via, e2e.docker(*globalArgs, "info", "--format", "{{.ID}}", check = false))
 
     // --- recording plumbing ---------------------------------------------------------------
 
@@ -153,27 +164,83 @@ class DockerFixtureRecorder {
 }
 
 /**
+ * A daemon's answer to "who are you": `GET /info`'s `ID`, which the engine generates once, on the first
+ * start against a given data root, and keeps for its lifetime. Two daemons never share one, and one
+ * daemon reports the same id no matter which of its sockets or ports the question arrives on — which is
+ * what makes it the right thing to compare, and a socket path the wrong one.
+ */
+internal class DaemonProbe(
+    /** How this daemon was addressed, named in the failure message. */
+    val via: String,
+    /** The `ID` it reported, or empty when the question could not be answered. */
+    val id: String,
+    /** What went wrong, when [id] is empty. */
+    val detail: String = "",
+)
+
+/**
+ * Read a daemon's id out of what `docker info --format '{{.ID}}'` answered, [via] naming how it was
+ * asked. Anything short of a clean answer is an *unanswered* probe carrying the output, never a blank
+ * id that could later read as agreement.
+ *
+ * The id is the last non-blank line: with `--format` the CLI writes nothing but the template's result,
+ * and whatever it has to say for itself (the harness merges stderr into stdout) is written before it.
+ */
+internal fun daemonProbe(via: String, result: CommandResult): DaemonProbe {
+    val id = result.output.lineSequence().map { it.trim() }.lastOrNull { it.isNotEmpty() }.orEmpty()
+    if (result.exitCode != 0 || id.isEmpty()) {
+        return DaemonProbe(via, "", "`docker info` exited ${result.exitCode}: ${result.output.trim()}")
+    }
+    return DaemonProbe(via, id)
+}
+
+/**
  * Guards the one way the recorder can produce a plausible-looking but worthless corpus.
  *
- * kodkod's transport is unix-socket only, so the in-process [DockerApi] always talks to [socket] —
- * it cannot follow a `tcp://` `DOCKER_HOST`. The harness, however, drives the CLI through
- * `DOCKER_HOST` whenever it starts Docker-in-Docker. Without `-Pkodkod.e2e.useCurrentDocker=true`
- * the containers would therefore be created on the inner daemon while the recording is taken from
- * the developer's host daemon: the cycle sees none of the scenario's containers, records a handful
+ * kodkod's transport is unix-socket only, so the in-process [DockerApi] always records from [socket].
+ * The scenario's containers, meanwhile, are created by the **CLI**, and the CLI picks its daemon from
+ * three places kodkod has no say in: `DOCKER_HOST`, `DOCKER_CONTEXT`, and the context left active by
+ * `docker context use`. Any of them pointing somewhere else — the harness's own Docker-in-Docker, a
+ * colima or a remote context — and the cycle sees none of the scenario's containers, records a handful
  * of empty listings, and overwrites the committed fixture with them. Nothing fails.
  *
- * @return the reason recording is unsafe, or `null` when the CLI and the recorder share a daemon.
+ * So the two are not compared by *address* — enumerating the ways they can be pointed apart is a list
+ * that grows with somebody else's release notes, and it gets the ordinary case wrong in both directions
+ * (Docker Desktop's active context is `unix:///Users/<me>/.docker/run/docker.sock` while the recorder
+ * reads `/var/run/docker.sock`: different paths, one daemon). They are compared by the identity the
+ * daemon itself reports, [DaemonProbe]. Anything that cannot be established refuses to record: a corpus
+ * taken from the wrong daemon is indistinguishable from a correct one after the fact.
+ *
+ * @param probeCli    what the harness's own `docker` invocation reaches — probed lazily, it costs a
+ *                    subprocess and is pointless when the flag below already rules recording out.
+ * @param probeSocket what a `docker` pinned to [socket] with `-H` reaches, which is by construction the
+ *                    daemon `DockerApi(socket)` records from.
+ * @return the reason recording is unsafe, or `null` when both name the same daemon.
  */
-internal fun recorderDaemonMismatch(useCurrentDocker: Boolean, dockerHost: String?, socket: String): String? {
+internal fun recorderDaemonMismatch(
+    useCurrentDocker: Boolean,
+    socket: String,
+    probeCli: () -> DaemonProbe,
+    probeSocket: () -> DaemonProbe,
+): String? {
     if (!useCurrentDocker) {
         return "the fixture recorder requires -Pkodkod.e2e.useCurrentDocker=true: without it the harness " +
             "starts Docker-in-Docker and drives the CLI through DOCKER_HOST, while the recorder can only " +
             "reach the unix socket $socket — the scenario would run on one daemon and be recorded from " +
             "another, silently producing an empty fixture"
     }
-    val host = dockerHost?.trim().orEmpty()
-    if (host.isEmpty() || host.removePrefix("unix://") == socket) return null
-    return "DOCKER_HOST=$host points the Docker CLI at a daemon the recorder cannot reach: kodkod speaks " +
-        "unix socket only and would record from $socket instead. Unset DOCKER_HOST, or point the recorder " +
-        "at the same daemon via KODKOD_DOCKER_SOCKET"
+    val cli = probeCli()
+    val recorded = probeSocket()
+    listOf(cli, recorded).firstOrNull { it.id.isBlank() }?.let {
+        return "could not ask ${it.via} which daemon it is (${it.detail}) — refusing to record, because a " +
+            "corpus taken from the wrong daemon looks exactly like a correct one"
+    }
+    if (cli.id != recorded.id) {
+        return "the Docker CLI and the recorder are on different daemons: the scenario's containers would " +
+            "be created on ${cli.id} (${cli.via}) while the fixture is recorded from ${recorded.id} " +
+            "($socket). Check DOCKER_HOST, DOCKER_CONTEXT and `docker context ls` (the active context is " +
+            "what an unset DOCKER_HOST falls back to), or point the recorder at the same daemon with " +
+            "KODKOD_DOCKER_SOCKET"
+    }
+    return null
 }
