@@ -643,10 +643,11 @@ class Updater(
             // Starting a container somebody else stopped is not this cycle's call, but staying quiet
             // about one whose create-time reference just died would leave the operator to find out from
             // a container that refuses to start much later, for no visible reason. One kodkod itself
-            // left stopped is a different sentence: it is tracked, and the next cycle rebuilds it.
+            // left stopped is a different sentence: it is tracked, and the next cycle brings it back.
             val doomed = when {
                 dependent.id in strandedDependents ->
-                    " — kodkod left it stopped itself and will rebuild it against ${provider.name} next cycle"
+                    " — kodkod left it stopped itself and will bring it back against ${provider.name} " +
+                        "on the next cycle"
                 dependent.pinnedToProviderId && replaced ->
                     " — and it references that container by id, so it will refuse to start until it is recreated"
                 else -> ""
