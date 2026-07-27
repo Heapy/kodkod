@@ -241,11 +241,20 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
                     ?: throw DockerException(-1, "truncated chunked body: no chunk header at byte $pos")
                 val sizeToken = String(data, pos, lineEnd - pos, StandardCharsets.US_ASCII)
                     .substringBefore(';').trim()
-                val size = sizeToken.toIntOrNull(16)
+                // RFC 9112 chunk-size is 1*HEXDIG — no sign, no prefix — but `toIntOrNull(16)` accepts
+                // one. Both spellings it lets through are dangerous: "-1" becomes a negative length
+                // handed to a byte-range copy, and "-0" becomes a counterfeit terminator that ends the
+                // body early and returns the prefix that arrived as if it were the whole answer.
+                val size = sizeToken.takeIf { token -> token.isNotEmpty() && token.all { it.digitToIntOrNull(16) != null } }
+                    ?.toIntOrNull(16)
                     ?: throw DockerException(-1, "malformed chunked body: unreadable chunk size '$sizeToken'")
                 pos = lineEnd + CRLF.size
                 if (size == 0) return out.toByteArray()
-                if (pos + size > data.size) {
+                // Subtraction, not `pos + size > data.size`: that sum overflows to a negative number
+                // for a size near Int.MAX_VALUE, which turns the bounds check into its own opposite
+                // and hands the range straight to the copy below. `pos <= data.size` here, so the
+                // difference cannot overflow.
+                if (size > data.size - pos) {
                     throw DockerException(-1, "truncated chunked body: chunk of $size bytes cut short")
                 }
                 out.write(data, pos, size)
