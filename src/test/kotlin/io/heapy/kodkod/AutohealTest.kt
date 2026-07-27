@@ -617,6 +617,48 @@ class AutohealTest {
         )
     }
 
+    /**
+     * The other half of that sweep: an absence that is *over* is not evidence of anything.
+     *
+     * A container in a bad spell does not read as unhealthy on every cycle — each restart resets its
+     * healthcheck to `starting`, so what the listings show is unhealthy → absent → unhealthy → absent.
+     * Carrying the first absence forward makes the "gone for a whole KODKOD_AUTOHEAL_MAX_INTERVAL" sweep
+     * measure a gap that ended long ago: the counter is dropped in the middle of the spell, the next
+     * restart counts as a first one, and the container is back to being restarted every base interval —
+     * the exact behaviour the backoff exists to stop, and with nothing in the log to say so.
+     */
+    @Test
+    fun an_absence_that_ended_does_not_age_the_backoff_out_from_under_the_container() {
+        val docker = FakeDockerClient()
+        docker.unhealthy("app")
+        val clock = FakeClock()
+        val autoheal = autoheal(docker, config(monitorAll = true, maxInterval = "120"), clock)
+
+        autoheal.runOnce() // 0s: restart #1, which buys a 30s window
+        // The restart reset the healthcheck: `starting` is in neither listing, so this is an absence.
+        docker.health["app"] = "starting"
+        clock.advance(10_000)
+        autoheal.runOnce()
+        docker.health["app"] = "unhealthy" // 20s: seen again — whatever that absence was, it is over
+        clock.advance(10_000)
+        autoheal.runOnce()
+        docker.health["app"] = "starting" // 140s: absent again, 130s after the *first* absence began
+        clock.advance(120_000)
+        autoheal.runOnce()
+        docker.health["app"] = "unhealthy"
+        clock.advance(10_000)
+        autoheal.runOnce() // 150s: restart #2, which buys 60s
+        clock.advance(40_000)
+        autoheal.runOnce() // 190s: still inside that window
+
+        assertEquals(
+            listOf("restart:app", "restart:app"), docker.ops,
+            "the absence at 140s had just started, so the container is still the one that was restarted " +
+                "at 0s and the restart at 150s is its second: measuring that absence from 10s instead " +
+                "drops the counter, and the restart at 190s comes as the second of a fresh spell: ${docker.ops}",
+        )
+    }
+
     @Test
     fun counts_the_restarts_of_each_container_separately() {
         val docker = FakeDockerClient()

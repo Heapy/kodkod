@@ -882,6 +882,40 @@ class UpdaterTest {
         )
     }
 
+    /**
+     * The gate's early exit is on *consecutive* good probes, and the word carries the whole guarantee.
+     * Counting good probes in total lets a replacement that flapped — a probe the socket ate here, a
+     * `starting` there — collect three of them across a window it was never once stable in, and leave
+     * the gate while it is still deciding what it is. What follows is irreversible: the container it
+     * replaced is force-removed and the image it was running is pruned.
+     *
+     * So the run below is scripted to turn unhealthy on the one probe an early exit would never make.
+     */
+    @Test
+    fun a_replacement_that_flapped_does_not_leave_the_gate_on_three_good_probes_in_total() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        // Probe 4 is the third *good* probe but only the second consecutive one; probe 5 is the verdict.
+        val scripted = ProbeScript(
+            docker, "new-web-0",
+            listOf("healthy", null, "healthy", "healthy", "unhealthy"),
+        )
+
+        val log = captureLog { Updater(scripted, config(verifySeconds = "2"), selfId = null, clock, clock).runOnce() }
+
+        assertFalse(
+            docker.ops.contains("remove:web"),
+            "the replacement was never up for three probes running, and the container it replaced is the " +
+                "only way back from what it turned into: ${docker.ops}",
+        )
+        assertTrue(docker.removedImages.isEmpty(), "nor may its image be pruned: ${docker.removedImages}")
+        assertOrder(docker.ops, "start:new-web-0", "remove:new-web-0", "rename:web->web", "start:web")
+        assertTrue(
+            log.contains("healthcheck reports unhealthy"),
+            "and the reason has to be the one the daemon gave on the last probe: $log",
+        )
+    }
+
     // --- memory of an image that cannot start ---------------------------------------------
 
     /** A stale `web` whose replacement starts and dies, so the first cycle ends in a rollback. */
@@ -2356,6 +2390,31 @@ private class HealthFlip(
     override fun start(id: String) {
         healthWhenStarted[id] = delegate.health[target]
         delegate.start(id)
+    }
+}
+
+/**
+ * A [FakeDockerClient] that answers successive inspects of [target] from [script], one entry per probe:
+ * a `State.Health.Status` to report, or `null` for a probe the daemon does not answer at all. The last
+ * entry stands for every probe after it.
+ *
+ * The static [FakeDockerClient.health] map can only say what a container reports *throughout*, which
+ * makes a replacement that is not the same on every probe — the one the liveness gate's "consecutive"
+ * rule exists for — impossible to express.
+ */
+private class ProbeScript(
+    private val delegate: FakeDockerClient,
+    private val target: String,
+    private val script: List<String?>,
+) : DockerClient by delegate {
+    private var probes = 0
+
+    override fun inspectContainer(id: String): JsonObject {
+        if (id != target) return delegate.inspectContainer(id)
+        val status = script[probes++.coerceAtMost(script.lastIndex)]
+            ?: throw DockerException(500, "fake: probe $probes of '$id' was not answered")
+        delegate.health[target] = status
+        return delegate.inspectContainer(id)
     }
 }
 
