@@ -1,1 +1,1 @@
-{"Descriptor":{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:0349d46ee8ce7dc314cde547507c7230253a223880d04167436d822840a3604b","size":855},"Platforms":[{"architecture":"arm64","os":"linux"},{"architecture":"unknown","os":"unknown"}]}
+{"Descriptor":{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:8d295f4ba799a04bf21bb548f3b5b7fa382c048b030b560056f6dec88dda4947","size":855},"Platforms":[{"architecture":"arm64","os":"linux"},{"architecture":"unknown","os":"unknown"}]}

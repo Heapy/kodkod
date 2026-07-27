@@ -24,7 +24,27 @@ class ConfigTest {
         assertEquals(3600, c.updateInterval)
         assertFalse(c.autohealMonitorAll)
         assertTrue(c.updateCleanup)
+        assertEquals(15, c.updateVerifySeconds)
+        assertTrue(c.updateVerifyHealth)
         assertNull(c.registryAuth)
+    }
+
+    @Test
+    fun reads_the_liveness_verification_window() {
+        assertEquals(45, Config.fromEnv(env("KODKOD_UPDATE_VERIFY_SECONDS" to "45")).updateVerifySeconds)
+        assertEquals(
+            0, Config.fromEnv(env("KODKOD_UPDATE_VERIFY_SECONDS" to "0")).updateVerifySeconds,
+            "0 is a legal window: probe the replacement once and move on",
+        )
+        assertEquals(
+            0, Config.fromEnv(env("KODKOD_UPDATE_VERIFY_SECONDS" to "-5")).updateVerifySeconds,
+            "a negative window cannot mean \"wait backwards\" — it degrades to a single probe",
+        )
+        assertEquals(
+            15, Config.fromEnv(env("KODKOD_UPDATE_VERIFY_SECONDS" to "soon")).updateVerifySeconds,
+            "unparseable values fall back to the default rather than disabling the gate",
+        )
+        assertFalse(Config.fromEnv(env("KODKOD_UPDATE_VERIFY_HEALTH" to "false")).updateVerifyHealth)
     }
 
     @Test

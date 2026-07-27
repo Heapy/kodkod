@@ -1,9 +1,14 @@
-# Scenario R — Rollback on a failed recreate (plan fix 2).
+# Scenario R — Rollback on a failed recreate (plan fix 2), in both flavours.
 #
-# app starts on a good image (v1). The runbook then pushes the *broken* variant
-# (entrypoint that can't exec) to testapp:latest. kodkod stops+renames app,
-# creates the new container (succeeds), tries to start it (FAILS), removes it and
-# rolls app back to running on v1. The container must never be left stopped.
+# app starts on a good image (v1). The runbook then pushes a bad variant to testapp:latest:
+#
+#   * `broken`  — entrypoint that cannot exec: `POST /start` itself fails.
+#   * `crasher` — starts fine and exits a moment later: `POST /start` returns 204 and only the
+#                 liveness gate's probes notice (plan task 10).
+#
+# Either way kodkod stops+renames app, creates the replacement, and on failure removes it and rolls
+# app back to running on v1. The container must never be left stopped, and — because the old image is
+# what the rollback runs on — it must not have been pruned either.
 name: e2e-rollback
 services:
   app:
@@ -21,3 +26,6 @@ services:
       KODKOD_UPDATE_START_PERIOD: "5"
       # Don't delete the "old" image on a rollback test run.
       KODKOD_UPDATE_CLEANUP: "false"
+      # Shorter than the 15s default so a crashing replacement is judged within one update interval;
+      # still long enough for the three good probes a healthy replacement needs.
+      KODKOD_UPDATE_VERIFY_SECONDS: "8"

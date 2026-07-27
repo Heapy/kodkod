@@ -25,6 +25,19 @@ data class Config(
     val updateStartPeriod: Long,
     val updateMonitorAll: Boolean,
     val updateCleanup: Boolean,
+    /**
+     * `KODKOD_UPDATE_VERIFY_SECONDS` — how long a replacement container is watched after `start`
+     * before the container and image it replaced are destroyed. A `204` from `POST /start` only says
+     * the process was launched, not that it survived, so nothing irreversible happens until this
+     * window either confirms the replacement or expires. `0` means "one probe and move on".
+     */
+    val updateVerifySeconds: Long,
+    /**
+     * `KODKOD_UPDATE_VERIFY_HEALTH` — whether a replacement that has already *failed* its healthcheck
+     * counts as a failed update. A container still inside its `start_period` (`Health=starting`) never
+     * does: that period is the image author's own statement about acceptable startup time.
+     */
+    val updateVerifyHealth: Boolean,
     val registryAuth: String?,
 ) {
     companion object {
@@ -47,6 +60,8 @@ data class Config(
                 updateStartPeriod = long("KODKOD_UPDATE_START_PERIOD", 0),
                 updateMonitorAll = bool("KODKOD_UPDATE_MONITOR_ALL", false),
                 updateCleanup = bool("KODKOD_UPDATE_CLEANUP", true),
+                updateVerifySeconds = long("KODKOD_UPDATE_VERIFY_SECONDS", 15).coerceAtLeast(0),
+                updateVerifyHealth = bool("KODKOD_UPDATE_VERIFY_HEALTH", true),
                 registryAuth = get("KODKOD_REGISTRY_AUTH")?.takeIf { it.isNotBlank() },
             ).also {
                 require(it.autohealInterval > 0) { "KODKOD_AUTOHEAL_INTERVAL must be > 0 (got ${it.autohealInterval})" }

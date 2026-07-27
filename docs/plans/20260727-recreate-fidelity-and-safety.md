@@ -430,17 +430,38 @@ max-adversarial ревью репозитория дало 15 подтвержд
 - Modify: `e2e/compose.rollback.yml`
 - Modify: `src/e2eTest/kotlin/io/heapy/kodkod/e2e/KodkodE2eTest.kt`
 
-- [ ] тест-на-баг: новый контейнер стартует и сразу выходит с кодом 1 → старый контейнер и старый образ **не**
-      удаляются, происходит rollback (использует `startedThenExits` и фейковые часы из задачи 3)
-- [ ] добавить `KODKOD_UPDATE_VERIFY_SECONDS` (default 15) и `KODKOD_UPDATE_VERIFY_HEALTH` (default true)
-- [ ] после `start(newId)` опрашивать inspect каждые ~500 мс: успех = 3 подряд удачных пробы (ранний выход);
+- [x] тест-на-баг: новый контейнер стартует и сразу выходит с кодом 1 → старый контейнер и старый образ **не**
+      удаляются, происходит rollback (использует `startedThenExits` и фейковые часы из задачи 3) —
+      `UpdaterTest.a_replacement_that_starts_and_exits_is_rolled_back_and_destroys_nothing`; `FakeDockerClient.create`
+      теперь регистрирует созданный контейнер в `containers` (иначе гейту нечего инспектировать), не перетирая
+      payload, который тест положил заранее
+- [x] добавить `KODKOD_UPDATE_VERIFY_SECONDS` (default 15) и `KODKOD_UPDATE_VERIFY_HEALTH` (default true)
+      (отрицательное окно нормализуется в 0 = одна проба)
+- [x] после `start(newId)` опрашивать inspect каждые ~500 мс: успех = 3 подряд удачных пробы (ранний выход);
       провал = `Running=false`, `Restarting=true` или `Health=unhealthy`; `Health=starting` в конце окна — успех
-- [ ] удаление старого контейнера и образа перенести за успешный гейт
-- [ ] тесты: контейнер жив → ранний выход без ожидания всего окна; restart-loop → rollback; `unhealthy` при
+      (`Updater.verifyStarted`: `Restarting` проверяется раньше `Running`, потому что контейнер между попытками
+      restart-политики отдаёт `Running=false`; непрочитанный inspect считается «ещё не устоялся», а не провалом —
+      блип на сокете не доказательство поломки)
+- [x] удаление старого контейнера и образа перенести за успешный гейт (гейт стоит внутри того же `try`, что
+      снимает замену, поэтому провал идёт по существующему пути rollback)
+- [x] тесты: контейнер жив → ранний выход без ожидания всего окна; restart-loop → rollback; `unhealthy` при
       `VERIFY_HEALTH=false` → успех; `starting` до конца окна → успех; конфиг-тесты на новые переменные
-- [ ] e2e: вариант `compose.rollback.yml` «стартует и падает через секунду» — старый контейнер вернулся
-- [ ] перезаписать фикстуры (появился `GET /containers/<newId>/json` после `start`)
-- [ ] прогнать тесты и целевой e2e
+      (плюс `unhealthy` при `VERIFY_HEALTH=true` → rollback; весь `UpdaterTest` переведён на инъекцию `FakeClock`
+      через хелпер `updater(...)`, чтобы юнит-сюита не спала на гейте)
+- [x] e2e: вариант `compose.rollback.yml` «стартует и падает через секунду» — старый контейнер вернулся
+      (`e2e/testapp/Dockerfile.crasher` + `aReplacementThatStartsAndThenDiesIsRolledBack`; смерть через 0.2s —
+      контейнер, доживший до третьей пробы, был бы принят как удачное обновление; в compose добавлен
+      `KODKOD_UPDATE_VERIFY_SECONDS: "8"`)
+- [x] перезаписать фикстуры (появился `GET /containers/<newId>/json` после `start`) — перезаписан тот же лейбл
+      `engine-29.6.2_compose-5.3.1`; нормализованная сверка манифестов: в `update-recreate` и `deps-ordered`
+      появилось ровно по 3 новых `GET /containers/<newId>/json` между `start` и `DELETE /containers/<old>`,
+      `update-noop` и `autoheal-restart` не изменились. Конфиг рекордера и `DockerReplayTest` получили
+      `KODKOD_UPDATE_VERIFY_HEALTH=false`: с включённой проверкой здоровья число проб — это гонка между
+      интервалом проб и healthcheck'ом новой замены, и запись, которую replay смог бы повторить только случайно
+- [x] прогнать тесты и целевой e2e (`./gradlew test` 133/133; `--tests '*aReplacementThatStartsAndThenDies*'`,
+      `'*failedRecreateRollsBackToRunningOriginal*'`, `'*updatePullsAndAdoptsNewImageDefaults*'` — зелёные;
+      краснота новых тестов подтверждена нейтрализацией вызова `verifyStarted`: падают 5 из 6, шестой —
+      негативный контроль `VERIFY_HEALTH=false`, он и должен остаться зелёным)
 
 ### Task 11: Не удалять образ, у которого остались чужие теги
 

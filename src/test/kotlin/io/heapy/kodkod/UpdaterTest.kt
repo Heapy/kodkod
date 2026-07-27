@@ -15,14 +15,32 @@ import org.junit.jupiter.api.Test
  * machinery, all of which used to be reachable only from the Docker-backed e2e suite.
  */
 class UpdaterTest {
+    /**
+     * Fake time for every updater under test: the liveness gate after a `start` polls on a real
+     * interval, and no unit test may spend it. [FakeClock.sleeps] doubles as the assertion that the
+     * gate exited early instead of burning its whole window.
+     */
+    private val clock = FakeClock()
+
     private fun json(s: String): JsonObject = Json.parseToJsonElement(s).jsonObject
 
-    private fun config(monitorAll: Boolean = true, cleanup: Boolean = true, stopTimeout: String? = null): Config =
+    private fun updater(docker: FakeDockerClient, config: Config = config()): Updater =
+        Updater(docker, config, selfId = null, clock, clock)
+
+    private fun config(
+        monitorAll: Boolean = true,
+        cleanup: Boolean = true,
+        stopTimeout: String? = null,
+        verifySeconds: String? = null,
+        verifyHealth: Boolean? = null,
+    ): Config =
         Config.fromEnv(
             buildMap {
                 put("KODKOD_UPDATE_MONITOR_ALL", monitorAll.toString())
                 put("KODKOD_UPDATE_CLEANUP", cleanup.toString())
                 stopTimeout?.let { put("KODKOD_STOP_TIMEOUT", it) }
+                verifySeconds?.let { put("KODKOD_UPDATE_VERIFY_SECONDS", it) }
+                verifyHealth?.let { put("KODKOD_UPDATE_VERIFY_HEALTH", it.toString()) }
             }::get,
         )
 
@@ -48,7 +66,7 @@ class UpdaterTest {
         val docker = FakeDockerClient()
         docker.container(id = "web", imageRef = "nginx@sha256:abc123")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertTrue(docker.ops.isEmpty(), "digest-pinned container must not be pulled or recreated: ${docker.ops}")
     }
@@ -59,7 +77,7 @@ class UpdaterTest {
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old") // no enable label
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(monitorAll = false), selfId = null).runOnce()
+        updater(docker, config(monitorAll = false)).runOnce()
 
         assertTrue(docker.ops.isEmpty(), "without the enable label and monitorAll=false nothing should happen: ${docker.ops}")
     }
@@ -73,7 +91,7 @@ class UpdaterTest {
         )
         docker.distribution["nginx:1.27"] = "sha256:remote"
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertTrue(docker.ops.isEmpty(), "running image already carries the registry digest — no work expected: ${docker.ops}")
     }
@@ -85,7 +103,7 @@ class UpdaterTest {
         // No distribution entry -> fall back to a pull; the pulled image id matches the running one.
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:old","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertEquals(listOf("pull:nginx:1.27"), docker.ops, "a no-op update pulls to check, then stops")
     }
@@ -100,7 +118,7 @@ class UpdaterTest {
         // The local repo:tag already resolves to a newer image than the running container.
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":["nginx@sha256:remote"]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertFalse(docker.ops.any { it.startsWith("pull:") }, "should reuse the present local image, not pull: ${docker.ops}")
         assertTrue(docker.ops.contains("create:web"), "stale container should be recreated: ${docker.ops}")
@@ -112,7 +130,7 @@ class UpdaterTest {
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertOrder(docker.ops, "pull:nginx:1.27", "create:web")
     }
@@ -125,7 +143,7 @@ class UpdaterTest {
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(cleanup = true), selfId = null).runOnce()
+        updater(docker, config(cleanup = true)).runOnce()
 
         assertOrder(
             docker.ops,
@@ -146,7 +164,7 @@ class UpdaterTest {
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(cleanup = false), selfId = null).runOnce()
+        updater(docker, config(cleanup = false)).runOnce()
 
         assertTrue(docker.ops.contains("create:web"))
         assertFalse(docker.ops.any { it.startsWith("removeImage:") }, "cleanup disabled must not prune the old image: ${docker.ops}")
@@ -161,7 +179,7 @@ class UpdaterTest {
         )
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         val (_, body) = docker.created.single()
         val endpoints = body.obj("NetworkingConfig")?.obj("EndpointsConfig")
@@ -181,7 +199,7 @@ class UpdaterTest {
         )
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         val endpoint = docker.created.single().second.endpoint("frontend")
         assertEquals(
@@ -204,7 +222,7 @@ class UpdaterTest {
         )
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         val endpoint = docker.created.single().second.endpoint("frontend")
         assertNull(
@@ -224,7 +242,7 @@ class UpdaterTest {
         )
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         val endpoint = docker.created.single().second.endpoint("frontend")
         assertNull(endpoint.str("MacAddress"), "an empty `Config.MacAddress` is not an explicit MAC: $endpoint")
@@ -241,7 +259,7 @@ class UpdaterTest {
         )
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         val labels = docker.created.single().second.obj("Labels")!!
         assertEquals(
@@ -262,7 +280,7 @@ class UpdaterTest {
         // The local repo:tag already resolves to a newer image, so this path never pulls.
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":["nginx@sha256:remote"]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         val labels = docker.created.single().second.obj("Labels")!!
         assertEquals("sha256:new", labels.label("com.docker.compose.image"))
@@ -283,7 +301,7 @@ class UpdaterTest {
         docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
         docker.distribution["web:1"] = "sha256:web-remote"
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         val web = docker.created.single { (name, _) -> name == "web" }.second
         assertEquals(
@@ -298,7 +316,7 @@ class UpdaterTest {
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         val body = docker.created.single().second
         assertNull(body.obj("Labels").label("com.docker.compose.image"), "kodkod must not fabricate compose metadata: $body")
@@ -315,7 +333,7 @@ class UpdaterTest {
         )
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertOrder(docker.ops, "pull:nginx:1.27", "create:web")
         assertEquals(
@@ -330,7 +348,7 @@ class UpdaterTest {
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old") // pre-descriptor engine
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertEquals(
             listOf(null, null), docker.platforms,
@@ -348,7 +366,7 @@ class UpdaterTest {
         )
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertEquals(
             listOf("linux/arm64", "linux/arm64"), docker.platforms,
@@ -366,7 +384,7 @@ class UpdaterTest {
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
         docker.failCreate += "web"
 
-        Updater(docker, config(), selfId = null).runOnce() // runOnce logs and swallows the recreate failure
+        updater(docker).runOnce() // runOnce logs and swallows the recreate failure
 
         // `create!:` is an attempted create — the fake never lets a failed mutation read as a done one.
         assertOrder(docker.ops, "rename:web->web_kodkod_old_web", "create!:web", "rename:web->web", "start:web")
@@ -382,11 +400,104 @@ class UpdaterTest {
         docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
         docker.failStart += "new-web-0" // the freshly-created container fails to start
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertOrder(docker.ops, "create:web", "start!:new-web-0", "remove:new-web-0", "rename:web->web", "start:web")
         assertFalse(docker.ops.contains("start:new-web-0"), "the start failed and must not read as done: ${docker.ops}")
         assertFalse(docker.ops.contains("remove:web"), "the original container must survive a failed start: ${docker.ops}")
+    }
+
+    // --- liveness gate --------------------------------------------------------------------
+
+    @Test
+    fun a_replacement_that_starts_and_exits_is_rolled_back_and_destroys_nothing() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.startedThenExits += "new-web-0" // `POST /start` succeeds, the process dies anyway
+
+        updater(docker).runOnce()
+
+        assertOrder(docker.ops, "start:new-web-0", "remove:new-web-0", "rename:web->web", "start:web")
+        assertFalse(
+            docker.ops.contains("remove:web"),
+            "the old container is the only way back and must survive a replacement that died: ${docker.ops}",
+        )
+        assertTrue(
+            docker.removedImages.isEmpty(),
+            "the old image is what a rollback runs on — it must not be pruned either: ${docker.removedImages}",
+        )
+    }
+
+    @Test
+    fun a_live_replacement_ends_the_wait_early() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+
+        updater(docker).runOnce()
+
+        assertOrder(docker.ops, "start:new-web-0", "remove:web", "removeImage:sha256:old")
+        assertEquals(
+            listOf(500L, 500L), clock.sleeps,
+            "three good probes end the wait; the default 15s window would be 30 sleeps: ${clock.sleeps}",
+        )
+    }
+
+    @Test
+    fun a_restart_looping_replacement_is_rolled_back() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        // A container with a restart policy that keeps crashing: the daemon reports it as restarting.
+        docker.containers["new-web-0"] = json("""{"Name":"/web","State":{"Restarting":true}}""")
+
+        updater(docker).runOnce()
+
+        assertOrder(docker.ops, "start:new-web-0", "remove:new-web-0", "rename:web->web", "start:web")
+        assertFalse(docker.ops.contains("remove:web"), "a crash loop is a failed update: ${docker.ops}")
+    }
+
+    @Test
+    fun an_unhealthy_replacement_is_rolled_back() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.health["new-web-0"] = "unhealthy" // the healthcheck already failed its retries
+
+        updater(docker).runOnce()
+
+        assertOrder(docker.ops, "start:new-web-0", "remove:new-web-0", "rename:web->web", "start:web")
+        assertFalse(docker.ops.contains("remove:web"), "a container that fails its own healthcheck is not up: ${docker.ops}")
+    }
+
+    @Test
+    fun an_unhealthy_replacement_is_accepted_when_health_verification_is_off() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.health["new-web-0"] = "unhealthy"
+
+        updater(docker, config(verifyHealth = false)).runOnce()
+
+        assertTrue(
+            docker.ops.contains("remove:web"),
+            "with KODKOD_UPDATE_VERIFY_HEALTH=false only a dead process blocks the update: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun a_replacement_still_inside_its_start_period_is_accepted_at_the_end_of_the_window() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.health["new-web-0"] = "starting" // never becomes healthy within the window
+
+        updater(docker, config(verifySeconds = "2")).runOnce()
+
+        assertTrue(
+            docker.ops.contains("remove:web"),
+            "start_period is the image author's own startup budget — rolling back on it would " +
+                "revert healthy updates of every slow-starting service: ${docker.ops}",
+        )
+        assertEquals(
+            4, clock.sleeps.size,
+            "a container that never settles must be waited out to the end of the 2s window: ${clock.sleeps}",
+        )
     }
 
     // --- ordering across a dependency edge ------------------------------------------------
@@ -407,7 +518,7 @@ class UpdaterTest {
         docker.distribution["web:1"] = "sha256:web-remote"
         docker.images["sha256:web-old"] = json("""{"Id":"sha256:web-old","Config":{},"RepoDigests":["web@sha256:web-remote"]}""")
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertOrder(docker.ops, "stop:web", "stop:db", "create:db", "start:web")
         assertFalse(docker.ops.contains("create:web"), "web only depends on db; it is restarted, not recreated: ${docker.ops}")
@@ -429,7 +540,7 @@ class UpdaterTest {
         val docker = FakeDockerClient()
         staleWeb(docker, configStopTimeout = 30)
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertEquals(
             listOf<Int?>(null, null), docker.stopTimeouts,
@@ -442,7 +553,7 @@ class UpdaterTest {
         val docker = FakeDockerClient()
         staleWeb(docker, labels = """{"kodkod.stop.timeout":"45"}""", configStopTimeout = 30)
 
-        Updater(docker, config(), selfId = null).runOnce()
+        updater(docker).runOnce()
 
         assertEquals(listOf<Int?>(45, 45), docker.stopTimeouts, "an explicit label is an override: ${docker.stopTimeouts}")
     }
@@ -452,7 +563,7 @@ class UpdaterTest {
         val docker = FakeDockerClient()
         staleWeb(docker, configStopTimeout = 30)
 
-        Updater(docker, config(stopTimeout = "25"), selfId = null).runOnce()
+        updater(docker, config(stopTimeout = "25")).runOnce()
 
         assertEquals(
             listOf<Int?>(25, 25), docker.stopTimeouts,

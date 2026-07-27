@@ -23,6 +23,9 @@ import kotlinx.serialization.json.put
  * refreshes their references. Containers pinned to a digest (`image@sha256:...`) are never stale but can
  * still be restarted or recreated as a dependent.
  *
+ * A replacement container is watched for a short window after `start` (see `verifyStarted`) and the
+ * container and image it replaced are destroyed only once it has proven it stays up.
+ *
  * [clock] and [sleeper] default to the real ones and exist so waiting logic can be driven from tests
  * without spending the wall-clock time it describes.
  */
@@ -30,8 +33,8 @@ class Updater(
     private val api: DockerClient,
     private val config: Config,
     private val selfId: String?,
-    @Suppress("unused") private val clock: TimeSource = TimeSource.SYSTEM,
-    @Suppress("unused") private val sleeper: Sleeper = Sleeper.SYSTEM,
+    private val clock: TimeSource = TimeSource.SYSTEM,
+    private val sleeper: Sleeper = Sleeper.SYSTEM,
 ) {
     private val ns = config.labelNamespace
 
@@ -250,6 +253,9 @@ class Updater(
             try {
                 networks.drop(1).forEach { (net, endpoint) -> api.connectNetwork(net, newId, endpoint) }
                 api.start(newId)
+                // Everything past this point destroys the only copy of the previous state, so the
+                // replacement has to prove it is actually up first.
+                verifyStarted(name, newId)
             } catch (e: Exception) {
                 runCatching { api.remove(newId, force = true) }
                 throw e
@@ -279,6 +285,57 @@ class Updater(
     private fun rollback(oldId: String, name: String) {
         runCatching { api.rename(oldId, name) }
         runCatching { api.start(oldId) }
+    }
+
+    /**
+     * Watch the freshly started replacement [newId] for up to [Config.updateVerifySeconds] and throw
+     * unless it stays up. A `204` from `POST /start` only means the process was launched: an image
+     * missing a dependency, or one whose new config is wrong, exits a moment later. Destroying the old
+     * container and image on the strength of that `204` turns a bad image into an outage, so the gate
+     * runs before either of them is touched and a failure goes down the ordinary rollback path.
+     *
+     * [REQUIRED_GOOD_PROBES] consecutive good probes end the wait early — the happy path must not pay
+     * for the whole window. `Health=starting` is *not* good enough to exit early but is never a
+     * failure either: it is the image author's own `start_period` talking, and a container still
+     * inside it is accepted once the window runs out. Treating it as a failure would roll back healthy
+     * updates of every slow-starting service.
+     */
+    private fun verifyStarted(name: String, newId: String) {
+        val deadline = clock.millis() + config.updateVerifySeconds * 1000L
+        var good = 0
+        while (true) {
+            val state = probeState(name, newId)
+            livenessFailure(state)?.let { error("the replacement did not stay up: $it") }
+            // A probe we could not read counts as "not settled yet" rather than as a failure: a blip on
+            // the socket is not evidence the container is broken, and a rollback would be self-inflicted.
+            val settled = state != null && !(config.updateVerifyHealth && state.healthStatus() == "starting")
+            if (settled && ++good >= REQUIRED_GOOD_PROBES) {
+                Log.info("[$name] replacement is up ($good consecutive probes)")
+                return
+            }
+            if (!settled) good = 0
+            if (clock.millis() >= deadline) {
+                val why = if (settled) "up but only $good/$REQUIRED_GOOD_PROBES probes in" else "still starting up"
+                Log.info("[$name] replacement is $why after ${config.updateVerifySeconds}s — accepting it")
+                return
+            }
+            sleeper.sleep(PROBE_INTERVAL_MS)
+        }
+    }
+
+    private fun probeState(name: String, newId: String): JsonObject? =
+        runCatching { api.inspectContainer(newId).obj("State") }
+            .onFailure { Log.warn("[$name] could not probe the replacement: ${it.message}") }
+            .getOrNull()
+
+    /** Why this probe says the replacement is not alive, or `null` when it looks fine (or unreadable). */
+    private fun livenessFailure(state: JsonObject?): String? {
+        if (state == null) return null
+        // Checked before `Running`, which a container between restart-policy attempts also reports false.
+        if (state.str("Restarting") == "true") return "it is restarting (a crash loop)"
+        if (state.str("Running") == "false") return "it exited with code ${state.str("ExitCode") ?: "?"}"
+        if (config.updateVerifyHealth && state.healthStatus() == "unhealthy") return "its healthcheck reports unhealthy"
+        return null
     }
 
     /**
@@ -362,7 +419,18 @@ class Updater(
 
     private fun inspectImageConfig(ref: String): JsonObject? =
         runCatching { api.inspectImage(ref).obj("Config") }.getOrNull()
+
+    private companion object {
+        /** Gap between liveness probes; the daemon's own state transitions are far coarser than this. */
+        const val PROBE_INTERVAL_MS = 500L
+
+        /** Consecutive good probes that end the liveness wait early. */
+        const val REQUIRED_GOOD_PROBES = 3
+    }
 }
+
+/** `State.Health.Status` — absent for a container whose image declares no healthcheck. */
+private fun JsonObject.healthStatus(): String? = obj("Health")?.str("Status")
 
 /** One container kodkod is considering for an update, plus the verdict it accumulates this cycle. */
 internal class Target(

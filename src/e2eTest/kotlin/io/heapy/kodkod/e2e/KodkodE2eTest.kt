@@ -280,6 +280,36 @@ class KodkodE2eTest {
         val kept = docker("exec", "e2e-update-vol-1", "cat", "/data/keep", check = false)
         assertEquals("kodkod-was-here", kept.output.trim(), "the data written before the update must survive it")
     }
+
+    /**
+     * A `204` from `POST /start` is not evidence the update worked: an image whose process dies a
+     * moment later leaves the daemon perfectly satisfied. Only a real daemon can prove that kodkod
+     * probes the replacement afterwards and that the original container — the only copy of the working
+     * state — is still there to be rolled back to.
+     */
+    @Test
+    @Order(11)
+    fun aReplacementThatStartsAndThenDiesIsRolledBack() = e2e.scenario("rollback") {
+        publishVariant("v1")
+        compose("rollback", "up", "-d")
+        waitUntil(30, "app v1 up") { variant("e2e-rollback-app-1") == "v1" }
+        val originalId = inspect("{{.Id}}", "e2e-rollback-app-1")
+
+        publishVariant("crasher")
+
+        waitUntil(120, "kodkod rejected the replacement that did not stay up") {
+            logHas("e2e-rollback-kodkod-1", "did not stay up")
+        }
+        publishVariant("v1") // stop the next cycle from re-attempting the doomed update
+
+        waitUntil(60, "app back to running v1") { running("e2e-rollback-app-1") && variant("e2e-rollback-app-1") == "v1" }
+        assertEquals(
+            originalId,
+            inspect("{{.Id}}", "e2e-rollback-app-1"),
+            "the original container must be the one running again, not a fresh replacement",
+        )
+        assertEquals(0, containerIdsByName("_kodkod_old_").size, "backup containers should be removed")
+    }
 }
 
 internal class E2eHarness {
@@ -373,10 +403,10 @@ internal class E2eHarness {
                 "e2e/testapp",
             )
 
-            "broken" -> docker(
+            "broken", "crasher" -> docker(
                 "build",
                 "-f",
-                "e2e/testapp/Dockerfile.broken",
+                "e2e/testapp/Dockerfile.$variant",
                 "-t",
                 "$registry/testapp:latest",
                 "e2e/testapp",

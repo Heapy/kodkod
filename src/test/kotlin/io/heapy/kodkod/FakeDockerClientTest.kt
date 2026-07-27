@@ -187,6 +187,22 @@ class FakeDockerClientTest {
         assertEquals("running", state.str("Status"))
     }
 
+    @Test
+    fun a_created_container_becomes_inspectable_unless_the_test_described_it_first() {
+        val plain = docker.create("web", json("{}"), platform = null)
+        docker.containers["new-db-1"] = json("""{"Name":"/db","State":{"Restarting":true}}""")
+        val described = docker.create("db", json("{}"), platform = null)
+
+        assertEquals("new-web-0", plain)
+        assertEquals("/web", docker.inspectContainer(plain).str("Name"), "the daemon knows what it just created")
+        assertTrue(running(plain))
+        assertEquals("new-db-1", described)
+        assertTrue(
+            docker.inspectContainer(described).obj("State")!!["Restarting"]!!.jsonPrimitive.booleanOrNull!!,
+            "a payload the test registered up front must not be overwritten by create",
+        )
+    }
+
     private fun running(id: String): Boolean =
         docker.inspectContainer(id).obj("State")!!["Running"]!!.jsonPrimitive.booleanOrNull!!
 }

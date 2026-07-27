@@ -27,6 +27,13 @@ import java.nio.charset.StandardCharsets
 class DockerReplayTest {
     private val json = Json { ignoreUnknownKeys = true }
 
+    /**
+     * Fake time, so replaying a recreate does not really sleep through the liveness gate's probe
+     * interval. The gate exits on three good probes, which the recording contains, so the clock never
+     * reaches the verification window.
+     */
+    private val clock = FakeClock()
+
     private fun resourceText(path: String): String? =
         javaClass.classLoader.getResourceAsStream(path)?.use { it.readBytes().toString(StandardCharsets.UTF_8) }
 
@@ -62,7 +69,7 @@ class DockerReplayTest {
         if (scenario.startsWith("autoheal")) {
             Autoheal(client, autohealConfig(), selfId = null).runOnce()
         } else {
-            Updater(client, updateConfig(), selfId = null).runOnce()
+            Updater(client, updateConfig(), selfId = null, clock, clock).runOnce()
         }
 
         // First, because a miss is the root cause of any op assertion that fails downstream.
@@ -167,7 +174,7 @@ class DockerReplayTest {
         val replay = ReplayDockerTransport(exchanges) { file ->
             SYNTHETIC_BODIES.getValue(file).toByteArray(StandardCharsets.UTF_8)
         }
-        Updater(OpLoggingClient(DockerApi(replay)), updateConfig(), selfId = null).runOnce()
+        Updater(OpLoggingClient(DockerApi(replay)), updateConfig(), selfId = null, clock, clock).runOnce()
         assertExhaustive("synthetic", replay)
     }
 
@@ -196,9 +203,11 @@ class DockerReplayTest {
     }
 
     // Must match the recorder's config so the listContainers filter (hence request paths) line up:
-    // monitorAll=false scopes to kodkod-labelled containers.
+    // monitorAll=false scopes to kodkod-labelled containers. KODKOD_UPDATE_VERIFY_HEALTH=false is what
+    // makes the number of liveness probes — and therefore the number of recorded inspects of the
+    // replacement — a constant instead of a race against the new container's healthcheck.
     private fun updateConfig(): Config =
-        Config.fromEnv(mapOf("KODKOD_UPDATE_CLEANUP" to "true")::get)
+        Config.fromEnv(mapOf("KODKOD_UPDATE_CLEANUP" to "true", "KODKOD_UPDATE_VERIFY_HEALTH" to "false")::get)
 
     private fun autohealConfig(): Config =
         Config.fromEnv(emptyMap<String, String>()::get)

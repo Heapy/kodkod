@@ -1,0 +1,12 @@
+# An image that starts *successfully* and then dies. Unlike Dockerfile.broken, `POST /start`
+# returns 204 here — the daemon is perfectly happy — so only probing the container after the
+# start can tell that the update failed (plan task 10, liveness gate):
+#   stop old -> rename old -> create new (ok) -> start new (ok) -> probe: exited ->
+#   remove new -> rename old back -> start old  => original is running again, old image intact.
+#
+# The exit must happen well before the gate's three good probes (~1s) can accumulate, hence the
+# fraction of a second: a container still alive at the third probe would be accepted as a good update.
+FROM busybox:1.36
+ENV APP_VARIANT=crasher
+LABEL app.variant=crasher
+CMD ["sh", "-c", "echo '[testapp] starting, then dying on purpose'; sleep 0.2; exit 1"]

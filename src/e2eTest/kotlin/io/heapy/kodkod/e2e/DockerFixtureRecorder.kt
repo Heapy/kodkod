@@ -140,8 +140,13 @@ class DockerFixtureRecorder {
     // IMPORTANT: monitorAll stays FALSE so the recorder only ever acts on containers explicitly
     // labelled for kodkod (the e2e compose services) — never the developer's own running containers.
     // With monitorAll=true, kodkod would treat every running container on the daemon as a target.
+    //
+    // KODKOD_UPDATE_VERIFY_HEALTH=false keeps the liveness gate's probe count deterministic: with health
+    // verification on, the gate waits out `Health=starting` and the number of inspects of the replacement
+    // becomes a race between the probe interval and the new container's healthcheck — a recording that
+    // replay could only match by luck. DockerReplayTest sets the same flag.
     private fun updateConfig(): Config =
-        Config.fromEnv(mapOf("KODKOD_UPDATE_CLEANUP" to "true")::get)
+        Config.fromEnv(mapOf("KODKOD_UPDATE_CLEANUP" to "true", "KODKOD_UPDATE_VERIFY_HEALTH" to "false")::get)
 
     private fun autohealConfig(): Config =
         Config.fromEnv(emptyMap<String, String>()::get)

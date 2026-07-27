@@ -19,7 +19,8 @@ import kotlinx.serialization.json.put
  * [pull] land in [ops]. As in [OpLoggingClient], an op is appended **after** the call succeeded and a
  * call that threw is recorded with a `!` marker (`create!:web`), so "kodkod did this" and "kodkod
  * tried this" never read the same. [create] returns deterministic ids of the form `new-<name>-<n>`,
- * so tests can predict and reference the replacement container.
+ * so tests can predict and reference the replacement container — and registers it in [containers] so
+ * it can be inspected, unless the test already registered a payload for that id itself.
  *
  * [listContainers] applies `all` and the `status`/`label`/`health` filters to [listed] the way the
  * daemon would, so code that deliberately looks beyond the monitored set (`all=true`, no label
@@ -201,7 +202,12 @@ class FakeDockerClient : DockerClient {
             platforms += platform
             if (name in failCreate) throw DockerException(500, "fake: create failure for '$name'")
             created += name to body
-            "new-$name-${createSeq++}"
+            val id = "new-$name-${createSeq++}"
+            // The daemon knows the replacement from here on, so whatever inspects it next (the liveness
+            // gate) gets an answer. A payload the test registered for this id up front wins, which is how
+            // a test asks for a replacement that comes up `Restarting`.
+            containers.getOrPut(id) { obj("""{"Name":"/$name","Config":{},"HostConfig":{},"NetworkSettings":{"Networks":{}}}""") }
+            id
         }
 
     override fun inspectImage(ref: String): JsonObject =
