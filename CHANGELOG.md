@@ -70,7 +70,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A create-time dependent that could not be recreated *and* could not be rolled back is remembered and
   rebuilt against its provider on every later cycle, instead of being left stopped under its own name
   where neither discovery (`status=running`) nor the backup reconcile (`_kodkod_old_*`) would ever look
-  at it again.
+  at it again. Only a dependent joined **by id** to a container this cycle actually replaced counts: one
+  whose provider was held back is stopped with its namespace still alive and a `docker start` away, and
+  rebuilding it every cycle would destroy and re-create a container for nothing. Like the cooldown, this
+  memory lives in the process — the log line says so, and names the command to run by hand if kodkod
+  restarts before the rebuild goes through.
 - Recreate create-time dependents (`--link` / `network_mode: container:`) when a dependency is updated,
   and resolve `network_mode: container:<id>` to a container name before any old ids are removed. This
   now also covers dependents kodkod does not monitor itself.
@@ -107,7 +111,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   namespace are still refreshed. The read-back is given as long as the container's own
   `Config.StopTimeout` needs — read from the inspect it was making anyway — instead of a flat minute
   that expired just short of a `stop_grace_period: 120s` restart, which is exactly the configuration
-  that makes the answer go missing in the first place.
+  that makes the answer go missing in the first place. That wait is held under the cycle lock, so it is
+  capped at five minutes and the truncation is logged: one container's stop window may not park autoheal
+  and the updater for as long as it likes.
 - A rollback that failed before the container was renamed no longer asks the daemon to rename it onto
   its own name, which was refused and reported as two ERRORs about a container that never moved.
 - Chunked responses that were cut off mid-body are reported as transport errors instead of being
