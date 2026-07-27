@@ -67,7 +67,7 @@ fun main() {
     }
     if (config.updateEnabled) {
         scheduler.scheduleWithFixedDelay(
-            guarded("update", cycleLock, updater::runOnce),
+            updateCycle(cycleLock, updater),
             config.updateStartPeriod, config.updateInterval, TimeUnit.SECONDS,
         )
     }
@@ -94,6 +94,38 @@ fun main() {
         },
     )
     shutdown.await()
+}
+
+/**
+ * One update cycle, in two halves, and only the second one under [cycleLock].
+ *
+ * All of a cycle's waiting is in the first half: `api.pull` is granted ten minutes of idle time per
+ * image by design (see [DockerApi.pull]), and a registry that answers slowly (or not at all) stretches
+ * that across every stale container in the stack. Holding the lock through it meant autoheal could not
+ * restart an unhealthy container for minutes at a time, waiting in `lockInterruptibly()` with nothing
+ * logged to say why. Planning touches no container, so it does not need the lock at all.
+ *
+ * What [Updater.apply] holds the lock for is bounded by configuration rather than by a registry:
+ * the graceful stops (`KODKOD_STOP_TIMEOUT` or each container's own `StopTimeout`), the liveness gate
+ * after every `start` (`KODKOD_UPDATE_VERIFY_SECONDS`) and each `service_healthy` dependency edge
+ * (`KODKOD_DEPENDENCY_HEALTH_TIMEOUT`) — all per container, all finite, none of them a network fetch.
+ *
+ * A plan that could not be built degrades to an empty one instead of skipping the second half: the
+ * reconcile of orphaned backups lives there, and a daemon that failed a listing is no reason to leave a
+ * service parked under its backup name for another interval. The plan is re-checked against the daemon
+ * inside [Updater.apply], since the state it was built from may have moved while an image downloaded.
+ */
+private fun updateCycle(cycleLock: ReentrantLock, updater: Updater): Runnable = Runnable {
+    val plan = try {
+        updater.plan()
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        UpdatePlan.NOTHING
+    } catch (e: Throwable) {
+        Log.error("[update] planning failed: ${e.message}")
+        UpdatePlan.NOTHING
+    }
+    guarded("update", cycleLock) { updater.apply(plan) }.run()
 }
 
 /** Wrap a cycle so a thrown exception is logged instead of cancelling the scheduled task. */

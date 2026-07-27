@@ -4,45 +4,45 @@
     "exchanges": [
         {
             "method": "GET",
-            "path": "/containers/json?all=true&filters=%7B%22name%22%3A%5B%22_kodkod_old_%22%5D%7D",
+            "path": "/containers/json?all=false&filters=%7B%22status%22%3A%5B%22running%22%5D%2C%22label%22%3A%5B%22kodkod.update.enable%22%5D%7D",
             "requestBodySummary": null,
             "status": 200,
             "responseFile": "0001.GET.containers-json.bin"
         },
         {
             "method": "GET",
-            "path": "/containers/json?all=false&filters=%7B%22status%22%3A%5B%22running%22%5D%2C%22label%22%3A%5B%22kodkod.update.enable%22%5D%7D",
+            "path": "/containers/8b96fcab37c4dde95f3d315e41cd24a198b6d66eeb6d8fcaa423c4b8fc129df8/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0002.GET.containers-json.bin"
+            "responseFile": "0002.GET.containers-8b96fcab37c4dde95f3d315e41cd2.bin"
         },
         {
             "method": "GET",
-            "path": "/containers/79c9f72c597ff4c2463a4a2df93a793ba4ca8e6366bc81cb1ac89837d1fb240e/json",
+            "path": "/images/sha256:4bb8b381fbc7831bf8ba3e44c3f6daf6ecd3ca7639c4853433cac1cd6e0b644a/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0003.GET.containers-79c9f72c597ff4c2463a4a2df93a7.bin"
-        },
-        {
-            "method": "GET",
-            "path": "/images/sha256:b7166d61885c429aa396b84fb7c8a906e584b808788b0733319069a3f6f1fa03/json",
-            "requestBodySummary": null,
-            "status": 200,
-            "responseFile": "0004.GET.images-sha256-b7166d61885c429aa396b84fb7.bin"
+            "responseFile": "0003.GET.images-sha256-4bb8b381fbc7831bf8ba3e44c3.bin"
         },
         {
             "method": "GET",
             "path": "/distribution/127.0.0.1:5000/testapp:latest/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0005.GET.distribution-127-0-0-1-5000-testapp-late.bin"
+            "responseFile": "0004.GET.distribution-127-0-0-1-5000-testapp-late.bin"
         },
         {
             "method": "GET",
-            "path": "/images/sha256:b7166d61885c429aa396b84fb7c8a906e584b808788b0733319069a3f6f1fa03/json",
+            "path": "/images/sha256:4bb8b381fbc7831bf8ba3e44c3f6daf6ecd3ca7639c4853433cac1cd6e0b644a/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0006.GET.images-sha256-b7166d61885c429aa396b84fb7.bin"
+            "responseFile": "0005.GET.images-sha256-4bb8b381fbc7831bf8ba3e44c3.bin"
+        },
+        {
+            "method": "GET",
+            "path": "/images/127.0.0.1:5000/testapp:latest/json",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0006.GET.images-127-0-0-1-5000-testapp-latest-jso.bin"
         },
         {
             "method": "GET",
@@ -53,87 +53,94 @@
         },
         {
             "method": "GET",
-            "path": "/images/127.0.0.1:5000/testapp:latest/json",
+            "path": "/containers/json?all=true&filters=%7B%22name%22%3A%5B%22_kodkod_old_%22%5D%7D",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0008.GET.images-127-0-0-1-5000-testapp-latest-jso.bin"
+            "responseFile": "0008.GET.containers-json.bin"
+        },
+        {
+            "method": "GET",
+            "path": "/containers/8b96fcab37c4dde95f3d315e41cd24a198b6d66eeb6d8fcaa423c4b8fc129df8/json",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0009.GET.containers-8b96fcab37c4dde95f3d315e41cd2.bin"
         },
         {
             "method": "POST",
-            "path": "/containers/79c9f72c597ff4c2463a4a2df93a793ba4ca8e6366bc81cb1ac89837d1fb240e/stop",
+            "path": "/containers/8b96fcab37c4dde95f3d315e41cd24a198b6d66eeb6d8fcaa423c4b8fc129df8/stop",
             "requestBodySummary": null,
             "status": 204,
-            "responseFile": "0009.POST.containers-79c9f72c597ff4c2463a4a2df93a7.bin"
+            "responseFile": "0010.POST.containers-8b96fcab37c4dde95f3d315e41cd2.bin"
         },
         {
             "method": "POST",
-            "path": "/containers/79c9f72c597ff4c2463a4a2df93a793ba4ca8e6366bc81cb1ac89837d1fb240e/stop",
+            "path": "/containers/8b96fcab37c4dde95f3d315e41cd24a198b6d66eeb6d8fcaa423c4b8fc129df8/stop",
             "requestBodySummary": null,
             "status": 304,
-            "responseFile": "0010.POST.containers-79c9f72c597ff4c2463a4a2df93a7.bin"
+            "responseFile": "0011.POST.containers-8b96fcab37c4dde95f3d315e41cd2.bin"
         },
         {
             "method": "POST",
-            "path": "/containers/79c9f72c597ff4c2463a4a2df93a793ba4ca8e6366bc81cb1ac89837d1fb240e/rename?name=e2e-update-app-1_kodkod_old_79c9f72c597f",
+            "path": "/containers/8b96fcab37c4dde95f3d315e41cd24a198b6d66eeb6d8fcaa423c4b8fc129df8/rename?name=e2e-update-app-1_kodkod_old_8b96fcab37c4",
             "requestBodySummary": null,
             "status": 204,
-            "responseFile": "0011.POST.containers-79c9f72c597ff4c2463a4a2df93a7.bin"
+            "responseFile": "0012.POST.containers-8b96fcab37c4dde95f3d315e41cd2.bin"
         },
         {
             "method": "POST",
             "path": "/containers/create?name=e2e-update-app-1&platform=linux%2Farm64",
             "requestBodySummary": "2502 bytes",
             "status": 201,
-            "responseFile": "0012.POST.containers-create.bin"
+            "responseFile": "0013.POST.containers-create.bin"
         },
         {
             "method": "POST",
-            "path": "/containers/e8a594d0a354403481f978cd24772dc482d819f371672537d37eb99f307020fa/start",
+            "path": "/containers/fc4db53a02878a27ea25ec257cfbec122ee445e9ce21055cc99f42e617ff6464/start",
             "requestBodySummary": null,
             "status": 204,
-            "responseFile": "0013.POST.containers-e8a594d0a354403481f978cd24772.bin"
+            "responseFile": "0014.POST.containers-fc4db53a02878a27ea25ec257cfbe.bin"
         },
         {
             "method": "GET",
-            "path": "/containers/e8a594d0a354403481f978cd24772dc482d819f371672537d37eb99f307020fa/json",
+            "path": "/containers/fc4db53a02878a27ea25ec257cfbec122ee445e9ce21055cc99f42e617ff6464/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0014.GET.containers-e8a594d0a354403481f978cd24772.bin"
+            "responseFile": "0015.GET.containers-fc4db53a02878a27ea25ec257cfbe.bin"
         },
         {
             "method": "GET",
-            "path": "/containers/e8a594d0a354403481f978cd24772dc482d819f371672537d37eb99f307020fa/json",
+            "path": "/containers/fc4db53a02878a27ea25ec257cfbec122ee445e9ce21055cc99f42e617ff6464/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0015.GET.containers-e8a594d0a354403481f978cd24772.bin"
+            "responseFile": "0016.GET.containers-fc4db53a02878a27ea25ec257cfbe.bin"
         },
         {
             "method": "GET",
-            "path": "/containers/e8a594d0a354403481f978cd24772dc482d819f371672537d37eb99f307020fa/json",
+            "path": "/containers/fc4db53a02878a27ea25ec257cfbec122ee445e9ce21055cc99f42e617ff6464/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0016.GET.containers-e8a594d0a354403481f978cd24772.bin"
+            "responseFile": "0017.GET.containers-fc4db53a02878a27ea25ec257cfbe.bin"
         },
         {
             "method": "DELETE",
-            "path": "/containers/79c9f72c597ff4c2463a4a2df93a793ba4ca8e6366bc81cb1ac89837d1fb240e?force=true&v=false",
+            "path": "/containers/8b96fcab37c4dde95f3d315e41cd24a198b6d66eeb6d8fcaa423c4b8fc129df8?force=true&v=false",
             "requestBodySummary": null,
             "status": 204,
-            "responseFile": "0017.DELETE.containers-79c9f72c597ff4c2463a4a2df93a7.bin"
+            "responseFile": "0018.DELETE.containers-8b96fcab37c4dde95f3d315e41cd2.bin"
         },
         {
             "method": "GET",
-            "path": "/images/sha256:b7166d61885c429aa396b84fb7c8a906e584b808788b0733319069a3f6f1fa03/json",
+            "path": "/images/sha256:4bb8b381fbc7831bf8ba3e44c3f6daf6ecd3ca7639c4853433cac1cd6e0b644a/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0018.GET.images-sha256-b7166d61885c429aa396b84fb7.bin"
+            "responseFile": "0019.GET.images-sha256-4bb8b381fbc7831bf8ba3e44c3.bin"
         },
         {
             "method": "GET",
             "path": "/containers/json?all=true&filters=%7B%22label%22%3A%5B%22com.docker.compose.project%3De2e-update%22%5D%7D",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0019.GET.containers-json.bin"
+            "responseFile": "0020.GET.containers-json.bin"
         }
     ]
 }

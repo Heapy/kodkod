@@ -1219,6 +1219,111 @@ class UpdaterTest {
 
         assertEquals(listOf("rename:web-old->web", "start:web-old"), docker.ops)
     }
+
+    // --- read phase / mutate phase ----------------------------------------------------------
+
+    /**
+     * The defect the split exists for: planning used to run under the same lock as the mutations, so a
+     * pull — ten minutes of permitted idle time per image, unbounded in practice behind a stalled
+     * registry — kept autoheal from restarting anything for the whole cycle. `pull` itself stays in the
+     * read phase (it only adds an image to the local store), so it is the *one* op allowed to appear
+     * here; anything else in `ops` is a container kodkod touched before taking the lock.
+     */
+    @Test
+    fun planning_pulls_but_changes_nothing() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        // A leftover the reconcile would restore — a mutation the read phase must not make either.
+        docker.orphanedBackup(id = "api-old", name = "api")
+
+        val plan = updater(docker).plan()
+
+        assertTrue(plan.hasWork, "the plan has to have found the update, or the assertions below are vacuous")
+        assertEquals(
+            listOf("pull:nginx:1.27"), docker.ops,
+            "the read phase may only pull; every other op is a mutation taken outside the cycle lock",
+        )
+    }
+
+    /** The mutations, and nothing else, happen in the second half — including the reconcile. */
+    @Test
+    fun applying_the_plan_is_what_recreates_the_container() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        val kodkod = updater(docker)
+
+        kodkod.apply(kodkod.plan())
+
+        assertOrder(
+            docker.ops,
+            "pull:nginx:1.27", "stop:web", "rename:web->web_kodkod_old_web", "create:web",
+            "start:new-web-0", "remove:web",
+        )
+    }
+
+    /**
+     * State can move while an image is downloading, and the plan carries container ids the mutations
+     * aim at: a container that is gone means `remove` would be pointed at whatever answers now.
+     */
+    @Test
+    fun a_plan_whose_container_disappeared_is_dropped() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        val kodkod = updater(docker)
+        val plan = kodkod.plan()
+
+        docker.containers.remove("web") // an operator (or compose) removed it during the pull
+        val log = captureLog { kodkod.apply(plan) }
+
+        assertEquals(
+            listOf("pull:nginx:1.27"), docker.ops,
+            "nothing may be mutated on a plan that no longer describes the daemon: ${docker.ops}",
+        )
+        assertTrue(log.contains("dropping this cycle's plan"), "a dropped plan must say so: $log")
+    }
+
+    /**
+     * Same for the image: somebody else recreating the container during the pull leaves the plan aimed
+     * at an image id that is no longer the one running, and the cleanup would prune a live image.
+     */
+    @Test
+    fun a_plan_whose_image_moved_under_it_is_dropped() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        val kodkod = updater(docker)
+        val plan = kodkod.plan()
+
+        docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:new")
+        val log = captureLog { kodkod.apply(plan) }
+
+        assertEquals(
+            listOf("pull:nginx:1.27"), docker.ops,
+            "the container already runs the new image — recreating it now is an outage for nothing: ${docker.ops}",
+        )
+        assertTrue(log.contains("dropping this cycle's plan"), "a dropped plan must say so: $log")
+    }
+
+    /**
+     * The reconcile is a mutation, so it moved into the second half with the others — but it is not part
+     * of the plan and must survive one being dropped: an orphaned backup is a service that is down right
+     * now, and "the update plan went stale" is no reason to leave it parked for another interval.
+     */
+    @Test
+    fun a_dropped_plan_does_not_take_the_reconcile_with_it() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.orphanedBackup(id = "api-old", name = "api")
+        val kodkod = updater(docker)
+        val plan = kodkod.plan()
+
+        docker.containers.remove("web")
+        kodkod.apply(plan)
+
+        assertEquals(
+            listOf("pull:nginx:1.27", "rename:api-old->api", "start:api-old"), docker.ops,
+            "the orphan has to be restored even though the plan was dropped: ${docker.ops}",
+        )
+    }
 }
 
 /**

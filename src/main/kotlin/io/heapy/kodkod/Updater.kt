@@ -35,6 +35,10 @@ import java.time.Instant
  * failed that gate is remembered for `KODKOD_UPDATE_FAILURE_COOLDOWN` so a broken `:latest` costs one
  * interrupted service instead of one per cycle.
  *
+ * A cycle comes in two halves: [plan] decides everything from reads alone — including the image pull,
+ * which is where all the waiting is — and [apply] makes every change. Only the second half has to be
+ * serialized against autoheal, which is the whole point of the split; see `updateCycle` in `main`.
+ *
  * [clock] and [sleeper] default to the real ones and exist so waiting logic can be driven from tests
  * without spending the wall-clock time it describes.
  */
@@ -151,19 +155,45 @@ class Updater(
             null
         }
 
-    fun runOnce() {
-        reconcileOrphanedBackups()
+    /** A whole cycle: decide what to do, then do it. The two halves are separate for [main]'s sake. */
+    fun runOnce() = apply(plan())
+
+    /**
+     * Decide what this cycle should do, **without changing anything**: discovery, the registry probe
+     * and the image pull, which is where all of a cycle's waiting lives — a pull of a large image is
+     * granted minutes of idle time by design (see [DockerApi]), and a stalled registry can stretch it
+     * further. None of it touches a container, which is what lets [main] run this half outside the
+     * cycle lock so autoheal is not held off by somebody else's slow download.
+     *
+     * The only state it does change is kodkod's own: [failedUpdates] forgets a memory that no longer
+     * applies (see [suppressedByCooldown]).
+     */
+    internal fun plan(): UpdatePlan {
         val targets = collectTargets()
-        if (targets.isEmpty()) return
+        if (targets.isEmpty()) return UpdatePlan.NOTHING
 
         markStale(targets)
         propagateLinkedRestart(targets, config.respectDependsOnRestart)
         if (targets.none { it.toRestart }) {
             Log.info("update: all monitored containers are up to date")
-            return
+            return UpdatePlan.NOTHING
         }
+        return UpdatePlan(topoSort(targets))
+    }
 
-        val ordered = topoSort(targets)
+    /**
+     * Carry out [plan] — the half that stops, renames, creates, starts and removes, and therefore the
+     * only half that has to be serialized against autoheal.
+     *
+     * [reconcileOrphanedBackups] belongs here rather than in [plan] for the same reason: it renames and
+     * starts containers. It stays first in the cycle, and unconditional — an orphan is a service that is
+     * down right now, and a cycle that found nothing to update is exactly the cycle that would otherwise
+     * walk past it.
+     */
+    internal fun apply(plan: UpdatePlan) {
+        reconcileOrphanedBackups()
+        if (!plan.hasWork || !isCurrent(plan)) return
+        val ordered = plan.targets
 
         // Stop dependents before the dependencies they rely on.
         for (target in ordered.asReversed()) {
@@ -176,7 +206,7 @@ class Updater(
         }
         // Bring everything back in dependency order: recreate stale/create-time-linked containers,
         // restart ordinary dependents.
-        val byId = targets.associateBy { it.id }
+        val byId = ordered.associateBy { it.id }
         for (target in ordered) {
             if (!target.toRestart) continue
             awaitHealthyDependencies(target, byId)
@@ -187,6 +217,42 @@ class Updater(
             }
         }
         refreshCreateTimeDependents(ordered)
+    }
+
+    /**
+     * Whether the daemon still agrees with [plan]. The plan was built outside the cycle lock and the
+     * pull it waited for can take minutes, so "this container runs that image" is a statement about the
+     * past by the time we get here — while every mutation below aims at the container id and the image
+     * id the plan recorded: a `remove` at the wrong id destroys somebody else's container, and a prune
+     * at the wrong image id deletes a live one.
+     *
+     * Only the containers the plan means to touch are re-checked, and a plan that no longer holds is
+     * dropped **whole**: the targets are a dependency graph, and going ahead with the half of it that
+     * still checks out means stopping containers for a dependency that is no longer being updated. The
+     * next cycle re-plans from the state that actually exists, one interval later.
+     */
+    private fun isCurrent(plan: UpdatePlan): Boolean {
+        for (target in plan.work) {
+            val inspect = try {
+                api.inspectContainer(target.id)
+            } catch (e: Exception) {
+                Log.warn(
+                    "update: dropping this cycle's plan — ${target.name} (${target.id.take(12)}) could no longer " +
+                        "be inspected, so the state it was planned against is gone: ${e.message}",
+                )
+                return false
+            }
+            val imageId = inspect.str("Image").orEmpty()
+            if (imageId != target.currentImageId) {
+                Log.warn(
+                    "update: dropping this cycle's plan — ${target.name} now runs ${imageId.shortId()} rather " +
+                        "than the ${target.currentImageId.shortId()} it was planned against, so something else " +
+                        "changed it while kodkod was planning",
+                )
+                return false
+            }
+        }
+        return true
     }
 
     // --- create-time dependents outside the monitored set -----------------------------------
@@ -955,6 +1021,24 @@ internal fun canonicalNameOfBackup(backup: String, id: String): String? =
 
 /** `State.Health.Status` — absent for a container whose image declares no healthcheck. */
 private fun JsonObject.healthStatus(): String? = obj("Health")?.str("Status")
+
+/**
+ * What one update cycle intends to do, as decided by [Updater.plan] from reads alone and carried out by
+ * [Updater.apply]. [targets] is the whole monitored set in dependency order (dependencies first),
+ * carrying the per-container verdict — the containers that are not being touched are part of the plan
+ * too, since they are what the graph is resolved against.
+ */
+internal class UpdatePlan(val targets: List<Target>) {
+    /** The containers this plan will actually stop and bring back, in the same order. */
+    val work: List<Target> = targets.filter { it.toRestart }
+
+    val hasWork: Boolean get() = work.isNotEmpty()
+
+    companion object {
+        /** Nothing to do — no monitored containers, or every one of them already up to date. */
+        val NOTHING = UpdatePlan(emptyList())
+    }
+}
 
 /** One container kodkod is considering for an update, plus the verdict it accumulates this cycle. */
 internal class Target(
