@@ -4,7 +4,8 @@
 # :latest tag is overwritten with v2, kodkod must log "digest-pinned — skipping"
 # and leave the container untouched.
 #
-# Capture the digest after pushing v1 (see E2E_TESTING.md):
+# TESTAPP_DIGEST is set by the suite itself (`digestPinnedContainerIsSkipped` reads it off the
+# image it just pushed). To bring this stack up by hand, capture it after pushing v1:
 #   export TESTAPP_DIGEST=$(docker inspect -f '{{index .RepoDigests 0}}' \
 #       127.0.0.1:5000/testapp:latest | cut -d@ -f2)
 name: e2e-digest

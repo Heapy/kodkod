@@ -46,9 +46,16 @@ recreate containers whose image tag moved (update). Kotlin, one runtime dependen
   Dropping a `?t=`, adding an inspect, adding `?platform=` — all of them break replay. Request bodies
   are *not* part of the key, so a change to a create body needs no re-record. Recording requires
   Docker; see the flags in `E2E_TESTING.md`.
-- **Never issue an unfiltered `all=true` listing on a path the recorder walks.** The recorder runs
+- **Never *add* an unfiltered `all=true` listing on a path the recorder walks.** The recorder runs
   against a developer's real daemon, so an unfiltered listing bakes that machine's unrelated
   containers into the committed corpus. Narrow it (e.g. `name=_kodkod_old_`, `status=running`).
+  There is exactly one deliberate exception, and it is conditional: `Dependents.findDependents` widens
+  its scan to a daemon-wide `all=true` listing with no filters at all, but only for a provider whose
+  compose project turns out to contain a create-time dependent (see its "Scan width" paragraph). No
+  recorded scenario has an in-project netns dependent today, so the wide listing is never reached
+  during a recording — that is the only reason the corpus is clean, not a property of the code. A
+  recorder scenario that adds one (a `network_mode: service:` sidecar inside a stack it updates or
+  heals) will start capturing the whole host: give it its own disposable daemon, or do not record it.
 - A create body is asserted through `FakeDockerClient.created` / `OpLoggingClient.created`, not stored
   as a fixture: recording our own output as a golden file self-heals on every re-record.
 - Replay is FIFO **per key**, so the order of calls to two *different* keys is not checked: moving a

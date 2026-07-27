@@ -117,20 +117,23 @@ resolved config.
 
 ## Test matrix
 
-| Test method | Aspect verified | Compose file | Registry? |
-|-------------|-----------------|--------------|-----------|
-| `autohealRestartsUnhealthyContainer` | Restart an unhealthy container | `compose.autoheal.yml` | no |
-| `updatePullsAndAdoptsNewImageDefaults` | Pull, recreate, adopt new image defaults | `compose.update.yml` | yes |
-| `composeUpAfterKodkodUpdateKeepsTheContainer` | A repeated `compose up -d` does not recreate what kodkod updated | `compose.update.yml` | yes |
-| `anonymousVolumeIsInheritedByTheRecreatedContainer` | An anonymous volume (and its data) survives a recreate | `compose.update.yml` | yes |
-| `dependencyUpdateRestartsDependentAfterProvider` | `depends_on` ordering and dependent restart | `compose.deps.yml` | yes |
-| `multiNetworkContainerIsReconnectedToEveryNetwork` | Multi-network reconnect on recreate | `compose.multinet.yml` | yes |
-| `containerNetworkModeDependentIsRecreatedAfterProviderUpdate` | `network_mode: container:` rewrite | `compose.container-mode.yml` | yes |
-| `failedRecreateRollsBackToRunningOriginal` | Failed recreate rolls back to original | `compose.rollback.yml` | yes |
-| `aReplacementThatStartsAndThenDiesIsRolledBack` | The liveness gate rolls back a container that starts and then exits | `compose.rollback.yml` | yes |
-| `aBackupOrphanedByAKilledKodkodIsRecoveredOnRestart` | A `_kodkod_old_` backup left by a killed process is reconciled on the next start | `compose.rollback.yml` | yes |
-| `digestPinnedContainerIsSkipped` | Digest-pinned containers are skipped | `compose.digest.yml` | yes |
-| `monitorAllDoesNotActOnKodkodItself` | Self-protection under monitor-all | `compose.self.yml` | no |
+Listed in the order they run — the class is `@TestMethodOrder(OrderAnnotation)`, and the `@Order` on
+each method is what this table's rows follow.
+
+| # | Test method | Aspect verified | Compose file | Registry? |
+|---|-------------|-----------------|--------------|-----------|
+| 1 | `autohealRestartsUnhealthyContainer` | Restart an unhealthy container | `compose.autoheal.yml` | no |
+| 2 | `updatePullsAndAdoptsNewImageDefaults` | Pull, recreate, adopt new image defaults | `compose.update.yml` | yes |
+| 3 | `composeUpAfterKodkodUpdateKeepsTheContainer` | A repeated `compose up -d` does not recreate what kodkod updated | `compose.update.yml` | yes |
+| 4 | `dependencyUpdateRestartsDependentAfterProvider` | `depends_on` ordering and dependent restart | `compose.deps.yml` | yes |
+| 5 | `multiNetworkContainerIsReconnectedToEveryNetwork` | Multi-network reconnect on recreate | `compose.multinet.yml` | yes |
+| 6 | `containerNetworkModeDependentIsRecreatedAfterProviderUpdate` | `network_mode: container:` rewrite, for a monitored consumer and an unlabelled sidecar | `compose.container-mode.yml` | yes |
+| 7 | `failedRecreateRollsBackToRunningOriginal` | Failed recreate rolls back to original | `compose.rollback.yml` | yes |
+| 8 | `digestPinnedContainerIsSkipped` | Digest-pinned containers are skipped | `compose.digest.yml` | yes |
+| 9 | `monitorAllDoesNotActOnKodkodItself` | Self-protection under monitor-all | `compose.self.yml` | no |
+| 10 | `anonymousVolumeIsInheritedByTheRecreatedContainer` | An anonymous volume (and its data) survives a recreate | `compose.update.yml` | yes |
+| 11 | `aReplacementThatStartsAndThenDiesIsRolledBack` | The liveness gate rolls back a container that starts and then exits | `compose.rollback.yml` | yes |
+| 12 | `aBackupOrphanedByAKilledKodkodIsRecoveredOnRestart` | A `_kodkod_old_` backup left by a killed process is reconciled on the next start | `compose.rollback.yml` | yes |
 
 `FixtureWriterTest` also lives in this source set but needs no Docker: the `test` source set cannot
 see `e2eTest` sources, and that is the only reason it is here.
@@ -141,7 +144,8 @@ see `e2eTest` sources, and that is the only reason it is here.
 
 ## What the JUnit suite does
 
-`KodkodE2eTest` performs the old shell setup and assertions in Kotlin:
+`KodkodE2eTest` owns the whole suite lifecycle; `E2eHarness` (same file) is the thin Docker CLI wrapper
+it drives:
 
 1. Starts Docker-in-Docker unless `-Pkodkod.e2e.useCurrentDocker=true`.
 2. Builds `kodkod:e2e`.
@@ -204,9 +208,17 @@ recording our own output as a golden file would just self-heal on every re-recor
 Review the fixture diff before committing it: only the paths and bodies you meant to change should
 move. Container and image ids differ on every run, so compare manifests with the ids normalized.
 
-The recorder runs with `KODKOD_UPDATE_MONITOR_ALL=false`, so it only ever acts on containers labelled
-for kodkod, and with `KODKOD_UPDATE_VERIFY_HEALTH=false` (as does `DockerReplayTest`), which keeps the
-liveness gate's probe count deterministic instead of a race with the replacement's healthcheck.
+The recorder's update scenarios run with three settings pinned, and the replay side has to match all
+three or the corpus misses:
+
+- `KODKOD_UPDATE_MONITOR_ALL=false`, so the recorder only ever acts on containers labelled for kodkod —
+  never the developer's own running containers on the daemon it is recording from;
+- `KODKOD_UPDATE_VERIFY_HEALTH=false` (as in `DockerReplayTest`), which keeps the liveness gate's probe
+  count deterministic instead of a race between the probe interval and the replacement's healthcheck;
+- `KODKOD_UPDATE_CLEANUP=true`, which is what puts the old image's `DELETE /images/<id>` — and the
+  `GET /images/<id>/json` that decides whether it may be deleted — into the recording at all.
+
+The autoheal scenario takes the defaults (`Config.fromEnv` over an empty map).
 
 ## Manual debugging
 
@@ -219,7 +231,7 @@ docker ps -a
 docker logs e2e-update-kodkod-1
 ```
 
-To manually publish the test image variants without the removed helper scripts:
+To publish the test image variants by hand — the same builds `E2eHarness.publishVariant` makes:
 
 ```bash
 REG=127.0.0.1:5000
@@ -274,10 +286,13 @@ docker rm -f -v kodkod-e2e-dind
 
 ```text
 E2E_TESTING.md
-src/e2eTest/kotlin/io/heapy/kodkod/e2e/KodkodE2eTest.kt
+src/e2eTest/kotlin/io/heapy/kodkod/e2e/KodkodE2eTest.kt      # the suite + E2eHarness
 src/e2eTest/kotlin/io/heapy/kodkod/e2e/DockerFixtureRecorder.kt
 src/e2eTest/kotlin/io/heapy/kodkod/e2e/FixtureWriter.kt
 src/e2eTest/kotlin/io/heapy/kodkod/e2e/FixtureWriterTest.kt
+src/main/kotlin/io/heapy/kodkod/DockerTransport.kt           # the seam both sides plug into
+src/main/kotlin/io/heapy/kodkod/UnixSocketTransport.kt       # production transport, what the recorder wraps
+src/main/kotlin/io/heapy/kodkod/DockerRecording.kt           # recording/replay transports + the corpus types
 src/test/kotlin/io/heapy/kodkod/DockerReplayTest.kt
 src/test/resources/docker-fixtures/
 e2e/

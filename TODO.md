@@ -21,28 +21,24 @@
 
 ## Надёжность и корректность
 
-7. Raw-ref без URL-кодирования в `inspectImage`/`removeImage`/`inspectDistribution` (`/images/$ref/json`), хотя
-   `pull` кодирует через `enc()`. Prune старого образа добавил ещё один вызов на тот же незакодированный путь.
-8. `Config.bool()` трактует пустую переменную как `false` вместо дефолта.
-9. `subtractImageDefaultsByKey` теряет пользовательские `Cmd`/`Entrypoint`/`User`/`WorkingDir`.
-10. `pull` буферизует весь прогресс-стрим в памяти; `dechunk` молча обрезает хвост.
-11. `DockerApi.create` бросает NPE без сообщения, когда в ответе нет `Id`.
-12. `isSelf` использует `id.startsWith(selfId)` — префиксное сравнение id.
+7. `subtractImageDefaultsByKey` теряет пользовательские `Cmd`/`Entrypoint`/`User`/`WorkingDir`.
+8. `pull` буферизует весь прогресс-стрим в памяти.
+9. `DockerApi.create` бросает NPE без сообщения, когда в ответе нет `Id`.
+10. `isSelf` использует `id.startsWith(selfId)` — префиксное сравнение id.
 
 ## Тесты и покрытие
 
-13. Multi-arch digest не проверен: `UpdaterTest` гоняет одиночные digest'ы, e2e — single-arch busybox. Сравнение
+11. Multi-arch digest не проверен: `UpdaterTest` гоняет одиночные digest'ы, e2e — single-arch busybox. Сравнение
     index-digest, скорее всего, корректно, но это классический watchtower-footgun без теста.
-14. Health-ветка liveness-гейта (`unhealthy` / `starting`) покрыта только юнит-тестами: и рекордер, и e2e идут с
+12. Health-ветка liveness-гейта (`unhealthy` / `starting`) покрыта только юнит-тестами: и рекордер, и e2e идут с
     `KODKOD_UPDATE_VERIFY_HEALTH=false`, потому что иначе число проб — гонка между интервалом проб и
     healthcheck'ом замены. Нужен детерминированный e2e (образ с предсказуемым healthcheck'ом).
-15. Grace-хук шатдауна в `Main.kt` (`awaitTermination` → `shutdownNow`) не покрыт тестом: `main()` не
+13. Grace-хук шатдауна в `Main.kt` (`awaitTermination` → `shutdownNow`) не покрыт тестом: `main()` не
     разбирается на тестируемые части. Из него проверен только `ConfigTest.reads_the_shutdown_grace_period`.
     Чтобы покрыть — выделить планировщик и хук в отдельную тестируемую функцию.
-16. Дублирование в тестах: версия `kotlinx-serialization-json` и хелперы `updateConfig`/`autohealConfig`.
+14. Дублирование в тестах: хелперы `updateConfig`/`autohealConfig` рекордера и `config(...)` юнит-тестов.
 
 ## Упаковка
 
-17. Test-only классы record/replay (`DockerRecording.kt`, `DockerTransport.kt`) — `public` в main source set и
+15. Test-only классы record/replay (`DockerRecording.kt`, `DockerTransport.kt`) — `public` в main source set и
     попадают в production-jar.
-18. `.dockerignore` тащит корпус фикстур в build context.

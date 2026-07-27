@@ -98,9 +98,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fails the update instead of releasing the old container and image, and a `404` on the replacement (an
   `AutoRemove` inherited from the old container, an outside `docker rm`) is treated as the failure it
   is rather than as "still starting".
-- The reconcile of orphaned backups no longer force-removes a container it did not create. Only a
-  holder that was created and never started is cleared out of the way; a holder that has run is left
-  alone and reported, because that is also what a completed update stopped by an operator looks like.
+- The reconcile of orphaned backups decides a **stopped** name holder by that container's own uptime
+  instead of clearing whatever is in the way. A holder that ran at least
+  `max(KODKOD_UPDATE_VERIFY_SECONDS, 60s)` — the window a replacement has to survive to be accepted —
+  is left alone together with the backup and reported, because that is also what a completed update
+  stopped by an operator looks like; so is one the daemon reports no run times for. A holder that never
+  proved that much is what a kodkod killed inside the liveness gate leaves behind: it is removed (with
+  `v=false`, so its volumes survive) and the backup takes the name back, logged at `ERROR` naming the
+  container and the threshold it missed.
 - The failed-update cooldown is only recorded when the replacement actually ran: a refused stop, a name
   conflict or a rejected create says nothing about the image and no longer freezes the update for six
   hours.

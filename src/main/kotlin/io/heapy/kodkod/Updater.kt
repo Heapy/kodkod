@@ -23,7 +23,9 @@ import java.time.Instant
  * restarted; create-time dependents (`--link` / `network_mode: container:`) are recreated so Docker
  * refreshes their references. Containers pinned to a digest (`image@sha256:...`) are never stale but can
  * still be restarted or recreated as a dependent. Create-time dependents that are *not* monitored are
- * searched for across the whole daemon once the cycle is done — see [refreshCreateTimeDependents].
+ * searched for once the cycle is done — see [refreshCreateTimeDependents], and [findDependents]'s "Scan
+ * width" paragraph for how far that search actually reaches (a compose provider is probed within its own
+ * project first, and only a project that turns out to share namespaces is re-scanned daemon-wide).
  *
  * Compose's `depends_on` carries a condition and a `restart` flag per edge. `condition: service_healthy`
  * is always honoured — a dependent waits for its dependency's healthcheck to pass, bounded by

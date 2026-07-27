@@ -12,9 +12,16 @@ import java.io.ByteArrayOutputStream
 import java.io.PrintStream
 
 /**
- * Exercises [Updater.runOnce] end-to-end against a [FakeDockerClient]. These cover the staleness
- * decision (`markStale` — digest-pinned / registry-digest / pull paths) and the recreate + rollback
- * machinery, all of which used to be reachable only from the Docker-backed e2e suite.
+ * Exercises whole [Updater] cycles against a [FakeDockerClient] — an in-memory daemon rather than
+ * stubbed return values, so a test asserts what the cycle *did* (its ops, its create bodies, the state
+ * the fake is left in) and multi-cycle behaviour can be driven by simply calling `runOnce` again.
+ *
+ * The banners divide it by decision, roughly in the order a cycle makes them: the staleness decision
+ * (digest-pinned / registry-digest / pull paths), the recreate itself (image cleanup, endpoint
+ * fidelity, the `com.docker.compose.image` restamp, platform), rollback, the liveness gate, the memory
+ * of an image that cannot start, then everything about dependency edges — ordering, compose
+ * `depends_on` conditions, bringing dependents back, create-time dependents outside the monitored set —
+ * and finally the reconcile of orphaned backups and the `plan()`/`apply()` split.
  */
 class UpdaterTest {
     /**

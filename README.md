@@ -128,11 +128,21 @@ step that fails is logged, and a rollback that did not land says `ROLLBACK INCOM
 rather than reporting success. If kodkod is killed mid-recreate, the `_kodkod_old_` backup it left
 behind is reconciled — restoring it when nothing is serving the name, removing it when the
 replacement is running. That reconcile runs at startup *and* at the head of every update cycle, and
-it is not gated on `KODKOD_UPDATE_ENABLED`: an orphan is a service that is down right now. It is
-deliberately conservative in one case — when the container holding the service name has *run* at some
-point (rather than being a replacement that was created and never started), both containers are left
-alone and the situation is reported, because that shape is also what "the update went through and an
-operator stopped the result" looks like.
+it is not gated on `KODKOD_UPDATE_ENABLED`: an orphan is a service that is down right now.
+
+The awkward case is a backup whose service name is held by a container that is **stopped**, and it is
+decided by that container's own uptime against `max(KODKOD_UPDATE_VERIFY_SECONDS, 60s)` — the same
+window a replacement has to survive to be accepted:
+
+- it ran at least that long before it stopped: both containers are left alone and the situation is
+  reported, because that shape is also what "the update went through and an operator stopped the
+  result" looks like. So is a holder the daemon reports no run times for;
+- it never proved that much (including never having been started at all): that is what a kodkod killed
+  inside the liveness gate leaves behind, so the holder is **removed** and the backup takes the name
+  back. The removal is logged at `ERROR`, naming the container and the threshold it missed, and sends
+  `v=false` so the container's volumes survive it. Getting this wrong costs one container and is undone
+  by the next cycle; the opposite mistake leaves a crashing replacement on the name until a human
+  notices.
 
 ### Limitations
 
@@ -155,10 +165,17 @@ operator stopped the result" looks like.
   `com.docker.compose.project` and widens to the whole daemon only when that narrow look finds
   something; a stack with no in-project `network_mode: container:` relation does not pay for a full
   listing on every restart, and an out-of-project sidecar joined to it is therefore not seen.
-- kodkod's memories are **in-process only**. The failed-update cooldown
-  (`KODKOD_UPDATE_FAILURE_COOLDOWN`) and the autoheal restart backoff live in the running process, so
-  restarting kodkod forgets both: an image that cannot start is retried on the next cycle, and a
-  flapping container's backoff starts again from `KODKOD_AUTOHEAL_INTERVAL`.
+- kodkod's memories are **in-process only**, and one of them matters more than the rest. The
+  failed-update cooldown (`KODKOD_UPDATE_FAILURE_COOLDOWN`) and the autoheal restart backoff are merely
+  forgotten on a restart: an image that cannot start is retried on the next cycle, and a flapping
+  container's backoff starts again from `KODKOD_AUTOHEAL_INTERVAL`. The list of **stranded create-time
+  dependents** — containers kodkod stopped for a recreate and could neither rebuild nor roll back — is
+  the dangerous one, because that list is the only thing that will ever look at those containers again:
+  they are stopped under their own name, and discovery lists running containers only. A kodkod that
+  restarts before such a container is serving again never comes back to it. There is no way to fix
+  that from the daemon's side — the container is the *original*, not one kodkod created, Docker cannot
+  label a container that already exists, and the netns id it carries names something that no longer
+  exists — so the `ERROR` that reports it says so out loud and names the command to run by hand.
 
 ### Ordering & dependencies
 
@@ -181,11 +198,12 @@ kodkod updates the whole monitored set together so it can respect dependencies:
   namespace that no longer exists. So the dependent updates alone first — where a failure *can* be
   rolled back — and the provider follows on a later cycle. The delay is logged every cycle;
 - a create-time dependent kodkod could neither recreate nor roll back is **brought back on every later
-  cycle** until it serves again: it is the one container nothing else would ever look at, since
-  discovery lists running containers only. What that takes is checked against the daemon each cycle —
-  a `start` while the namespace it names is still its provider's, a rebuild against the provider's
-  name once that container is gone (which a later cycle can do at any time: a stopped dependent no
-  longer holds its provider back);
+  cycle of this process** until it serves again: it is the one container nothing else would ever look
+  at, since discovery lists running containers only. What that takes is checked against the daemon each
+  cycle — a `start` while the namespace it names is still its provider's, a rebuild against the
+  provider's name once that container is gone (which a later cycle can do at any time: a stopped
+  dependent no longer holds its provider back). The retry does **not** survive a restart of kodkod
+  itself, and the `ERROR` reporting the container says so and names the manual fix — see Limitations;
 - a dependency compose marked `condition: service_healthy` is **waited for** before its dependent is
   started, bounded by `KODKOD_DEPENDENCY_HEALTH_TIMEOUT`. Only dependencies this cycle brought back
   are waited for, and the timeout starts the dependent anyway: the condition may delay a container,

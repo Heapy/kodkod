@@ -12,8 +12,11 @@ import java.time.Instant
  *  - `<ns>.stop.timeout=<seconds>`     — per-container stop timeout override
  *
  * A restart is never issued in isolation: containers wired to the restarted one at create time
- * (`network_mode: service:x`, legacy `--link`) are restarted after it — see [findDependents] — and
- * they are looked up across the whole daemon, not just the labelled set.
+ * (`network_mode: service:x`, legacy `--link`) are restarted after it, and the search for them leaves
+ * the labelled set — an unlabelled sidecar is exactly the one nothing else would notice is broken. How
+ * far it reaches is [findDependents]'s "Scan width" paragraph: a compose-managed provider is probed
+ * within its own project first, and only a project that turns out to share namespaces is re-scanned
+ * across the whole daemon.
  *
  * Neither is a restart repeated indefinitely: a container that comes back unhealthy every time is
  * backed off per container (see [restarts]), because the restart is evidently not the fix.

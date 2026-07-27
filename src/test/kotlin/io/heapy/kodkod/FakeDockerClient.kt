@@ -24,9 +24,13 @@ import java.time.Instant
  * so tests can predict and reference the replacement container — and registers it in [containers] so
  * it can be inspected, unless the test already registered a payload for that id itself.
  *
- * [listContainers] applies `all` and the `status`/`label`/`health` filters to [listed] the way the
- * daemon would, so code that deliberately looks beyond the monitored set (`all=true`, no label
- * filter) can be told apart from code that only ever sees its own targets.
+ * [listContainers] applies `all` and the `status`/`label`/`health`/`name`/`id` filters to [listed] the
+ * way the daemon would, so code that deliberately looks beyond the monitored set (`all=true`, no label
+ * filter) can be told apart from code that only ever sees its own targets. `name` matches as an
+ * unanchored substring over every name a container answers to (what narrows the backup reconcile) and
+ * `id` matches by prefix (what asks about one backed-off container without listing the host) — both are
+ * the daemon's own semantics, and both are load-bearing: code narrowing a listing that way is asserted
+ * on through [listFilters] *and* has to get the right containers back.
  */
 class FakeDockerClient : DockerClient {
     /** Container summaries the daemon knows about; [listContainers] filters this list. */

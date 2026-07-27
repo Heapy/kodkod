@@ -15,10 +15,13 @@ ARG VARIANT
 ENV APP_VARIANT=${VARIANT}
 LABEL app.variant=${VARIANT}
 
-# Self-contained health: the marker exists while healthy. Removing it (docker exec
-# rm /tmp/healthy) flips the container to unhealthy — used by the autoheal scenario.
-# v1/v2 intentionally have different healthcheck defaults so the update scenario can
-# prove kodkod preserves partial user overrides without freezing the old image check.
+# Self-contained health: the markers exist while healthy, and the HEALTHCHECKs of both
+# variants below are what read them. Removing one (docker exec rm /tmp/healthy) flips the
+# container to unhealthy. The autoheal scenarios do NOT use this image — compose.autoheal.yml
+# runs plain busybox with a marker of its own — so these markers serve the update scenarios,
+# where the healthcheck is part of what an update has to adopt: v1/v2 intentionally declare
+# different healthcheck defaults so the update scenario can prove kodkod picks up the new
+# image's check instead of freezing the old container's resolved config.
 CMD ["sh", "-c", "echo \"[testapp] live variant=$APP_VARIANT\"; touch /tmp/healthy /tmp/healthy-$APP_VARIANT; while true; do sleep 1; done"]
 
 FROM base AS v1
