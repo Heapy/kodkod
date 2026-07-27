@@ -17,6 +17,16 @@ data class Config(
     // Autoheal — restart unhealthy containers
     val autohealEnabled: Boolean,
     val autohealInterval: Long,
+    /**
+     * `KODKOD_AUTOHEAL_MAX_INTERVAL` — the ceiling of the per-container backoff between restarts of a
+     * container that stays unhealthy. A container unhealthy because of its *configuration* is not fixed
+     * by a restart, and restarting it every [autohealInterval] forever keeps resetting its healthcheck
+     * `start_period`, so it reads as freshly starting instead of broken. The wait doubles from
+     * [autohealInterval] up to this value; setting it *to* [autohealInterval] disables the backoff and
+     * restores the retry-every-cycle behaviour. Never below [autohealInterval] — a ceiling under the
+     * loop's own period would throttle nothing.
+     */
+    val autohealMaxInterval: Long,
     val autohealStartPeriod: Long,
     val autohealMonitorAll: Boolean,
     // Update — pull newer images and recreate containers
@@ -65,12 +75,16 @@ data class Config(
             fun bool(key: String, default: Boolean) =
                 get(key)?.trim()?.lowercase()?.let { it in TRUTHY } ?: default
 
+            // Read up front: the backoff ceiling is expressed relative to it.
+            val autohealInterval = long("KODKOD_AUTOHEAL_INTERVAL", 30)
+
             return Config(
                 dockerSocket = str("KODKOD_DOCKER_SOCKET", "/var/run/docker.sock"),
                 labelNamespace = str("KODKOD_LABEL_NAMESPACE", "kodkod"),
                 defaultStopTimeout = get("KODKOD_STOP_TIMEOUT")?.trim()?.toIntOrNull(),
                 autohealEnabled = bool("KODKOD_AUTOHEAL_ENABLED", true),
-                autohealInterval = long("KODKOD_AUTOHEAL_INTERVAL", 30),
+                autohealInterval = autohealInterval,
+                autohealMaxInterval = long("KODKOD_AUTOHEAL_MAX_INTERVAL", 3600).coerceAtLeast(autohealInterval),
                 autohealStartPeriod = long("KODKOD_AUTOHEAL_START_PERIOD", 0),
                 autohealMonitorAll = bool("KODKOD_AUTOHEAL_MONITOR_ALL", false),
                 updateEnabled = bool("KODKOD_UPDATE_ENABLED", true),

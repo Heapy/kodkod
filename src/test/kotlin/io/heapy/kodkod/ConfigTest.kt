@@ -21,6 +21,7 @@ class ConfigTest {
         assertNull(c.defaultStopTimeout, "unset means \"no opinion\": each container's own Config.StopTimeout applies")
         assertTrue(c.autohealEnabled)
         assertEquals(30, c.autohealInterval)
+        assertEquals(3600, c.autohealMaxInterval)
         assertEquals(3600, c.updateInterval)
         assertFalse(c.autohealMonitorAll)
         assertTrue(c.updateCleanup)
@@ -95,6 +96,24 @@ class ConfigTest {
         assertTrue(Config.fromEnv(env("KODKOD_UPDATE_MONITOR_ALL" to "yes")).updateMonitorAll)
         assertTrue(Config.fromEnv(env("KODKOD_UPDATE_MONITOR_ALL" to "1")).updateMonitorAll)
         assertFalse(Config.fromEnv(env("KODKOD_UPDATE_MONITOR_ALL" to "nope")).updateMonitorAll)
+    }
+
+    @Test
+    fun reads_the_autoheal_backoff_ceiling() {
+        assertEquals(300, Config.fromEnv(env("KODKOD_AUTOHEAL_MAX_INTERVAL" to "300")).autohealMaxInterval)
+        assertEquals(
+            30, Config.fromEnv(env("KODKOD_AUTOHEAL_MAX_INTERVAL" to "30")).autohealMaxInterval,
+            "a ceiling equal to the interval is legal: it disables the backoff",
+        )
+        assertEquals(
+            120, Config.fromEnv(env("KODKOD_AUTOHEAL_INTERVAL" to "120", "KODKOD_AUTOHEAL_MAX_INTERVAL" to "10"))
+                .autohealMaxInterval,
+            "a ceiling below the loop's own period would throttle nothing — it is raised to the interval",
+        )
+        assertEquals(
+            3600, Config.fromEnv(env("KODKOD_AUTOHEAL_MAX_INTERVAL" to "nonsense")).autohealMaxInterval,
+            "an unparseable value falls back to the default rather than to no ceiling at all",
+        )
     }
 
     @Test

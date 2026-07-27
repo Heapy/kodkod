@@ -32,13 +32,45 @@ class AutohealTest {
         )
     }
 
-    private fun config(monitorAll: Boolean = true, stopTimeout: String? = null): Config =
+    private fun config(
+        monitorAll: Boolean = true,
+        stopTimeout: String? = null,
+        maxInterval: String? = null,
+    ): Config =
         Config.fromEnv(
             buildMap {
                 put("KODKOD_AUTOHEAL_MONITOR_ALL", monitorAll.toString())
                 stopTimeout?.let { put("KODKOD_STOP_TIMEOUT", it) }
+                maxInterval?.let { put("KODKOD_AUTOHEAL_MAX_INTERVAL", it) }
             }::get,
         )
+
+    private fun autoheal(docker: FakeDockerClient, config: Config, clock: FakeClock) =
+        Autoheal(docker, config, selfId = null, clock = clock, sleeper = clock)
+
+    /**
+     * Runs [cycles] autoheal cycles [everyMs] apart on a fake clock and returns the clock time of every
+     * restart of [id] — the shape the "30s, then 60s, then 120s" of the backoff is stated in. The
+     * container stays unhealthy the whole time, which is exactly the case a restart cannot fix.
+     */
+    private fun restartTimes(
+        docker: FakeDockerClient,
+        config: Config,
+        cycles: Int,
+        everyMs: Long,
+        id: String = "app",
+    ): List<Long> {
+        val clock = FakeClock()
+        val autoheal = autoheal(docker, config, clock)
+        val times = mutableListOf<Long>()
+        repeat(cycles) {
+            val before = docker.ops.count { it == "restart:$id" }
+            autoheal.runOnce()
+            if (docker.ops.count { it == "restart:$id" } > before) times += clock.millis()
+            clock.advance(everyMs)
+        }
+        return times
+    }
 
     @Test
     fun restarts_an_unhealthy_container() {
@@ -185,6 +217,94 @@ class AutohealTest {
         assertEquals(
             listOf("restart:app000000000000"), docker.ops,
             "kodkod restarting itself mid-cycle would abandon the rest of the pass: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun does_not_restart_a_still_unhealthy_container_every_interval() {
+        val docker = FakeDockerClient()
+        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+
+        val times = restartTimes(docker, config(monitorAll = true), cycles = 5, everyMs = 30_000)
+
+        assertEquals(
+            listOf(0L, 30_000L, 90_000L), times,
+            "a container unhealthy because of its configuration never recovers: restarting it every " +
+                "KODKOD_AUTOHEAL_INTERVAL forever only keeps resetting its healthcheck start_period, " +
+                "which hides the real fault",
+        )
+    }
+
+    @Test
+    fun the_wait_between_restarts_doubles() {
+        val docker = FakeDockerClient()
+        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+
+        val times = restartTimes(docker, config(monitorAll = true), cycles = 300, everyMs = 1_000)
+
+        assertEquals(
+            listOf(0L, 30_000L, 90_000L, 210_000L), times,
+            "gaps of 30s, 60s and 120s — the interval doubles with every restart that did not help",
+        )
+    }
+
+    @Test
+    fun the_wait_between_restarts_stops_growing_at_the_ceiling() {
+        val docker = FakeDockerClient()
+        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+
+        val times = restartTimes(docker, config(monitorAll = true, maxInterval = "60"), cycles = 300, everyMs = 1_000)
+
+        assertEquals(
+            listOf(0L, 30_000L, 90_000L, 150_000L, 210_000L, 270_000L), times,
+            "KODKOD_AUTOHEAL_MAX_INTERVAL caps the growth: gaps of 30s, 60s, then 60s forever",
+        )
+    }
+
+    @Test
+    fun the_backoff_resets_once_the_container_is_healthy_again() {
+        val docker = FakeDockerClient()
+        val app = json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+        docker.listed += app
+        val clock = FakeClock()
+        val autoheal = autoheal(docker, config(monitorAll = true), clock)
+
+        autoheal.runOnce()
+        clock.advance(30_000)
+        autoheal.runOnce()
+        // Recovered: a healthy container is simply absent from a `health=unhealthy` listing.
+        docker.listed.clear()
+        clock.advance(1_000)
+        autoheal.runOnce()
+        docker.listed += app
+        clock.advance(1_000)
+        autoheal.runOnce()
+
+        assertEquals(
+            listOf("restart:app", "restart:app", "restart:app"), docker.ops,
+            "the second restart bought a 60s window, but the container recovered in between — the next " +
+                "unhealthy spell is a new problem and starts from the base interval: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun counts_the_restarts_of_each_container_separately() {
+        val docker = FakeDockerClient()
+        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+        val clock = FakeClock()
+        val autoheal = autoheal(docker, config(monitorAll = true), clock)
+
+        autoheal.runOnce()
+        docker.listed += json("""{"Id":"db","Names":["/db"],"State":"running","Labels":{}}""")
+        clock.advance(30_000)
+        autoheal.runOnce()
+        clock.advance(30_000)
+        autoheal.runOnce()
+
+        assertEquals(
+            listOf("restart:app", "restart:app", "restart:db", "restart:db"), docker.ops,
+            "at 60s `app` is on its second restart and held back, while `db` — unhealthy since 30s — is " +
+                "still owed its second: one flapping container must not throttle another: ${docker.ops}",
         )
     }
 }
