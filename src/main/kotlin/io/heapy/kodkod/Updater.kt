@@ -684,10 +684,13 @@ class Updater(
         val backupName = backupName(name, target.id)
         // A replacement we failed to delete still owns [name], which is what the rollback needs back.
         var stranded: String? = null
+        // Whether the name was actually taken away from the old container yet.
+        var parked = false
 
         try {
             stopGracefully(target) // usually a no-op (already stopped in the reverse-order pass)
             api.rename(target.id, backupName)
+            parked = true
             val newId = api.create(name, body, target.platform)
             try {
                 networks.drop(1).forEach { (net, endpoint) -> api.connectNetwork(net, newId, endpoint) }
@@ -724,7 +727,7 @@ class Updater(
             // Any failure after we stopped the container must restore the original, running container.
             Log.error("[$name] recreate failed — rolling back: ${e.message}")
             rememberFailedUpdate(target)
-            rollback(target.id, name, stranded)
+            rollback(target.id, name, stranded, parked)
             throw e
         }
     }
@@ -770,7 +773,9 @@ class Updater(
         }
 
     /**
-     * Put the original container back the way it was: under [name] and running. [blockingId] is a
+     * Put the original container back the way it was: under [name] and running. [parked] says whether
+     * the rename to the backup name actually happened — a recreate that failed before it still owns
+     * its name and must not be renamed onto itself. [blockingId] is a
      * replacement that is known to still hold [name] (see [discardReplacement]) and is cleared out of
      * the way before the rename is retried — without that the service would keep running under its
      * `_kodkod_old_` backup name while a dead container owns the real one.
@@ -785,13 +790,16 @@ class Updater(
      * shutdown just killed, and running with the flag set would mean every call here fails instantly
      * and the service stays down under its backup name with nothing but log lines to show for it.
      */
-    private fun rollback(oldId: String, name: String, blockingId: String?) {
+    private fun rollback(oldId: String, name: String, blockingId: String?, parked: Boolean) {
         val interrupted = Thread.interrupted()
         if (interrupted) {
             Log.warn("[$name] rolling back on an interrupted thread — finishing the rollback before stopping")
         }
         try {
-            restoreName(oldId, name, blockingId)
+            // A recreate that failed before the rename never lost the name, and the daemon refuses to
+            // rename a container to the name it already has ("Renaming a container with the same name
+            // as its current name"). Asking anyway produced two ERRORs about a container that is fine.
+            if (parked) restoreName(oldId, name, blockingId)
             try {
                 api.start(oldId)
             } catch (e: Exception) {

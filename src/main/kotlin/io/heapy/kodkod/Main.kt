@@ -115,7 +115,7 @@ fun main() {
  * service parked under its backup name for another interval. The plan is re-checked against the daemon
  * inside [Updater.apply], since the state it was built from may have moved while an image downloaded.
  */
-private fun updateCycle(cycleLock: ReentrantLock, updater: Updater): Runnable = Runnable {
+internal fun updateCycle(cycleLock: ReentrantLock, updater: Updater): Runnable = Runnable {
     val plan = try {
         updater.plan()
     } catch (_: InterruptedException) {

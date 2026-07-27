@@ -131,6 +131,33 @@ class AutohealTest {
     }
 
     @Test
+    fun an_explicit_enable_false_opts_out_even_when_monitoring_everything() {
+        val docker = FakeDockerClient()
+        docker.unhealthy("app", labels = """{"kodkod.autoheal.enable":"false"}""")
+
+        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
+
+        assertTrue(
+            docker.ops.isEmpty(),
+            "KODKOD_AUTOHEAL_MONITOR_ALL is a default, not an override — an explicit opt-out is the only " +
+                "way to keep one container out of it: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun the_stop_window_the_restart_is_waited_for_is_the_one_that_was_asked_for() {
+        val docker = FakeDockerClient()
+        docker.unhealthy("app", labels = """{"kodkod.stop.timeout":"45"}""")
+
+        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
+
+        assertEquals(
+            listOf<Int?>(45), docker.restartExpected,
+            "the read timeout has to cover the graceful window, or a good restart reports a timeout",
+        )
+    }
+
+    @Test
     fun skips_a_container_that_is_already_restarting() {
         val docker = FakeDockerClient()
         docker.unhealthy("app", state = "restarting")

@@ -259,6 +259,27 @@ class UpdaterTest {
         )
     }
 
+    /**
+     * [resolveMounts] itself is covered in `ImageDefaultsTest`; what is covered here is that `recreate`
+     * feeds it the container's own arrays. Handing it the wrong ones would keep every one of those
+     * tests green while the replacement silently came up with fresh, empty volumes.
+     */
+    @Test
+    fun the_volumes_the_container_is_running_with_are_carried_into_the_create_body() {
+        val docker = FakeDockerClient()
+        docker.container(
+            id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
+            mounts = """[{"Type":"volume","Name":"vol0123456789","Destination":"/data","RW":true}]""",
+        )
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+
+        updater(docker).runOnce()
+
+        val mount = docker.created.single().second.obj("HostConfig")?.arr("Mounts")?.single()?.jsonObject
+        assertEquals("vol0123456789", mount?.str("Source"), "the replacement must re-attach the same volume")
+        assertEquals("/data", mount?.str("Target"), "at the destination the data is expected at")
+    }
+
     @Test
     fun recreate_puts_the_first_network_in_the_create_body_and_connects_the_rest() {
         val docker = FakeDockerClient()
@@ -1166,6 +1187,11 @@ class UpdaterTest {
             listOf<Int?>(null, null), docker.stopTimeouts,
             "with no label and no KODKOD_STOP_TIMEOUT nothing may be sent — the daemon applies Config.StopTimeout",
         )
+        assertEquals(
+            listOf<Int?>(30, 30), docker.stopExpected,
+            "but the wait we signed up for is the container's own 30s, and a read timeout sized for 10s " +
+                "would report a perfectly good stop as a failure: ${docker.stopExpected}",
+        )
     }
 
     @Test
@@ -1176,6 +1202,63 @@ class UpdaterTest {
         updater(docker).runOnce()
 
         assertEquals(listOf<Int?>(45, 45), docker.stopTimeouts, "an explicit label is an override: ${docker.stopTimeouts}")
+        assertEquals(
+            listOf<Int?>(45, 45), docker.stopExpected,
+            "and the override is what the wait is sized for too: ${docker.stopExpected}",
+        )
+    }
+
+    // --- opt-out and failure branches -------------------------------------------------------
+
+    @Test
+    fun an_explicit_enable_false_opts_out_even_when_monitoring_everything() {
+        val docker = FakeDockerClient()
+        staleWeb(docker, labels = """{"kodkod.update.enable":"false"}""")
+
+        updater(docker, config(monitorAll = true)).runOnce()
+
+        assertTrue(
+            docker.ops.isEmpty(),
+            "KODKOD_UPDATE_MONITOR_ALL is a default, not an override — an explicit opt-out is the only " +
+                "way to keep one container out of it: ${docker.ops}",
+        )
+    }
+
+    /**
+     * A stop the daemon refuses must not take the rest of the cycle with it: the dependent is one of
+     * several containers, and its dependency is still owed its update.
+     */
+    @Test
+    fun a_dependent_whose_stop_is_refused_is_reported_and_the_cycle_carries_on() {
+        val docker = FakeDockerClient()
+        dependentWeb(docker)
+        docker.failStop += "web"
+
+        val log = captureLog { updater(docker).runOnce() }
+
+        assertTrue(log.contains("[web] stop failed"), "a refused stop must be reported: $log")
+        assertOrder(docker.ops, "stop!:web", "stop:db", "create:db", "start:web")
+    }
+
+    /**
+     * The same refusal on the container being recreated is a different story: the recreate is abandoned
+     * before anything is renamed, so the rollback has nothing to rename back — and must not ask the
+     * daemon to rename the container onto the name it already holds, which is refused and would report
+     * two ERRORs about a container that never moved.
+     */
+    @Test
+    fun a_recreate_whose_stop_is_refused_rolls_back_without_touching_the_name() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.failStop += "web"
+
+        val log = captureLog { updater(docker).runOnce() }
+
+        assertTrue(docker.ops.none { it.startsWith("rename:") || it.startsWith("rename!:") }, "the name never moved: ${docker.ops}")
+        assertTrue(docker.ops.none { it.startsWith("create:") }, "nothing may be created after a failed stop: ${docker.ops}")
+        assertFalse(log.contains("could not rename"), "there was nothing to rename back: $log")
+        assertFalse(log.contains("ROLLBACK INCOMPLETE"), "the container is exactly where it was: $log")
+        assertTrue(log.contains("recreate failed — rolling back"), "the abandoned update still has to be reported: $log")
     }
 
     @Test
@@ -1635,6 +1718,8 @@ private fun FakeDockerClient.container(
     labels: String = "{}",
     hostConfig: String = "{}",
     networks: String = "{}",
+    /** Top-level `Mounts[]`, the only place an anonymous volume's generated name appears. */
+    mounts: String = "[]",
     configMacAddress: String? = null,
     configStopTimeout: Int? = null,
     imageManifestPlatform: String? = null,
@@ -1653,7 +1738,7 @@ private fun FakeDockerClient.container(
             """"HostConfig":$hostConfig,"NetworkSettings":{"Networks":$networks}}""",
     ).jsonObject
     containers[id] = Json.parseToJsonElement(
-        """{"Name":"/$name","Image":"$currentImageId",""" +
+        """{"Name":"/$name","Image":"$currentImageId","Mounts":$mounts,""" +
             """"Config":{"Image":"$imageRef","Labels":$labels$mac$stopTimeout},""" +
             """"HostConfig":$hostConfig,"NetworkSettings":{"Networks":$networks}$manifest}""",
     ).jsonObject
