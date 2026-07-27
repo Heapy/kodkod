@@ -246,13 +246,23 @@ class FakeDockerClient : DockerClient {
      * answer to the name [rename] last gave them, are running until [stop] (or a [startedThenExits]
      * start) says otherwise, and report `State.Health.Status` from [health]. Any other `State` field the
      * test registered is passed through.
+     *
+     * [ref] is resolved the way `GET /containers/{id}/json` resolves it — full id, name, or id prefix —
+     * because that is what a `container:<ref>` network mode is followed with. A fake that only answered
+     * to full ids made "the reference names a container that is gone" and "the reference is spelled as a
+     * name, so it now resolves to the replacement" indistinguishable: both came back as a fixture error.
      */
-    override fun inspectContainer(id: String): JsonObject {
-        if (id in failInspect) throw DockerException(500, "fake: inspect failure for '$id'")
-        // A container the daemon has forgotten answers 404, which is an answer; an id no test ever
+    override fun inspectContainer(ref: String): JsonObject {
+        if (ref in failInspect) throw DockerException(500, "fake: inspect failure for '$ref'")
+        // A container the daemon has forgotten answers 404, which is an answer; a reference no test ever
         // registered is a broken fixture and must not be mistaken for one.
-        if (id in removed) throw DockerException(404, "fake: no such container: $id")
-        val stored = containers[id] ?: error("fake: no container registered for id '$id'")
+        val id = resolveRef(ref)
+            ?: if (removed.any { it == ref || (ref.length >= 4 && it.startsWith(ref)) }) {
+                throw DockerException(404, "fake: no such container: $ref")
+            } else {
+                error("fake: no container registered for id '$ref'")
+            }
+        val stored = containers[id] ?: error("fake: no container registered for id '$ref'")
         val storedState = stored.obj("State") ?: EMPTY_OBJECT
         val alive = running[id] ?: storedState["Running"]?.jsonPrimitive?.booleanOrNull ?: true
         val declaredHealth = health[id]
@@ -319,17 +329,23 @@ class FakeDockerClient : DockerClient {
      */
     private fun requireNamespaceProvider(id: String) {
         val ref = netnsRef(containers[id]?.obj("HostConfig")) ?: return
-        val provider = netnsProvider(ref) ?: throw DockerException(404, "fake: no such container: $ref")
+        val provider = resolveRef(ref) ?: throw DockerException(404, "fake: no such container: $ref")
         if (!isRunning(provider)) {
             throw DockerException(500, "fake: cannot join network of a non running container: $ref")
         }
     }
 
-    /** The container a `container:<ref>` names, resolved the way the daemon does: by id, prefix or name. */
-    private fun netnsProvider(ref: String): String? =
-        (containers.keys + renamed.keys).firstOrNull {
-            it !in removed && (it == ref || nameOf(it) == ref || (ref.length >= 4 && it.startsWith(ref)))
-        }
+    /**
+     * The container a reference names, resolved the way the daemon does: by full id, by name, or by id
+     * prefix — in that order, so a fixture in which one container's name is another's id resolves the
+     * way the daemon's index would rather than the way the map happens to be ordered.
+     */
+    private fun resolveRef(ref: String): String? {
+        val live = (containers.keys + renamed.keys).filterNot { it in removed }
+        return live.firstOrNull { it == ref }
+            ?: live.firstOrNull { nameOf(it) == ref }
+            ?: live.firstOrNull { ref.length >= 4 && it.startsWith(ref) }
+    }
 
     /** Whether the daemon still knows [id] and reports it running — this fake's lifecycle model wins. */
     private fun isRunning(id: String): Boolean {

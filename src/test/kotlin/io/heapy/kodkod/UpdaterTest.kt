@@ -1950,6 +1950,49 @@ class UpdaterTest {
     }
 
     /**
+     * How the reference is *spelled* is what decides this, not whether the provider moved. A
+     * `container:<name>` reference survives its provider being replaced — the replacement takes the name
+     * over, so the daemon resolves it to the container that is now serving — and the consumer this cycle
+     * left stopped is one `start` from being back on a live namespace. Rebuilding it instead would
+     * destroy and re-create a container to reach the state a single call already reaches.
+     */
+    @Test
+    fun a_consumer_that_names_its_provider_is_started_again_even_though_the_provider_moved() {
+        val docker = FakeDockerClient()
+        staleProviderWithSidecar(
+            docker,
+            sidecarLabels = """{"kodkod.update.enable":"true","com.docker.compose.project":"proj"}""",
+            sidecarHostConfig = """{"NetworkMode":"container:app"}""",
+        )
+        docker.failCreate += "side"
+        docker.failStart += "side"
+        val updater = updater(docker, config(monitorAll = false))
+
+        val log = captureLog { updater.runOnce() }
+
+        assertTrue(
+            docker.ops.contains("remove:$PROVIDER_ID"),
+            "the test is worthless unless the provider really was replaced: ${docker.ops}",
+        )
+        assertTrue(
+            log.contains("a `start` is all it needs"),
+            "the name resolves to the replacement, so the container it is joined to is alive: $log",
+        )
+
+        val afterFirstCycle = docker.ops.size
+        docker.failStart -= "side" // whatever refused the start is over
+        val second = captureLog { updater.runOnce() }
+
+        assertEquals(
+            listOf("start:side"), docker.ops.drop(afterFirstCycle).filter { it.endsWith(":side") },
+            "one call is what this container needed, and it is the original that comes back — not a " +
+                "replacement built from an image ref that failed here a cycle ago: ${docker.ops}",
+        )
+        assertTrue(running(docker, "side"), "and it has to be serving again: ${docker.ops}")
+        assertTrue(second.contains("started again"), "which is what the operator is told: $second")
+    }
+
+    /**
      * "The container it names still exists" is not the same question as "its namespace is still the
      * provider's". A recreate whose final `remove` the daemon refused leaves the old provider behind,
      * stopped, under its `_kodkod_old_` backup name — so the consumer's reference still resolves, to a

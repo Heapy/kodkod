@@ -126,6 +126,29 @@ class FakeDockerClientTest {
         assertEquals(404, gone.status, "and it answers 404, not a fixture error")
     }
 
+    /**
+     * An inspect resolves a reference the way the daemon does, because that is how a `container:<ref>`
+     * network mode is followed: whether the namespace a stopped container names is still there is asked
+     * by inspecting that very reference. Answering only to full ids made a reference spelled as a *name*
+     * — which the replacement takes over, so it still resolves — read as a broken fixture.
+     */
+    @Test
+    fun an_inspect_resolves_a_reference_by_id_name_or_prefix() {
+        docker.containers["abcdef123456"] = json("""{"Name":"/web"}""")
+
+        assertEquals("/web", docker.inspectContainer("abcdef123456").str("Name"), "by full id")
+        assertEquals("/web", docker.inspectContainer("web").str("Name"), "by the name it answers to")
+        assertEquals("/web", docker.inspectContainer("abcd").str("Name"), "by id prefix")
+
+        docker.rename("abcdef123456", "web${BACKUP_MARKER}abcdef123456")
+
+        assertThrows(IllegalStateException::class.java, { docker.inspectContainer("web") },
+            "a name the container no longer answers to is not a name the daemon's index knows")
+        docker.remove("abcdef123456", force = true)
+        val gone = assertThrows(DockerException::class.java) { docker.inspectContainer("abcd") }
+        assertEquals(404, gone.status, "and a prefix of a container that was destroyed is a 404, not a fixture error")
+    }
+
     @Test
     fun a_created_container_is_listed_as_created_and_becomes_running_when_started() {
         val id = docker.create("web", json("""{"Image":"app:1","Labels":{"a":"b"}}"""), platform = null)
