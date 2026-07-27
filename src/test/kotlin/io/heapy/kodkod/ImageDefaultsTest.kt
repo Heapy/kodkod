@@ -246,6 +246,62 @@ class ImageDefaultsTest {
     }
 
     @Test
+    fun buildContainerConfig_restamps_the_compose_image_label_with_the_new_id() {
+        val result = buildContainerConfig(
+            jsonObj(
+                """
+                {
+                  "Image":"app:1",
+                  "Labels":{
+                    "com.docker.compose.project":"stack",
+                    "com.docker.compose.image":"sha256:OLD",
+                    "com.docker.compose.config-hash":"h1"
+                  }
+                }
+                """.trimIndent(),
+            ),
+            imageConfig = null,
+            hostConfig = null,
+            oldId = "id",
+            imageRef = "app:2",
+            newComposeImageId = "sha256:NEW",
+        )
+
+        val labels = result.obj("Labels")!!
+        assertEquals("sha256:NEW", labels.label("com.docker.compose.image"))
+        // The hash covers the compose file's service definition, which kodkod never edits.
+        assertEquals("h1", labels.label("com.docker.compose.config-hash"))
+        assertEquals("stack", labels.label("com.docker.compose.project"))
+    }
+
+    @Test
+    fun buildContainerConfig_copies_the_compose_image_label_when_the_image_did_not_change() {
+        val result = buildContainerConfig(
+            jsonObj("""{"Image":"app:1","Labels":{"com.docker.compose.image":"sha256:OLD"}}"""),
+            imageConfig = null,
+            hostConfig = null,
+            oldId = "id",
+            imageRef = "app:1",
+        )
+
+        assertEquals("sha256:OLD", result.obj("Labels").label("com.docker.compose.image"))
+    }
+
+    @Test
+    fun buildContainerConfig_does_not_invent_a_compose_image_label() {
+        val result = buildContainerConfig(
+            jsonObj("""{"Image":"app:1","Labels":{"custom":"x"}}"""),
+            imageConfig = null,
+            hostConfig = null,
+            oldId = "id",
+            imageRef = "app:2",
+            newComposeImageId = "sha256:NEW",
+        )
+
+        assertEquals(jsonObj("""{"custom":"x"}"""), result["Labels"])
+    }
+
+    @Test
     fun buildCreateBody_includes_only_the_first_network() {
         val body = buildCreateBody(
             containerConfig = jsonObj("""{"Image":"app:1"}"""),

@@ -5,6 +5,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -161,6 +162,80 @@ class UpdaterTest {
         val endpoints = body.obj("NetworkingConfig")?.obj("EndpointsConfig")
         assertEquals(setOf("frontend"), endpoints?.keys, "only the first network belongs in the create body")
         assertTrue(docker.ops.contains("connect:backend:new-web-0"), "the rest are connected after create: ${docker.ops}")
+    }
+
+    // --- com.docker.compose.image ---------------------------------------------------------
+
+    @Test
+    fun recreate_stamps_the_new_image_id_into_the_compose_image_label() {
+        val docker = FakeDockerClient()
+        docker.container(
+            id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
+            labels = """{"com.docker.compose.image":"sha256:old","com.docker.compose.config-hash":"h1"}""",
+        )
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+
+        Updater(docker, config(), selfId = null).runOnce()
+
+        val labels = docker.created.single().second.obj("Labels")!!
+        assertEquals(
+            "sha256:new", labels.label("com.docker.compose.image"),
+            "a stale label makes the next `compose up` recreate the container kodkod just updated",
+        )
+        assertEquals("h1", labels.label("com.docker.compose.config-hash"), "the config hash describes the compose file we did not touch")
+    }
+
+    @Test
+    fun the_compose_image_label_is_stamped_on_the_registry_digest_path_too() {
+        val docker = FakeDockerClient()
+        docker.container(
+            id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
+            labels = """{"com.docker.compose.image":"sha256:old"}""",
+        )
+        docker.distribution["nginx:1.27"] = "sha256:remote"
+        // The local repo:tag already resolves to a newer image, so this path never pulls.
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":["nginx@sha256:remote"]}""")
+
+        Updater(docker, config(), selfId = null).runOnce()
+
+        val labels = docker.created.single().second.obj("Labels")!!
+        assertEquals("sha256:new", labels.label("com.docker.compose.image"))
+    }
+
+    @Test
+    fun a_container_recreated_for_a_dependency_keeps_its_compose_image_label() {
+        val docker = FakeDockerClient()
+        // db's image moved; web is up to date but --link'ed to db, so it is recreated, not updated.
+        docker.container(id = "db", imageRef = "db:1", currentImageId = "sha256:db-old")
+        docker.container(
+            id = "web", imageRef = "web:1", currentImageId = "sha256:web-old",
+            currentRepoDigests = listOf("web@sha256:web-remote"),
+            labels = """{"com.docker.compose.image":"sha256:web-old"}""",
+            hostConfig = """{"Links":["/db:/web/db"]}""",
+        )
+        docker.distribution["db:1"] = "sha256:db-remote"
+        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
+        docker.distribution["web:1"] = "sha256:web-remote"
+
+        Updater(docker, config(), selfId = null).runOnce()
+
+        val web = docker.created.single { (name, _) -> name == "web" }.second
+        assertEquals(
+            "sha256:web-old", web.obj("Labels").label("com.docker.compose.image"),
+            "web's own image did not change — the label must be copied verbatim",
+        )
+    }
+
+    @Test
+    fun a_container_without_compose_labels_does_not_get_one_invented() {
+        val docker = FakeDockerClient()
+        docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+
+        Updater(docker, config(), selfId = null).runOnce()
+
+        val body = docker.created.single().second
+        assertNull(body.obj("Labels").label("com.docker.compose.image"), "kodkod must not fabricate compose metadata: $body")
     }
 
     // --- rollback -------------------------------------------------------------------------

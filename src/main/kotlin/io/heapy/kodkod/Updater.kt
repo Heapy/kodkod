@@ -149,6 +149,7 @@ class Updater(
                         continue
                     } else {
                         Log.warn("[${target.name}] update available (${target.currentImageId.shortId()} -> ${localImageId.shortId()})")
+                        target.newImageId = localImageId
                         target.stale = true
                         continue
                     }
@@ -163,6 +164,7 @@ class Updater(
                         Log.info("[${target.name}] already up to date")
                     else -> {
                         Log.warn("[${target.name}] update available (${target.currentImageId.shortId()} -> ${newImageId.shortId()})")
+                        target.newImageId = newImageId
                         target.stale = true
                     }
                 }
@@ -229,6 +231,9 @@ class Updater(
             target.id,
             networks.firstOrNull(),
             subtractImageDefaultsByKey = subtractByKey,
+            // Only an actual image update restamps the compose label; a container recreated because a
+            // create-time dependency moved still runs the image its label already names.
+            newComposeImageId = if (target.stale) target.newImageId else null,
         )
         val backupName = "${name}_kodkod_old_${target.id.take(12)}"
         val timeout = stopTimeout(target)
@@ -364,6 +369,12 @@ internal class Target(
 
     /** The running image's defaults, captured before pulling so a moved tag cannot erase them. */
     var oldImageConfig: JsonObject? = null
+
+    /**
+     * Local image id the tag resolves to now — set exactly when [stale] is set, since a target that
+     * could not be resolved to a new id is never marked stale. Restamps `com.docker.compose.image`.
+     */
+    var newImageId: String? = null
 
     val toRecreate: Boolean get() = stale || linkedToRecreate
 

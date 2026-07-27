@@ -77,6 +77,37 @@ internal fun structMapSubtract(container: JsonObject?, image: JsonObject?): Json
     return JsonObject(container.filterKeys { it !in img })
 }
 
+/**
+ * Compose's record of the local image id its service currently resolves to — a verbatim copy of the
+ * container's `Image` field at create time.
+ */
+internal const val COMPOSE_IMAGE_LABEL = "com.docker.compose.image"
+
+/**
+ * Restamp [COMPOSE_IMAGE_LABEL] with the id kodkod just resolved the tag to.
+ *
+ * Carrying the *old* id into the replacement is what makes the next `docker compose up` decide the
+ * service drifted and recreate the container kodkod had just updated — the label, not the image ref, is
+ * what compose compares. Only a real image update ([Target.stale]) restamps: a container recreated
+ * because a create-time dependency changed still runs the same image, so its label is already correct.
+ *
+ * The sibling `com.docker.compose.config-hash` is deliberately **copied verbatim**. It hashes the
+ * *service definition in the compose file*, which kodkod never touches; restamping it would paper over
+ * a genuine drift between the running container and the compose file. Leaving it alone is only safe
+ * because the rest of the create body faithfully reproduces the container — otherwise compose would
+ * consider the service converged while kodkod had silently dropped part of its configuration.
+ *
+ * A container without the label (not managed by compose) never gets one invented.
+ */
+private fun restampComposeImage(
+    labels: JsonObject,
+    containerLabels: JsonObject?,
+    newComposeImageId: String?,
+): JsonObject {
+    if (newComposeImageId == null || containerLabels?.containsKey(COMPOSE_IMAGE_LABEL) != true) return labels
+    return JsonObject(labels + (COMPOSE_IMAGE_LABEL to JsonPrimitive(newComposeImageId)))
+}
+
 /** `ExposedPorts` = (container ports not declared by the image) plus every published `PortBindings` key. */
 internal fun mergeExposedPorts(
     containerPorts: JsonObject?,
@@ -94,6 +125,9 @@ internal fun mergeExposedPorts(
  * Build the create-time `Config` for the replacement: copy the running container's `Config`, drop the
  * fields the old image contributed (so the new image's defaults win), and swap in the new image ref.
  * Pure — no Docker calls.
+ *
+ * [newComposeImageId] is the local image id the tag now resolves to, passed only when this container's
+ * own image changed; see [restampComposeImage].
  */
 internal fun buildContainerConfig(
     containerConfig: JsonObject,
@@ -102,6 +136,7 @@ internal fun buildContainerConfig(
     oldId: String,
     imageRef: String,
     subtractImageDefaultsByKey: Boolean = false,
+    newComposeImageId: String? = null,
 ): JsonObject {
     val networkMode = hostConfig?.str("NetworkMode").orEmpty()
     val isContainerMode = networkMode.startsWith("container:")
@@ -146,7 +181,9 @@ internal fun buildContainerConfig(
                     stringMapSubtractKeys(value as? JsonObject, imageConfig?.obj("Labels"))
                 } else {
                     stringMapSubtract(value as? JsonObject, imageConfig?.obj("Labels"))
-                }.let { if (it.isNotEmpty()) put("Labels", it) }
+                }
+                    .let { restampComposeImage(it, value as? JsonObject, newComposeImageId) }
+                    .let { if (it.isNotEmpty()) put("Labels", it) }
                 "Volumes" -> structMapSubtract(value as? JsonObject, imageConfig?.obj("Volumes"))
                     .let { if (it.isNotEmpty()) put("Volumes", it) }
                 "WorkingDir" -> if (subtractImageDefaultsByKey) {
@@ -182,6 +219,7 @@ internal fun buildCreateBody(
     oldId: String,
     firstNetwork: Pair<String, JsonObject>?,
     subtractImageDefaultsByKey: Boolean = false,
+    newComposeImageId: String? = null,
 ): JsonObject = buildJsonObject {
     buildContainerConfig(
         containerConfig,
@@ -190,6 +228,7 @@ internal fun buildCreateBody(
         oldId,
         imageRef,
         subtractImageDefaultsByKey,
+        newComposeImageId,
     ).forEach { (k, v) -> put(k, v) }
     if (hostConfig != null) put("HostConfig", hostConfig)
     if (firstNetwork != null) {

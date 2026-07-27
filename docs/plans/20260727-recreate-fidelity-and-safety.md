@@ -279,16 +279,19 @@ max-adversarial ревью репозитория дало 15 подтвержд
 - Modify: `src/test/kotlin/io/heapy/kodkod/ImageDefaultsTest.kt`
 - Modify: `src/test/kotlin/io/heapy/kodkod/UpdaterTest.kt`
 
-- [ ] тест-на-баг в `ImageDefaultsTest`: create-body для stale-контейнера с лейблом
+- [x] тест-на-баг в `ImageDefaultsTest`: create-body для stale-контейнера с лейблом
       `com.docker.compose.image=sha256:OLD` и новым образом `sha256:NEW` обязан содержать `sha256:NEW`
-- [ ] тест-на-баг в `UpdaterTest`: после `runOnce()` тело `create` содержит новый image id в лейбле
-- [ ] добавить `Target.newImageId`, заполнять его в обеих ветках `markStale` (registry-digest и pull)
-- [ ] прокинуть `newImageId` в `buildCreateBody`/`buildContainerConfig`: при `stale == true` лейбл переписывается,
+- [x] тест-на-баг в `UpdaterTest`: после `runOnce()` тело `create` содержит новый image id в лейбле
+      (два теста: pull-ветка и registry-digest-ветка)
+- [x] добавить `Target.newImageId`, заполнять его в обеих ветках `markStale` (registry-digest и pull)
+- [x] прокинуть `newImageId` в `buildCreateBody`/`buildContainerConfig`: при `stale == true` лейбл переписывается,
       иначе копируется дословно (ветки «id неизвестен» не существует — без нового id цель не становится stale)
-- [ ] зафиксировать в комментарии решение по `com.docker.compose.config-hash`: копируется дословно и почему
-- [ ] тесты на граничные случаи: контейнер без compose-лейблов; recreate по зависимости (не stale) — лейбл
+- [x] зафиксировать в комментарии решение по `com.docker.compose.config-hash`: копируется дословно и почему
+      (KDoc `restampComposeImage` в `ImageDefaults.kt`)
+- [x] тесты на граничные случаи: контейнер без compose-лейблов; recreate по зависимости (не stale) — лейбл
       сохраняется байт-в-байт
-- [ ] прогнать тесты — до фикса красные, после зелёные
+- [x] прогнать тесты — до фикса красные, после зелёные (редность проверена нейтрализацией `restampComposeImage`:
+      3 теста-на-баг падают, оба граничных остаются зелёными; затем полная сюита 96/96 зелёная)
 
 ### Task 5: E2E — повторный `compose up` не должен пересоздавать сервис
 
