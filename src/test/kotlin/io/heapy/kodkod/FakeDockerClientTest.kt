@@ -358,7 +358,10 @@ class FakeDockerClientTest {
 
         assertEquals("new-web-0", plain)
         assertEquals("/web", docker.inspectContainer(plain).str("Name"), "the daemon knows what it just created")
-        assertTrue(running(plain))
+        // `docker create` leaves the container in state `created`: it exists, it is inspectable, and it
+        // is not running. This used to assert the opposite, which let the liveness gate pass a
+        // replacement nothing had started. DockerClientContract pins it against a real daemon now.
+        assertFalse(running(plain), "a container that was created and not started is not running")
         assertEquals("new-db-1", described)
         assertTrue(
             docker.inspectContainer(described).obj("State")!!["Restarting"]!!.jsonPrimitive.booleanOrNull!!,

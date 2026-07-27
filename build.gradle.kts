@@ -6,6 +6,10 @@ plugins {
     kotlin("plugin.serialization").version("2.4.10")
     application
     `jvm-test-suite`
+    // The DockerClient contract suite has to be visible to BOTH test source sets: `test` runs it
+    // against FakeDockerClient, `e2eTest` against DockerApi on a real daemon. Test fixtures are the
+    // one place both can see, and they are packaged separately from the production jar.
+    `java-test-fixtures`
 }
 
 group = "io.heapy"
@@ -20,6 +24,11 @@ repositories {
 
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationVersion")
+
+    // The contract suite is JUnit tests over DockerClient, so it needs both on its own classpath;
+    // main exposes serialization only as `implementation`, hence the re-declaration.
+    testFixturesImplementation("org.junit.jupiter:junit-jupiter-api:$junitVersion")
+    testFixturesImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationVersion")
 }
 
 testing {
@@ -36,6 +45,9 @@ testing {
                 // The recorder calls DockerApi (which returns kotlinx JsonObject) and writes fixture
                 // JSON; main exposes these only as `implementation`, so re-declare for this suite.
                 implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationVersion")
+                // The same DockerClient contract `test` runs against the fake, run here against a
+                // real daemon — that pairing is the whole point of putting it in fixtures.
+                implementation(testFixtures(project()))
             }
 
             targets.all {

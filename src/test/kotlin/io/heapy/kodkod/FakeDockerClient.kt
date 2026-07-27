@@ -138,6 +138,15 @@ class FakeDockerClient : DockerClient {
     /** Ids [remove] deleted — they hold no name any more, so a [rename] onto it is free to succeed. */
     private val removed = mutableSetOf<String>()
 
+    /**
+     * Ids [create] made that nothing has started yet. The daemon calls that state `created`: the
+     * container exists and is inspectable, but it is not running and never has been. Without this the
+     * fake's own two answers disagreed — the listing said `created` while the inspect said
+     * `Running: true` — so the liveness gate could pass a replacement that was never started, and the
+     * reconcile pass could not tell a replacement that never ran from one that ran and was stopped.
+     */
+    private val neverStarted = mutableSetOf<String>()
+
     private var createSeq = 0
 
     /** Record `<verb>:<arg>` once [call] returned, or `<verb>!:<arg>` if it threw. */
@@ -264,7 +273,7 @@ class FakeDockerClient : DockerClient {
             }
         val stored = containers[id] ?: error("fake: no container registered for id '$ref'")
         val storedState = stored.obj("State") ?: EMPTY_OBJECT
-        val alive = running[id] ?: storedState["Running"]?.jsonPrimitive?.booleanOrNull ?: true
+        val alive = if (id in neverStarted) false else running[id] ?: storedState["Running"]?.jsonPrimitive?.booleanOrNull ?: true
         val declaredHealth = health[id]
         val started = startedAt[id]
         // What this fake models itself wins over the registered payload; everything else passes through.
@@ -292,6 +301,7 @@ class FakeDockerClient : DockerClient {
             restartExpected += expectedStopSeconds
             if (id in failRestart) throw DockerException(500, "fake: restart failure for '$id'")
             requireNamespaceProvider(id)
+            neverStarted -= id
             running[id] = id !in startedThenExits
             startedAt[id] = clock.millis()
         }
@@ -310,6 +320,7 @@ class FakeDockerClient : DockerClient {
         op("start", id) {
             if (id in failStart) throw DockerException(500, "fake: start failure for '$id'")
             requireNamespaceProvider(id)
+            neverStarted -= id
             running[id] = id !in startedThenExits
             startedAt[id] = clock.millis()
             if (id in vanishesAfterStart) {
@@ -350,6 +361,7 @@ class FakeDockerClient : DockerClient {
     /** Whether the daemon still knows [id] and reports it running — this fake's lifecycle model wins. */
     private fun isRunning(id: String): Boolean {
         if (id in removed || id !in containers) return false
+        if (id in neverStarted) return false
         running[id]?.let { return it }
         containers[id]?.obj("State")?.get("Running")?.jsonPrimitive?.booleanOrNull?.let { return it }
         return (listed.firstOrNull { it.str("Id") == id }?.str("State") ?: "running") == "running"
@@ -383,6 +395,7 @@ class FakeDockerClient : DockerClient {
             running.remove(id)
             startedAt.remove(id)
             renamed.remove(id)
+            neverStarted -= id
             containers.remove(id)
             listed.removeAll { it.str("Id") == id }
             removed += id
@@ -410,6 +423,7 @@ class FakeDockerClient : DockerClient {
             // gate) gets an answer. A payload the test registered for this id up front wins, which is how
             // a test asks for a replacement that comes up `Restarting`.
             containers.getOrPut(id) { inspectOf(id, name, body) }
+            neverStarted += id
             // And it appears in listings — as `created` until something starts it. Without this a later
             // pass (a second cycle's discovery, the daemon-wide scan for create-time dependents) cannot
             // see the container that was just made, so tests of "do not touch it twice" cannot fail.
