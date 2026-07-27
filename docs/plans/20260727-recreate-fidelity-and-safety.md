@@ -316,20 +316,23 @@ max-adversarial ревью репозитория дало 15 подтвержд
 - Modify: `src/e2eTest/kotlin/io/heapy/kodkod/e2e/KodkodE2eTest.kt`
 - Modify: `e2e/compose.update.yml`
 
-- [ ] тест-на-баг №1 (compose `volumes: ["/data"]`): `HostConfig.Mounts=[{Type:volume,Source:"",Target:"/data"}]`
+- [x] тест-на-баг №1 (compose `volumes: ["/data"]`): `HostConfig.Mounts=[{Type:volume,Source:"",Target:"/data"}]`
       + top-level `Mounts=[{Type:volume,Name:"vol123",Destination:"/data"}]` → create-body обязан содержать
       `Source: "vol123"`
-- [ ] тест-на-баг №2 (`VOLUME` в образе / `docker run -v /data`): в `HostConfig` записи нет вовсе, том виден только
+- [x] тест-на-баг №2 (`VOLUME` в образе / `docker run -v /data`): в `HostConfig` записи нет вовсе, том виден только
       в top-level `Mounts` → create-body обязан получить синтезированную запись `HostConfig.Mounts`
-- [ ] написать чистую функцию `resolveMounts(inspectMounts, hostConfig)`: идёт **от top-level `Mounts[]`**,
+- [x] написать чистую функцию `resolveMounts(inspectMounts, hostConfig)`: идёт **от top-level `Mounts[]`**,
       синтезирует/дополняет записи `HostConfig.Mounts`, эмитит только `Type`/`Source`/`Target`/`ReadOnly`
       (остальные ключи top-level невалидны для `/containers/create` и дадут 400)
-- [ ] вызвать её в `Updater.recreate` рядом с `resolveHostConfig`
-- [ ] тесты на граничные случаи: legacy `Binds` покрывает тот же `Destination` (дубликат не создаём), именованный
-      том (не меняется), bind-mount и tmpfs (не трогаем), запись без `Name` (пропускаем)
-- [ ] e2e: сервис с `volumes: ["/data"]`, запись файла в `/data`, обновление образа kodkod'ом, ассерт что файл жив
-      и имя тома то же
-- [ ] прогнать `./gradlew test` и целевой e2e — зелёные
+- [x] вызвать её в `Updater.recreate` рядом с `resolveHostConfig`
+- [x] тесты на граничные случаи: legacy `Binds` покрывает тот же `Destination` (дубликат не создаём), именованный
+      том (не меняется, включая `VolumeOptions`), bind-mount и tmpfs (не трогаем), запись без `Name` (пропускаем),
+      том `RW=false` → `ReadOnly=true`
+- [x] e2e: сервис с `volumes: ["/data"]`, запись файла в `/data`, обновление образа kodkod'ом, ассерт что файл жив
+      и имя тома то же (сервис `vol` в `compose.update.yml`,
+      `anonymousVolumeIsInheritedByTheRecreatedContainer`)
+- [x] прогнать `./gradlew test` и целевой e2e — зелёные (unit-тесты подтверждены красными на заглушке
+      `resolveMounts`; «красный до фикса» для e2e, как и в задаче 5, проверяется вручную и тест не гейтит)
 
 ### Task 7: Сохранять `MacAddress` и `GwPriority` в endpoint'е
 

@@ -221,7 +221,12 @@ class Updater(
             }
         }
 
-        val hostConfig = resolveHostConfig(target.inspect.obj("HostConfig"), target.networkModeContainerName)
+        // The anonymous volumes the container is running with are only named in the top-level `Mounts[]`,
+        // so they are re-attached explicitly; without that the replacement gets fresh empty volumes.
+        val hostConfig = resolveMounts(
+            target.inspect.arr("Mounts"),
+            resolveHostConfig(target.inspect.obj("HostConfig"), target.networkModeContainerName),
+        )
         val networks = networkEndpoints(target.inspect, hostConfig, target.id)
         val body = buildCreateBody(
             containerConfig,

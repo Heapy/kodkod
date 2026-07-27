@@ -12,6 +12,17 @@ services:
     healthcheck:
       interval: 5s
 
+  # An anonymous volume: compose records only the destination, the daemon generates the volume name.
+  # Recreating this service from HostConfig alone would silently hand it a fresh, empty volume.
+  vol:
+    image: 127.0.0.1:5000/testapp:latest
+    labels:
+      kodkod.update.enable: "true"
+    volumes:
+      - /data
+    healthcheck:
+      interval: 5s
+
   kodkod:
     image: kodkod:e2e
     volumes:

@@ -4,6 +4,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
@@ -76,6 +77,77 @@ internal fun structMapSubtract(container: JsonObject?, image: JsonObject?): Json
     val img = image ?: EMPTY_OBJECT
     return JsonObject(container.filterKeys { it !in img })
 }
+
+/**
+ * Carry the volumes a container is actually using into the replacement's `HostConfig.Mounts`.
+ *
+ * An anonymous volume is only fully described by the container's **top-level** `Mounts[]` — that is the
+ * one place the generated volume `Name` appears. `HostConfig` either names the destination with an empty
+ * `Source` (compose's `volumes: ["/data"]`), or does not mention it at all (the image declared `VOLUME`,
+ * or `docker run -v /data`, where the path lives in `Config.Volumes` and [structMapSubtract] drops it as
+ * an image default). Recreating from `HostConfig` alone therefore hands the new container a *fresh* empty
+ * volume and orphans the old data — the database-loses-its-data failure.
+ *
+ * So the resolver is driven from [inspectMounts]: every `Type=volume` entry with a non-empty `Name` whose
+ * `Destination` is not already covered by `HostConfig.Mounts`/`Binds` becomes an explicit mount of that
+ * volume. Existing entries are completed in place (their `Source` filled in) and otherwise kept verbatim,
+ * since whatever else they carry — `VolumeOptions`, `BindOptions` — was already accepted at create time.
+ *
+ * Synthesized entries emit **only** `Type`/`Source`/`Target`/`ReadOnly`: the remaining top-level keys
+ * (`Destination`, `Name`, `Mode`, `Propagation`, `RW`) are not part of the `HostConfig.Mounts` schema and
+ * `/containers/create` rejects unknown fields with a 400. Binds, tmpfs and anonymous entries without a
+ * `Name` are left alone — there is nothing to inherit.
+ */
+internal fun resolveMounts(
+    inspectMounts: JsonArray?,
+    hostConfig: JsonObject?,
+): JsonObject? {
+    if (inspectMounts.isNullOrEmpty()) return hostConfig
+
+    val declared = hostConfig?.arr("Mounts")?.mapNotNull { it as? JsonObject } ?: emptyList()
+    val boundTargets = hostConfig?.arr("Binds")
+        ?.mapNotNull { it.jsonPrimitive.contentOrNull?.bindTarget() }
+        ?.toSet()
+        ?: emptySet()
+    val indexByTarget = HashMap<String, Int>()
+    declared.forEachIndexed { index, mount -> mount.str("Target")?.let { indexByTarget.putIfAbsent(it, index) } }
+
+    val resolved = declared.toMutableList()
+    var changed = false
+    for (element in inspectMounts) {
+        val mount = element as? JsonObject ?: continue
+        if (mount.str("Type") != "volume") continue
+        val name = mount.str("Name")?.takeIf { it.isNotEmpty() } ?: continue
+        val target = mount.str("Destination")?.takeIf { it.isNotEmpty() } ?: continue
+
+        val declaredIndex = indexByTarget[target]
+        if (declaredIndex != null) {
+            val spec = resolved[declaredIndex]
+            if (!spec.str("Source").isNullOrEmpty()) continue
+            resolved[declaredIndex] = JsonObject(spec + ("Source" to JsonPrimitive(name)))
+            changed = true
+            continue
+        }
+        if (target in boundTargets) continue
+        resolved += buildJsonObject {
+            put("Type", JsonPrimitive("volume"))
+            put("Source", JsonPrimitive(name))
+            put("Target", JsonPrimitive(target))
+            put("ReadOnly", JsonPrimitive(mount["RW"]?.jsonPrimitive?.booleanOrNull == false))
+        }
+        changed = true
+    }
+    if (!changed) return hostConfig
+
+    return buildJsonObject {
+        hostConfig?.forEach { (key, value) -> if (key != "Mounts") put(key, value) }
+        put("Mounts", JsonArray(resolved))
+    }
+}
+
+/** Destination of a legacy `Binds` entry: `source:/target[:opts]`. */
+private fun String.bindTarget(): String? =
+    split(':').getOrNull(1)?.takeIf { it.isNotEmpty() }
 
 /**
  * Compose's record of the local image id its service currently resolves to — a verbatim copy of the

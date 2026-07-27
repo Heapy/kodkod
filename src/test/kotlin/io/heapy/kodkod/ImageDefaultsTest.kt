@@ -301,6 +301,133 @@ class ImageDefaultsTest {
         assertEquals(jsonObj("""{"custom":"x"}"""), result["Labels"])
     }
 
+    private fun createBodyMounts(inspectMounts: JsonArray, hostConfig: JsonObject?): JsonArray? {
+        val body = buildCreateBody(
+            containerConfig = jsonObj("""{"Image":"app:1"}"""),
+            imageConfig = null,
+            hostConfig = resolveMounts(inspectMounts, hostConfig),
+            imageRef = "app:2",
+            oldId = "id",
+            firstNetwork = null,
+        )
+        return body.obj("HostConfig")?.arr("Mounts")
+    }
+
+    @Test
+    fun resolveMounts_names_the_volume_of_an_anonymous_compose_mount() {
+        // compose `volumes: ["/data"]` records the destination but leaves the source for the daemon to fill.
+        val mounts = createBodyMounts(
+            jsonArr(
+                """
+                [{
+                  "Type":"volume",
+                  "Name":"vol123",
+                  "Source":"/var/lib/docker/volumes/vol123/_data",
+                  "Destination":"/data",
+                  "Driver":"local",
+                  "Mode":"z",
+                  "RW":true,
+                  "Propagation":""
+                }]
+                """.trimIndent(),
+            ),
+            jsonObj("""{"NetworkMode":"bridge","Mounts":[{"Type":"volume","Source":"","Target":"/data"}]}"""),
+        )!!
+
+        assertEquals(1, mounts.size, "the existing entry must be completed, not duplicated")
+        assertEquals(jsonObj("""{"Type":"volume","Source":"vol123","Target":"/data"}"""), mounts[0])
+    }
+
+    @Test
+    fun resolveMounts_synthesizes_a_mount_for_a_volume_missing_from_the_host_config() {
+        // `VOLUME /data` in the image (or `docker run -v /data`): HostConfig has no entry at all.
+        val inspectMounts = jsonArr(
+            """
+            [{
+              "Type":"volume",
+              "Name":"anon456",
+              "Source":"/var/lib/docker/volumes/anon456/_data",
+              "Destination":"/var/lib/postgresql/data",
+              "Driver":"local",
+              "Mode":"",
+              "RW":true,
+              "Propagation":""
+            }]
+            """.trimIndent(),
+        )
+        val hostConfig = jsonObj("""{"NetworkMode":"bridge"}""")
+        val mounts = createBodyMounts(inspectMounts, hostConfig)!!
+
+        assertEquals(1, mounts.size)
+        // Only create-valid keys: Destination/Name/Mode/RW/Propagation would fail the request with a 400.
+        assertEquals(
+            jsonObj("""{"Type":"volume","Source":"anon456","Target":"/var/lib/postgresql/data","ReadOnly":false}"""),
+            mounts[0],
+        )
+        assertEquals("bridge", resolveMounts(inspectMounts, hostConfig)!!.str("NetworkMode"), "the rest of HostConfig must survive")
+    }
+
+    @Test
+    fun resolveMounts_marks_a_read_only_volume_read_only() {
+        val mounts = createBodyMounts(
+            jsonArr("""[{"Type":"volume","Name":"ro789","Destination":"/ref","RW":false}]"""),
+            jsonObj("""{"NetworkMode":"bridge"}"""),
+        )!!
+
+        assertEquals(jsonObj("""{"Type":"volume","Source":"ro789","Target":"/ref","ReadOnly":true}"""), mounts[0])
+    }
+
+    @Test
+    fun resolveMounts_leaves_a_destination_already_covered_by_binds_alone() {
+        val hostConfig = jsonObj("""{"Binds":["vol123:/data:rw"],"NetworkMode":"bridge"}""")
+        val resolved = resolveMounts(
+            jsonArr("""[{"Type":"volume","Name":"vol123","Destination":"/data","RW":true}]"""),
+            hostConfig,
+        )
+
+        assertEquals(hostConfig, resolved, "the legacy bind already mounts the volume; a second entry would conflict")
+    }
+
+    @Test
+    fun resolveMounts_keeps_a_named_volume_entry_verbatim() {
+        val hostConfig = jsonObj(
+            """
+            {"Mounts":[{
+              "Type":"volume",
+              "Source":"pgdata",
+              "Target":"/data",
+              "ReadOnly":false,
+              "VolumeOptions":{"NoCopy":true}
+            }]}
+            """.trimIndent(),
+        )
+        val resolved = resolveMounts(
+            jsonArr("""[{"Type":"volume","Name":"pgdata","Destination":"/data","RW":true}]"""),
+            hostConfig,
+        )
+
+        assertEquals(hostConfig, resolved)
+    }
+
+    @Test
+    fun resolveMounts_ignores_binds_tmpfs_and_unnamed_entries() {
+        val hostConfig = jsonObj("""{"NetworkMode":"bridge"}""")
+        val resolved = resolveMounts(
+            jsonArr(
+                """
+                [
+                  {"Type":"bind","Source":"/host/etc","Destination":"/etc/app","RW":true},
+                  {"Type":"tmpfs","Destination":"/tmp/scratch","RW":true},
+                  {"Type":"volume","Name":"","Destination":"/nameless","RW":true}
+                ]
+                """.trimIndent(),
+            ),
+            hostConfig,
+        )
+
+        assertEquals(hostConfig, resolved, "binds and tmpfs are already fully described by HostConfig")
+    }
+
     @Test
     fun buildCreateBody_includes_only_the_first_network() {
         val body = buildCreateBody(

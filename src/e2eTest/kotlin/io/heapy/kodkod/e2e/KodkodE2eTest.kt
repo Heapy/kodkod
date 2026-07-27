@@ -233,6 +233,35 @@ class KodkodE2eTest {
             compose("registry", "start", check = false)
         }
     }
+
+    /**
+     * An anonymous volume is named only in the container's top-level `Mounts[]`; `HostConfig` records the
+     * destination with an empty source. Recreating from `HostConfig` alone therefore hands the replacement
+     * a brand-new empty volume — for a database that is silent data loss. Only a real daemon can prove the
+     * volume was inherited, hence the file written before the update.
+     */
+    @Test
+    @Order(10)
+    fun anonymousVolumeIsInheritedByTheRecreatedContainer() = e2e.scenario("update") {
+        publishVariant("v1")
+        compose("update", "up", "-d")
+        waitUntil(30, "vol v1 up") { variant("e2e-update-vol-1") == "v1" }
+        val volumeBefore = volumeName("e2e-update-vol-1", "/data")
+        assertTrue(volumeBefore.isNotBlank(), "expected an anonymous volume on /data, got '$volumeBefore'")
+        docker("exec", "e2e-update-vol-1", "sh", "-c", "echo kodkod-was-here > /data/keep")
+
+        publishVariant("v2")
+
+        waitUntil(90, "vol updated to v2") { variant("e2e-update-vol-1") == "v2" }
+        assertEquals(
+            volumeBefore,
+            volumeName("e2e-update-vol-1", "/data"),
+            "the recreated container must keep mounting the original anonymous volume",
+        )
+        waitUntil(30, "vol container running") { running("e2e-update-vol-1") }
+        val kept = docker("exec", "e2e-update-vol-1", "cat", "/data/keep", check = false)
+        assertEquals("kodkod-was-here", kept.output.trim(), "the data written before the update must survive it")
+    }
 }
 
 internal class E2eHarness {
@@ -384,6 +413,10 @@ internal class E2eHarness {
     fun startedAt(container: String): String = inspect("{{.State.StartedAt}}", container)
 
     fun variant(container: String): String = inspect("{{index .Config.Labels \"app.variant\"}}", container)
+
+    /** Name of the volume mounted at [destination], as the daemon reports it in the top-level `Mounts`. */
+    fun volumeName(container: String, destination: String): String =
+        inspect("{{range .Mounts}}{{if eq .Destination \"$destination\"}}{{.Name}}{{end}}{{end}}", container)
 
     fun logHas(container: String, text: String): Boolean {
         return docker("logs", container, check = false).output.contains(text, ignoreCase = true)
