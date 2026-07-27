@@ -417,8 +417,18 @@ class FakeDockerClient : DockerClient {
         op("create", name) {
             platforms += platform
             if (name in failCreate) throw DockerException(500, "fake: create failure for '$name'")
-            created += name to body
             val id = "new-$name-${createSeq++}"
+            // The name index applies to `create` exactly as it does to `rename`: the daemon answers
+            // 409 either way. Letting create through meant a recreate could put a second container on
+            // the service name, which no daemon permits and which the ordering of the recreate path
+            // (rename the original away *first*) exists to avoid.
+            //
+            // A payload a test registered under *this* id is the exception: that is not another
+            // container holding the name, it is this one being described before it exists — how a test
+            // asks for a replacement that comes up `Restarting`.
+            holderOf(name)?.takeIf { it != id }
+                ?.let { throw DockerException(409, "fake: name '$name' is already in use by $it") }
+            created += name to body
             // The daemon knows the replacement from here on, so whatever inspects it next (the liveness
             // gate) gets an answer. A payload the test registered for this id up front wins, which is how
             // a test asks for a replacement that comes up `Restarting`.

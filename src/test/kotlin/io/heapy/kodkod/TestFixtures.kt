@@ -63,3 +63,49 @@ internal fun containerSummary(
            "HostConfig":{"NetworkMode":"$networkMode"},"NetworkSettings":{"Networks":$networks}}""",
     )
 }
+
+/**
+ * Register a running, update-eligible container plus its current image. Test bodies then layer on
+ * `distribution`/`images` entries to drive the specific staleness path under test.
+ *
+ * Shared rather than private to one file: the generated worlds in [UpdateCycleModelTest] have to be
+ * built out of the same pieces the hand-written ones are, or the two disagree about what a container
+ * even looks like.
+ */
+internal fun FakeDockerClient.container(
+    id: String,
+    name: String = id,
+    imageRef: String = "img:1",
+    currentImageId: String = "sha256:$id-old",
+    currentRepoDigests: List<String> = emptyList(),
+    labels: String = "{}",
+    hostConfig: String = "{}",
+    networks: String = "{}",
+    /** Top-level `Mounts[]`, the only place an anonymous volume's generated name appears. */
+    mounts: String = "[]",
+    configMacAddress: String? = null,
+    configStopTimeout: Int? = null,
+    imageManifestPlatform: String? = null,
+    state: String = "running",
+) {
+    val repoDigests = currentRepoDigests.joinToString(",", "[", "]") { "\"$it\"" }
+    val mac = configMacAddress?.let { ",\"MacAddress\":\"$it\"" } ?: ""
+    // `docker run --stop-timeout` / compose `stop_grace_period`, as the daemon records it.
+    val stopTimeout = configStopTimeout?.let { ",\"StopTimeout\":$it" } ?: ""
+    // Engines that report it put the resolved manifest (and its platform) on the container inspect.
+    val manifest = imageManifestPlatform?.let { ""","ImageManifestDescriptor":{"platform":$it}""" } ?: ""
+    // The listing carries names, state, `HostConfig.NetworkMode` and the endpoints' `Links` as the
+    // daemon does — that is all a create-time dependency of another container can be recognised from.
+    listed += Json.parseToJsonElement(
+        """{"Id":"$id","Names":["/$name"],"State":"$state","Labels":$labels,""" +
+            """"HostConfig":$hostConfig,"NetworkSettings":{"Networks":$networks}}""",
+    ).jsonObject
+    containers[id] = Json.parseToJsonElement(
+        """{"Name":"/$name","Image":"$currentImageId","Mounts":$mounts,""" +
+            """"Config":{"Image":"$imageRef","Labels":$labels$mac$stopTimeout},""" +
+            """"HostConfig":$hostConfig,"NetworkSettings":{"Networks":$networks}$manifest}""",
+    ).jsonObject
+    images[currentImageId] = Json.parseToJsonElement(
+        """{"Id":"$currentImageId","Config":{},"RepoDigests":$repoDigests}""",
+    ).jsonObject
+}

@@ -179,6 +179,21 @@ abstract class DockerClientContract {
     }
 
     /**
+     * A name is taken by whoever holds it, and `create` is refused just as `rename` is. The recreate
+     * path is built on that: the original is renamed out of the way *first* precisely because the
+     * replacement could not otherwise be created under the service name.
+     */
+    @Test
+    fun creating_a_container_under_a_name_that_is_taken_is_refused() {
+        val taken = uniqueName("taken")
+        given(taken)
+
+        assertThrows(DockerException::class.java, { given(taken) }) {
+            "two containers cannot hold one name, whichever call asks for it"
+        }
+    }
+
+    /**
      * The daemon resolves a container reference by full id, by name, or by an id prefix, and kodkod
      * relies on all three: compose writes `network_mode: container:<id>`, kodkod rewrites it to a
      * name, and `docker ps` shows people the short id they then put in a label.
