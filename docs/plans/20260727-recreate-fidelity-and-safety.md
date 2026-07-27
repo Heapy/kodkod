@@ -199,20 +199,23 @@ max-adversarial ревью репозитория дало 15 подтвержд
 - Modify: `src/test/kotlin/io/heapy/kodkod/DockerReplayTest.kt`
 - Modify: `src/test/kotlin/io/heapy/kodkod/ReplayDockerTransportTest.kt`
 - Modify: `src/main/kotlin/io/heapy/kodkod/DockerRecording.kt`
+- Create: `src/test/kotlin/io/heapy/kodkod/OpLoggingClientTest.kt` (➕ тесты на новое различение
+  «сделал»/«попытался» в `OpLoggingClient` — в replay-сценариях все вызовы успешны, поэтому маркер `!`
+  иначе остался бы непокрытым)
 
-- [ ] мета-тест на строгость: собрать список `RecordedExchange` **в памяти** (как уже делает
+- [x] мета-тест на строгость: собрать список `RecordedExchange` **в памяти** (как уже делает
       `ReplayDockerTransportTest`, с синтетическим `bodyLoader`), выбросить из него один обмен и убедиться, что
       сценарий падает — сейчас он зелёный, потому что исключение проглатывается кодом под тестом
-- [ ] в `OpLoggingClient` писать op **после** успешного делегирования, а неуспешный фиксировать отдельной пометкой
+- [x] в `OpLoggingClient` писать op **после** успешного делегирования, а неуспешный фиксировать отдельной пометкой
       (`create!:web`), чтобы «сделал» и «попытался» не сливались; `created` заполнять так же
-- [ ] в `ReplayDockerTransport` считать промахи (`NoSuchRecordedExchangeException`/`RecordedExchangesExhausted`)
+- [x] в `ReplayDockerTransport` считать промахи (`NoSuchRecordedExchangeException`/`RecordedExchangesExhausted`)
       в счётчик, доступный тесту
-- [ ] в `DockerReplayTest` после каждого сценария проверять `isFullyConsumed()` и нулевой счётчик промахов
-- [ ] заменить `?: return emptyList()` на явный отказ при отсутствии `index.json` (корпус закоммичен — пустой
+- [x] в `DockerReplayTest` после каждого сценария проверять `isFullyConsumed()` и нулевой счётчик промахов
+- [x] заменить `?: return emptyList()` на явный отказ при отсутствии `index.json` (корпус закоммичен — пустой
       прогон это поломка, а не «ещё не засеяли»)
-- [ ] сделать `update-noop` невакуумным: проверять, что сценарий реально проинспектировал контейнер и признал его
+- [x] сделать `update-noop` невакуумным: проверять, что сценарий реально проинспектировал контейнер и признал его
       актуальным, а не отработал на пустом списке
-- [ ] прогнать тесты — мета-тест красный до фикса, вся сюита зелёная после
+- [x] прогнать тесты — мета-тест красный до фикса, вся сюита зелёная после
 
 ### Task 2: Безопасный рекордер фикстур
 

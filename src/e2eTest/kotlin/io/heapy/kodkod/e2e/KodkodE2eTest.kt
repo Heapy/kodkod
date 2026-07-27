@@ -193,7 +193,7 @@ class KodkodE2eTest {
     }
 }
 
-private class E2eHarness {
+internal class E2eHarness {
     val root: Path = Path.of(System.getProperty("user.dir")).absolute()
     val registry: String = System.getenv("KODKOD_E2E_REGISTRY") ?: "127.0.0.1:5000"
 
@@ -323,6 +323,12 @@ private class E2eHarness {
     fun hostDocker(vararg args: String, check: Boolean = true): CommandResult {
         return command(listOf("docker") + args, check = check, env = emptyMap(), hostDocker = true)
     }
+
+    /** The `docker compose` plugin version (e.g. "2.29.7"), used to label recorded fixtures. */
+    fun composeVersion(): String = docker("compose", "version", "--short", check = false).output.trim()
+
+    /** The Docker engine server version (e.g. "27.3.1"), used to label recorded fixtures. */
+    fun engineVersion(): String = docker("version", "--format", "{{.Server.Version}}", check = false).output.trim()
 
     fun inspect(format: String, target: String): String {
         val result = docker("inspect", "-f", format, target, check = false)
@@ -457,7 +463,7 @@ private class E2eHarness {
     }
 }
 
-private data class CommandResult(
+internal data class CommandResult(
     val exitCode: Int,
     val output: String,
 )

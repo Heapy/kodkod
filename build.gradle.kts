@@ -32,6 +32,9 @@ testing {
 
             dependencies {
                 implementation(project())
+                // The recorder calls DockerApi (which returns kotlinx JsonObject) and writes fixture
+                // JSON; main exposes these only as `implementation`, so re-declare for this suite.
+                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
             }
 
             targets.all {
@@ -43,6 +46,7 @@ testing {
                     outputs.upToDateWhen { false }
 
                     systemProperty("kodkod.e2e.useCurrentDocker", providers.gradleProperty("kodkod.e2e.useCurrentDocker").orNull ?: "false")
+                    systemProperty("kodkod.e2e.record", providers.gradleProperty("kodkod.e2e.record").orNull ?: "false")
                     systemProperty("kodkod.e2e.keepDind", providers.gradleProperty("kodkod.e2e.keepDind").orNull ?: "false")
                     systemProperty("kodkod.e2e.dindName", providers.gradleProperty("kodkod.e2e.dindName").orNull ?: "kodkod-e2e-dind")
                     systemProperty("kodkod.e2e.dindImage", providers.gradleProperty("kodkod.e2e.dindImage").orNull ?: "docker:dind")

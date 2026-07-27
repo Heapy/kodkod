@@ -1,0 +1,13 @@
+{
+    "labels": [
+        {
+            "label": "engine-29.5.2_compose-5.1.4",
+            "scenarios": [
+                "autoheal-restart",
+                "deps-ordered",
+                "update-noop",
+                "update-recreate"
+            ]
+        }
+    ]
+}

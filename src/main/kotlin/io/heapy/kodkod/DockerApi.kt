@@ -11,25 +11,23 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import java.io.ByteArrayOutputStream
-import java.net.StandardProtocolFamily
 import java.net.URLEncoder
-import java.net.UnixDomainSocketAddress
-import java.nio.ByteBuffer
-import java.nio.channels.SelectionKey
-import java.nio.channels.Selector
-import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
 
 /** Raised for non-2xx Docker API responses (or transport errors). */
 class DockerException(val status: Int, message: String) : RuntimeException("docker api error ($status): $message")
 
 /**
- * A tiny Docker Engine API client that speaks HTTP/1.1 directly over the unix domain socket
- * (`/var/run/docker.sock`) using only the JDK. Each call opens a fresh connection and sends
- * `Connection: close`, so we never have to manage keep-alive state; the response body is either
- * `Transfer-Encoding: chunked` (decoded here) or simply delimited by the socket close.
+ * A tiny Docker Engine API client. It builds the request, hands the bytes to a [DockerTransport],
+ * and parses the raw HTTP/1.1 response (`Transfer-Encoding: chunked` decoded here, or simply
+ * delimited by the socket close). Production wires a [UnixSocketTransport] over
+ * `/var/run/docker.sock` via the [secondary][DockerApi] socket-path constructor; tests inject a
+ * recording or replay transport.
  */
-class DockerApi(private val socketPath: String) : DockerClient {
+class DockerApi(private val transport: DockerTransport) : DockerClient {
+
+    /** Production entry point: talk to the Docker engine over the unix socket at [socketPath]. */
+    constructor(socketPath: String) : this(UnixSocketTransport(socketPath))
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
@@ -145,7 +143,7 @@ class DockerApi(private val socketPath: String) : DockerClient {
 
     private fun enc(value: String): String = URLEncoder.encode(value, StandardCharsets.UTF_8)
 
-    // --- Transport: HTTP/1.1 over a unix domain socket ------------------------------------
+    // --- HTTP/1.1 request/response handling -----------------------------------------------
 
     internal class HttpResponse(val status: Int, val body: ByteArray) {
         val bodyText: String get() = String(body, StandardCharsets.UTF_8)
@@ -157,104 +155,59 @@ class DockerApi(private val socketPath: String) : DockerClient {
         body: ByteArray? = null,
         headers: Map<String, String> = emptyMap(),
         readTimeoutMs: Long = 60_000,
-    ): HttpResponse {
-        SocketChannel.open(StandardProtocolFamily.UNIX).use { channel ->
-            channel.connect(UnixDomainSocketAddress.of(socketPath))
+    ): HttpResponse = parse(transport.exchange(method, path, body, headers, readTimeoutMs))
 
-            val head = StringBuilder()
-                .append(method).append(' ').append(path).append(" HTTP/1.1\r\n")
-                .append("Host: localhost\r\n")
-                .apply { headers.forEach { (k, v) -> append(k).append(": ").append(v).append("\r\n") } }
-                .apply {
-                    if (body != null || (method != "GET" && method != "HEAD")) {
-                        append("Content-Length: ").append(body?.size ?: 0).append("\r\n")
-                    }
-                }
-                .append("Connection: close\r\n\r\n")
-                .toString()
-                .toByteArray(StandardCharsets.US_ASCII)
+    internal companion object {
+        private val CRLF = "\r\n".toByteArray(StandardCharsets.US_ASCII)
+        private val CRLF_CRLF = "\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
 
-            channel.configureBlocking(true)
-            writeFully(channel, ByteBuffer.wrap(head))
-            if (body != null && body.isNotEmpty()) writeFully(channel, ByteBuffer.wrap(body))
+        /** Split raw HTTP/1.1 response bytes into a status + body, decoding a chunked body. */
+        internal fun parse(raw: ByteArray): HttpResponse {
+            val separator = indexOf(raw, CRLF_CRLF, 0)
+            if (separator < 0) throw DockerException(-1, "malformed http response (no header terminator)")
 
-            return parse(readUntilClose(channel, readTimeoutMs))
+            val headerText = String(raw, 0, separator, StandardCharsets.US_ASCII)
+            val lines = headerText.split("\r\n")
+            val status = lines.first().split(' ').getOrNull(1)?.toIntOrNull()
+                ?: throw DockerException(-1, "malformed status line: ${lines.first()}")
+
+            val chunked = lines.drop(1).any {
+                val colon = it.indexOf(':')
+                colon > 0 &&
+                    it.substring(0, colon).trim().equals("Transfer-Encoding", ignoreCase = true) &&
+                    it.substring(colon + 1).trim().equals("chunked", ignoreCase = true)
+            }
+
+            val bodyStart = separator + CRLF_CRLF.size
+            val body = raw.copyOfRange(bodyStart, raw.size)
+            return HttpResponse(status, if (chunked) dechunk(body) else body)
         }
-    }
 
-    private fun writeFully(channel: SocketChannel, buffer: ByteBuffer) {
-        while (buffer.hasRemaining()) channel.write(buffer)
-    }
-
-    private fun readUntilClose(channel: SocketChannel, readTimeoutMs: Long): ByteArray {
-        channel.configureBlocking(false)
-        Selector.open().use { selector ->
-            channel.register(selector, SelectionKey.OP_READ)
+        /** Decode a `Transfer-Encoding: chunked` body into the concatenated chunk payloads. */
+        internal fun dechunk(data: ByteArray): ByteArray {
             val out = ByteArrayOutputStream()
-            val buffer = ByteBuffer.allocate(16 * 1024)
-            while (true) {
-                if (selector.select(readTimeoutMs) == 0) {
-                    throw DockerException(-1, "read timed out after ${readTimeoutMs}ms")
-                }
-                selector.selectedKeys().clear()
-                buffer.clear()
-                val read = channel.read(buffer)
-                if (read < 0) break
-                if (read > 0) out.write(buffer.array(), 0, read)
+            var pos = 0
+            while (pos < data.size) {
+                val lineEnd = indexOf(data, CRLF, pos)
+                if (lineEnd < 0) break
+                val sizeToken = String(data, pos, lineEnd - pos, StandardCharsets.US_ASCII)
+                    .substringBefore(';').trim()
+                val size = sizeToken.toIntOrNull(16) ?: break
+                pos = lineEnd + CRLF.size
+                if (size == 0) break
+                if (pos + size > data.size) break
+                out.write(data, pos, size)
+                pos += size + CRLF.size // skip the chunk data plus its trailing CRLF
             }
             return out.toByteArray()
         }
-    }
 
-    internal fun parse(raw: ByteArray): HttpResponse {
-        val separator = indexOf(raw, CRLF_CRLF, 0)
-        if (separator < 0) throw DockerException(-1, "malformed http response (no header terminator)")
-
-        val headerText = String(raw, 0, separator, StandardCharsets.US_ASCII)
-        val lines = headerText.split("\r\n")
-        val status = lines.first().split(' ').getOrNull(1)?.toIntOrNull()
-            ?: throw DockerException(-1, "malformed status line: ${lines.first()}")
-
-        val chunked = lines.drop(1).any {
-            val colon = it.indexOf(':')
-            colon > 0 &&
-                it.substring(0, colon).trim().equals("Transfer-Encoding", ignoreCase = true) &&
-                it.substring(colon + 1).trim().equals("chunked", ignoreCase = true)
+        private fun indexOf(haystack: ByteArray, needle: ByteArray, from: Int): Int {
+            outer@ for (i in from..haystack.size - needle.size) {
+                for (j in needle.indices) if (haystack[i + j] != needle[j]) continue@outer
+                return i
+            }
+            return -1
         }
-
-        val bodyStart = separator + CRLF_CRLF.size
-        val body = raw.copyOfRange(bodyStart, raw.size)
-        return HttpResponse(status, if (chunked) dechunk(body) else body)
-    }
-
-    internal fun dechunk(data: ByteArray): ByteArray {
-        val out = ByteArrayOutputStream()
-        var pos = 0
-        while (pos < data.size) {
-            val lineEnd = indexOf(data, CRLF, pos)
-            if (lineEnd < 0) break
-            val sizeToken = String(data, pos, lineEnd - pos, StandardCharsets.US_ASCII)
-                .substringBefore(';').trim()
-            val size = sizeToken.toIntOrNull(16) ?: break
-            pos = lineEnd + CRLF.size
-            if (size == 0) break
-            if (pos + size > data.size) break
-            out.write(data, pos, size)
-            pos += size + CRLF.size // skip the chunk data plus its trailing CRLF
-        }
-        return out.toByteArray()
-    }
-
-    internal fun indexOf(haystack: ByteArray, needle: ByteArray, from: Int): Int {
-        outer@ for (i in from..haystack.size - needle.size) {
-            for (j in needle.indices) if (haystack[i + j] != needle[j]) continue@outer
-            return i
-        }
-        return -1
-    }
-
-    private companion object {
-        val CRLF = "\r\n".toByteArray(StandardCharsets.US_ASCII)
-        val CRLF_CRLF = "\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
     }
 }
