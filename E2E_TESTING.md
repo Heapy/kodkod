@@ -75,23 +75,12 @@ daemon:
 ./gradlew e2eTest -Pkodkod.e2e.useCurrentDocker=true
 ```
 
-Run the `DockerClient` contract against a real daemon:
+Run the `DockerClient` contract against a real daemon (see the test matrix below for what it is and
+why it needs the flag):
 
 ```bash
 ./gradlew e2eTest -Pkodkod.e2e.useCurrentDocker=true --tests '*DockerApiContractTest*'
 ```
-
-`DockerApiContractTest` is the half of the contract that proves `FakeDockerClient` is not more
-forgiving than Docker (the other half, `FakeDockerClientContractTest`, runs on every `./gradlew
-test`). It needs the flag because `DockerApi` speaks only to a unix socket while the suite's dind
-daemon is reachable over TCP — the same constraint the fixture recorder has — so without it the
-class is **skipped**, not run against the wrong daemon.
-
-It is safe to point at a working machine: every container it makes is named `kodkod-contract-*`,
-nothing else is listed, renamed or removed, and each test cleans up after itself.
-
-CI runs exactly this command, against the runner's own daemon, before the dind suite — so the daemon
-half of the contract is checked on every push, not only when somebody remembers to.
 
 Useful dind overrides:
 
@@ -159,6 +148,24 @@ see `e2eTest` sources, and that is the only reason it is here.
 ```bash
 ./gradlew e2eTest --tests '*FixtureWriterTest*'
 ```
+
+`DockerApiContractTest` lives here too, and is the only test in the suite that does **not** run by
+default. It drives the real `DockerApi` through `DockerClientContract` — the same class
+`FakeDockerClientContractTest` runs against the fake on every `./gradlew test` — so that a behaviour
+the unit suite assumes about a daemon is a behaviour a daemon was made to demonstrate. `DockerApi`
+speaks only to a unix socket while the suite's DinD daemon is reachable over TCP, so it needs the
+local daemon and skips itself otherwise rather than testing the wrong one:
+
+```bash
+./gradlew e2eTest --tests '*DockerApiContractTest*' -Pkodkod.e2e.useCurrentDocker=true
+```
+
+It is safe to point at a working machine: every container it makes is named `kodkod-contract-*`,
+nothing else is listed, renamed or removed, and each test cleans up after itself. It does pull
+`busybox:1.36`, since the daemon can only create from an image it already has.
+
+CI runs exactly that command against the runner's own daemon, before the dind suite, so the daemon
+half of the contract is checked on every push rather than whenever somebody remembers the flag.
 
 ## What the JUnit suite does
 
@@ -331,7 +338,7 @@ src/e2eTest/kotlin/io/heapy/kodkod/e2e/FixtureWriter.kt
 src/e2eTest/kotlin/io/heapy/kodkod/e2e/FixtureWriterTest.kt
 src/main/kotlin/io/heapy/kodkod/DockerTransport.kt           # the seam both sides plug into
 src/main/kotlin/io/heapy/kodkod/UnixSocketTransport.kt       # production transport, what the recorder wraps
-src/main/kotlin/io/heapy/kodkod/DockerRecording.kt           # recording/replay transports + the corpus types
+src/testFixtures/kotlin/io/heapy/kodkod/DockerRecording.kt   # recording/replay transports + the corpus types
 src/test/kotlin/io/heapy/kodkod/DockerReplayTest.kt
 src/test/resources/docker-fixtures/
 e2e/

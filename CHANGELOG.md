@@ -75,6 +75,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (kotlinx-serialization-json stays at 1.11.0, already current). Patch-level updates only — no
   behaviour change, and the published image is built from the same JDK 25 base.
 
+- The production jar no longer carries the record/replay machinery. `DockerRecording.kt` — the fixture
+  model and the recording/replay transports — moved to `src/testFixtures`, which both test source sets
+  can see and neither user can. It only ever sat in `main` so `e2eTest` could reach it. `DockerApi`'s
+  own seam (`DockerTransport`, `UnixSocketTransport`) stays where it was: production is built on it.
 ### Fixed
 - A create-time dependent is no longer forced through a recreate that could not be undone. Its
   replacement is built from its image *ref*, so once that ref has moved on — the dependent has an update

@@ -11,8 +11,14 @@ import java.nio.charset.StandardCharsets
  * versioned fixture set. [ReplayDockerTransport] serves a captured set back with no daemon, so the
  * real [DockerApi] + [Updater]/[Autoheal] can be exercised against genuine Docker JSON in unit tests.
  *
- * Everything here is `public`: the recorder lives in the `e2eTest` source set, which depends on the
- * main artifact and cannot see `internal`.
+ * This lives in `testFixtures` rather than `main` because none of it is production code: the daemon
+ * never records or replays anything. It used to sit in `main` purely so both test source sets could
+ * reach it, which shipped the whole fixture model in the production jar. Test fixtures are the one
+ * place `test` and `e2eTest` can both see, and they are packaged separately — so the seam that
+ * production does need ([DockerTransport], [UnixSocketTransport]) stays in `main` and this does not.
+ *
+ * Everything here is `public` for the same reason [DockerClientContract] is: a fixtures jar is a
+ * separate module, so `internal` would hide it from the very source sets it exists for.
  */
 
 // --- On-disk fixture model ----------------------------------------------------------------

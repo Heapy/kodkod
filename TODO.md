@@ -37,8 +37,3 @@
     разбирается на тестируемые части. Из него проверен только `ConfigTest.reads_the_shutdown_grace_period`.
     Чтобы покрыть — выделить планировщик и хук в отдельную тестируемую функцию.
 14. Дублирование в тестах: хелперы `updateConfig`/`autohealConfig` рекордера и `config(...)` юнит-тестов.
-
-## Упаковка
-
-15. Test-only классы record/replay (`DockerRecording.kt`, `DockerTransport.kt`) — `public` в main source set и
-    попадают в production-jar.

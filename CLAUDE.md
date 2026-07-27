@@ -67,11 +67,14 @@ recreate containers whose image tag moved (update). Kotlin, one runtime dependen
 - Replay is FIFO **per key**, so the order of calls to two *different* keys is not checked: moving a
   listing from the start of a cycle to the end replays identically. Order that matters is asserted
   from the op log in `DockerReplayTest`, never assumed from a green replay.
-- `DockerTransport`, `UnixSocketTransport` and `DockerRecording.kt`'s recording/replay types are
-  `public` in `main` **on purpose**: the `e2eTest` source set consumes `main` as a compiled artifact
-  and therefore cannot see `internal`, and the fixture recorder lives there because it needs a real
-  daemon. Moving them out of the production jar (their own source set, or a test-fixtures artifact) is
-  tracked in `TODO.md`; until then, do not "fix" them to `internal` — it breaks the recorder.
+- The recording/replay types (`DockerRecording.kt`) live in **`src/testFixtures`**, not `main`: the
+  daemon never records or replays anything, and a fixtures jar is the one thing both `test` and
+  `e2eTest` can see without shipping it to users. They are `public` there for exactly that reason — a
+  separate module makes `internal` invisible to the source sets they exist for, so do not "tidy" them
+  to `internal`.
+- `DockerTransport` and `UnixSocketTransport` stay in `main` and stay `public`: that pair is the seam
+  `DockerApi` is built on (`DockerApi(transport)`), not test scaffolding. The rule of thumb for this
+  split is whether production would still need the type if the tests were deleted.
 
 ## When you change X, update Y
 
