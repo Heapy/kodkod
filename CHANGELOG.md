@@ -13,7 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   whose replacement reports `unhealthy`; a container still inside its `start_period` is accepted.
 - Memory of an image that could not come up on a container: the same update is not retried for
   `KODKOD_UPDATE_FAILURE_COOLDOWN` seconds (default 6h), so an unstartable `:latest` no longer costs a
-  self-inflicted outage every cycle. Cleared as soon as the tag resolves to a different image.
+  self-inflicted outage every cycle. Cleared as soon as the tag resolves to a different image. A
+  container held back this way is also kept out of the cycle's dependency restarts, since a recreate
+  would build it from that same image. Note the memory lives in the process: restarting kodkod forgets
+  every cooldown.
 - Reconciliation of orphaned `_kodkod_old_` backups, at startup and at the beginning of every cycle:
   restored when nothing serves the service name, removed once the replacement is running. It runs even
   with `KODKOD_UPDATE_ENABLED=false`, since otherwise a backup left by a killed process would never
@@ -22,7 +25,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   interrupting a recreate between the rename of a container and the start of its replacement.
 - Per-container exponential backoff for autoheal restarts, capped by `KODKOD_AUTOHEAL_MAX_INTERVAL`
   (default 3600). Restarting a container that is unhealthy because of its configuration every cycle
-  only kept resetting its healthcheck `start_period`.
+  only kept resetting its healthcheck `start_period`. The counter is reset by the daemon reporting the
+  container `healthy` — not by its absence from the `health=unhealthy` listing, which is also what a
+  container that is merely `starting` after its restart looks like. Like the update cooldown, the
+  counters live in the process and are forgotten on restart.
 - Autoheal restarts the containers that share the restarted container's network namespace or link to
   it, instead of leaving them attached to a namespace that no longer exists.
 - Compose `depends_on` conditions are honoured: a dependency marked `condition: service_healthy` is
@@ -46,7 +52,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Config.StopTimeout` / compose `stop_grace_period`. The read timeout is sized from whichever value
   will actually apply, instead of a flat 60s that could cut a long graceful stop short.
 - `KODKOD_UPDATE_CLEANUP` skips an old image that still carries a tag other than the one just updated,
-  so a pinned rollback tag (`app:1.26`) is no longer silently untagged by the prune.
+  so a pinned rollback tag (`app:1.26`) is no longer silently untagged by the prune. The prune is also
+  limited to updates that actually replaced the image: a container recreated because a create-time
+  dependency moved runs the same image its replacement runs, so there is nothing to reclaim. Tags are
+  compared canonically, so `docker.io/library/nginx:1.27` matches the `nginx:1.27` the daemon records.
 - The e2e suite is a JUnit suite (`src/e2eTest`) instead of shell scripts, running against a
   disposable Docker-in-Docker daemon by default.
 
@@ -69,7 +78,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   service stopped under its backup name.
 - A container this cycle stopped for a dependency of its own is retried a few times if `start` is
   refused, and reported at `ERROR` if it stays down, instead of being silently left stopped.
-- The compose service key no longer embeds a literal NUL byte in the source.
+- The liveness gate no longer passes without evidence. A window in which no probe could be read at all
+  fails the update instead of releasing the old container and image, and a `404` on the replacement (an
+  `AutoRemove` inherited from the old container, an outside `docker rm`) is treated as the failure it
+  is rather than as "still starting".
+- The reconcile of orphaned backups no longer force-removes a container it did not create. Only a
+  holder that was created and never started is cleared out of the way; a holder that has run is left
+  alone and reported, because that is also what a completed update stopped by an operator looks like.
+- The failed-update cooldown is only recorded when the replacement actually ran: a refused stop, a name
+  conflict or a rejected create says nothing about the image and no longer freezes the update for six
+  hours.
+- The plan is re-checked against the daemon before it is applied, including whether the container is
+  still running, and the replacement is built from the state at that moment — a `docker update`, a
+  `network connect` or a label change made while the image downloaded is no longer reverted.
+- An autoheal restart whose answer never arrived (a `stop_grace_period` longer than the socket's read
+  timeout) is read back from the daemon instead of assumed failed, so the containers sharing its network
+  namespace are still refreshed.
+- A rollback that failed before the container was renamed no longer asks the daemon to rename it onto
+  its own name, which was refused and reported as two ERRORs about a container that never moved.
+- Chunked responses that were cut off mid-body are reported as transport errors instead of being
+  returned as short-but-complete answers (an empty container list, an image with no tags).
+- Image references are escaped into request paths, an empty environment variable no longer reads as
+  `false`, and the compose service key no longer embeds a literal NUL byte in the source.
 
 ## [0.3.0] - 2026-06-04
 

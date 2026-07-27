@@ -32,6 +32,10 @@ services:
   kodkod:
     image: ghcr.io/heapy/kodkod:latest
     restart: always
+    # Docker SIGKILLs 10s after SIGTERM unless told otherwise, and a recreate in flight can be between
+    # renaming the old container away and starting its replacement — the one moment nothing is serving
+    # the name. Give kodkod more than its KODKOD_SHUTDOWN_GRACE (30s) so it can finish instead.
+    stop_grace_period: 45s
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # optional: match host time in logs
@@ -121,9 +125,14 @@ If anything fails after the container is stopped, kodkod rolls the service back:
 failed replacement, frees the service name if a corpse is still holding it, renames the original
 back, starts it, and then **inspects it to confirm** it is running under its own name again. Every
 step that fails is logged, and a rollback that did not land says `ROLLBACK INCOMPLETE` at `ERROR`
-rather than reporting success. If kodkod is killed mid-recreate, the next start reconciles the
-`_kodkod_old_` backup it left behind — restoring it when nothing is serving the name, removing it
-when the replacement is running.
+rather than reporting success. If kodkod is killed mid-recreate, the `_kodkod_old_` backup it left
+behind is reconciled — restoring it when nothing is serving the name, removing it when the
+replacement is running. That reconcile runs at startup *and* at the head of every update cycle, and
+it is not gated on `KODKOD_UPDATE_ENABLED`: an orphan is a service that is down right now. It is
+deliberately conservative in one case — when the container holding the service name has *run* at some
+point (rather than being a replacement that was created and never started), both containers are left
+alone and the situation is reported, because that shape is also what "the update went through and an
+operator stopped the result" looks like.
 
 ### Limitations
 
@@ -137,6 +146,19 @@ when the replacement is running.
   tests only. The recorded-fixture and end-to-end runs go with `KODKOD_UPDATE_VERIFY_HEALTH=false`,
   because the number of probes is otherwise a race between the probe interval and the replacement's
   own healthcheck.
+- With `KODKOD_UPDATE_VERIFY_HEALTH=true` (the default), a replacement reporting `Health=starting`
+  never satisfies the early exit, so a service with a long `start_period` pays the **full**
+  `KODKOD_UPDATE_VERIFY_SECONDS` — under the cycle lock, which also holds off autoheal for that long.
+  Shorten the window, or turn the health check of the gate off, if that matters more than the check.
+- Dependents that live **outside** the provider's compose project are only found when the project
+  contains at least one create-time dependent of its own. The scan starts narrowed to the provider's
+  `com.docker.compose.project` and widens to the whole daemon only when that narrow look finds
+  something; a stack with no in-project `network_mode: container:` relation does not pay for a full
+  listing on every restart, and an out-of-project sidecar joined to it is therefore not seen.
+- kodkod's memories are **in-process only**. The failed-update cooldown
+  (`KODKOD_UPDATE_FAILURE_COOLDOWN`) and the autoheal restart backoff live in the running process, so
+  restarting kodkod forgets both: an image that cannot start is retried on the next cycle, and a
+  flapping container's backoff starts again from `KODKOD_AUTOHEAL_INTERVAL`.
 
 ### Ordering & dependencies
 
@@ -147,7 +169,9 @@ kodkod updates the whole monitored set together so it can respect dependencies:
 - create-time dependents (`--link` and `network_mode: container:`) are **recreated** instead of only
   restarted, so Docker refreshes those references against the new dependency container. This also
   applies to dependents kodkod does not monitor itself — a sidecar sharing a recreated container's
-  network namespace would otherwise be left on a namespace that no longer exists;
+  network namespace would otherwise be left on a namespace that no longer exists — and it follows
+  chains, since recreating that sidecar tears down *its* namespace in turn. See Limitations for the
+  one case this scan does not cover;
 - `network_mode: container:<id>` is rewritten to the target's **name** so it survives that container
   being recreated;
 - a dependency compose marked `condition: service_healthy` is **waited for** before its dependent is

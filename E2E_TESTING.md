@@ -1,8 +1,16 @@
 # kodkod end-to-end tests
 
-Unit tests under `src/test` cover pure logic: image-defaults subtraction, the
-dependency graph, HTTP parsing, and config parsing. The E2E suite under
-`src/e2eTest` covers what unit tests cannot: kodkod driving a real Docker daemon.
+Unit tests under `src/test` cover three layers, none of which needs Docker:
+
+- pure logic — image-defaults subtraction, the dependency graph, HTTP parsing, config parsing;
+- whole `Updater`/`Autoheal` cycles against `FakeDockerClient`, an in-memory daemon that models
+  listing filters, the name index and the container lifecycle, so orchestration behaviour (rollback,
+  the liveness gate, backoff, cooldowns, ordering) is asserted from the ops a cycle issued;
+- `DockerReplayTest`, which replays the committed corpus of **real** Docker responses under
+  `src/test/resources/docker-fixtures` through the production `DockerApi`, and fails if the code under
+  test issues a request the recording does not have (or stops issuing one it does).
+
+The E2E suite under `src/e2eTest` covers what none of those can: kodkod driving a real Docker daemon.
 
 The E2E scenarios build `kodkod:e2e`, run a throwaway registry, publish movable
 test images, recreate containers, validate dependency ordering, roll back failed
@@ -91,7 +99,10 @@ To test that for real, the E2E harness runs a throwaway `registry:2` on
 - `e2e/testapp/Dockerfile` bakes `APP_VARIANT` and `app.variant` into image
   defaults.
 - `v1` and `v2` have different defaults.
-- `broken` creates successfully but fails to start, forcing rollback.
+- `broken` (`e2e/testapp/Dockerfile.broken`) creates successfully but fails to start, forcing rollback.
+- `crasher` (`e2e/testapp/Dockerfile.crasher`) starts successfully and then exits a moment later — the
+  case a `204` from `POST /start` cannot tell apart from a healthy start, and what the liveness gate
+  exists for.
 
 The container overrides none of those values. A successful update therefore proves
 that kodkod adopted the new image defaults instead of freezing the old container's
@@ -215,6 +226,10 @@ docker build --target v2 --build-arg VARIANT=v2 \
 docker push "$REG/testapp:latest"
 
 docker build -f e2e/testapp/Dockerfile.broken \
+  -t "$REG/testapp:latest" e2e/testapp
+docker push "$REG/testapp:latest"
+
+docker build -f e2e/testapp/Dockerfile.crasher \
   -t "$REG/testapp:latest" e2e/testapp
 docker push "$REG/testapp:latest"
 ```

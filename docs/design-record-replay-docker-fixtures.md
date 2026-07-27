@@ -1,3 +1,10 @@
+> **Status: superseded — implemented.** This is the original design note for the record/replay
+> fixture harness, kept for the reasoning behind it. It is **not** a description of the shipped
+> behaviour and disagrees with it in places (the index is required rather than optional, exhaustive
+> consumption is asserted on every scenario, and the per-scenario op expectations have moved on).
+> For how the harness works today see [E2E_TESTING.md](../E2E_TESTING.md) — recording flags, the
+> corpus layout, and when to re-record — and [CLAUDE.md](../CLAUDE.md) for the rules that govern it.
+
 # Record real Docker responses, replay them in versioned unit tests
 
 ## Context

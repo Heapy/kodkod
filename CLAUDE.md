@@ -16,7 +16,7 @@ recreate containers whose image tag moved (update). Kotlin, one runtime dependen
   Document each variable's *why* in its KDoc and add it to the README table in the same change.
 - **Helpers are `internal` and pure** (`buildCreateBody`, `resolveMounts`, `resolveLinks`, `topoSort`,
   `parseDependsOn`, …) so behaviour can be tested as a JSON-in/JSON-out transformation.
-- **Time is injected.** `TimeSource`/`Sleeper` (`Time.kt`) are constructor parameters of
+- **Time is injected.** `WallClock`/`Sleeper` (`Time.kt`) are constructor parameters of
   `Updater`/`Autoheal`, defaulting to the real clock. Tests use `FakeClock`; a unit test must never
   actually sleep through a probe interval, a cooldown or a backoff.
 - **The update cycle is `plan()` (reads only, no lock) then `apply()` (mutates, under the cycle lock).**
@@ -30,8 +30,13 @@ recreate containers whose image tag moved (update). Kotlin, one runtime dependen
   `start!:web`). Keep both doubles on that format: an assertion on `ops` must be able to distinguish
   "kodkod did this" from "kodkod tried this and it failed", otherwise a rollback test passes on a
   code path that never ran.
-- `FakeDockerClient.listContainers` honours `all` and the `status`/`label`/`health`/`name` filters. A
-  test proving "we search the whole daemon, not just the monitored set" depends on that.
+- `FakeDockerClient.listContainers` honours `all` and the `status`/`label`/`health`/`name`/`id`
+  filters, and reads state and names from its own lifecycle model rather than from the fixture, so a
+  container it created, started, renamed or removed is listed the way the daemon would list it. A test
+  proving "we search the whole daemon, not just the monitored set" depends on that — as does anything
+  that runs more than one cycle. Keep it honest: a fake that keeps a removed container, or that
+  matches every `health` filter regardless of the modelled health, makes the code that tells those
+  cases apart untestable.
 
 ## Fixture corpus (record/replay)
 
@@ -46,6 +51,26 @@ recreate containers whose image tag moved (update). Kotlin, one runtime dependen
   containers into the committed corpus. Narrow it (e.g. `name=_kodkod_old_`, `status=running`).
 - A create body is asserted through `FakeDockerClient.created` / `OpLoggingClient.created`, not stored
   as a fixture: recording our own output as a golden file self-heals on every re-record.
+- Replay is FIFO **per key**, so the order of calls to two *different* keys is not checked: moving a
+  listing from the start of a cycle to the end replays identically. Order that matters is asserted
+  from the op log in `DockerReplayTest`, never assumed from a green replay.
+- `DockerTransport`, `UnixSocketTransport` and `DockerRecording.kt`'s recording/replay types are
+  `public` in `main` **on purpose**: the `e2eTest` source set consumes `main` as a compiled artifact
+  and therefore cannot see `internal`, and the fixture recorder lives there because it needs a real
+  daemon. Moving them out of the production jar (their own source set, or a test-fixtures artifact) is
+  tracked in `TODO.md`; until then, do not "fix" them to `internal` — it breaks the recorder.
+
+## When you change X, update Y
+
+- A new or changed `KODKOD_*` variable → its KDoc in `Config`, **and** the env table in `README.md`.
+- Any user-visible behaviour change → an entry under `## [Unreleased]` in `CHANGELOG.md`, in the same
+  change. A behaviour that only kodkod's own logs reveal still counts as user-visible.
+- A new or renamed e2e scenario → the test matrix in `E2E_TESTING.md`, plus the file list when it
+  brings a new compose file or `Dockerfile.<variant>`.
+- A changed request method/path/query → re-record the fixture corpus (see above).
+- **Language.** Plans (`docs/plans/`) and `TODO.md` are written in Russian; everything that ships to
+  users — `README.md`, `CHANGELOG.md`, `E2E_TESTING.md`, this file, and every comment, KDoc and log
+  line in the source — is English. Do not mix the two inside one file.
 
 ## Working expectations
 
