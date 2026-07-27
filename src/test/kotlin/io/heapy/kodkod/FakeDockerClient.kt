@@ -9,6 +9,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import java.time.Instant
 
 /**
  * In-memory [DockerClient] for unit tests. It serves canned `list`/`inspect`/`distribution` data and
@@ -117,8 +118,19 @@ class FakeDockerClient : DockerClient {
     /** id -> `State.Health.Status` reported by [inspectContainer] and matched by the `health` filter. */
     val health = mutableMapOf<String, String>()
 
+    /**
+     * The clock this fake stamps `State.StartedAt` from. A container it starts (or restarts) is recorded
+     * as having started *now*, which is the only thing that tells a restart the daemon carried out from
+     * one it has not got to yet — the two are indistinguishable by `Running` alone. Tests driving virtual
+     * time pass their own [FakeClock] so the stamps and the code under test read the same clock.
+     */
+    var clock: WallClock = WallClock.SYSTEM
+
     /** id -> running, as tracked through [start]/[stop]/[restart]; absent means "as registered". */
     private val running = mutableMapOf<String, Boolean>()
+
+    /** id -> `State.StartedAt` as epoch millis, set by the last [start]/[restart] that went through. */
+    private val startedAt = mutableMapOf<String, Long>()
 
     /** id -> name given by [rename]; absent means the name in the registered payload still stands. */
     private val renamed = mutableMapOf<String, String>()
@@ -210,18 +222,21 @@ class FakeDockerClient : DockerClient {
         val storedState = stored.obj("State") ?: EMPTY_OBJECT
         val alive = running[id] ?: storedState["Running"]?.jsonPrimitive?.booleanOrNull ?: true
         val declaredHealth = health[id]
+        val started = startedAt[id]
+        // What this fake models itself wins over the registered payload; everything else passes through.
+        val computed = COMPUTED_STATE_KEYS +
+            listOfNotNull("Health".takeIf { declaredHealth != null }, "StartedAt".takeIf { started != null })
         return buildJsonObject {
             stored.forEach { (key, value) -> if (key != "State" && key != "Name") put(key, value) }
             nameOf(id)?.let { put("Name", "/$it") }
             put(
                 "State",
                 buildJsonObject {
-                    storedState.forEach { (key, value) ->
-                        if (key !in COMPUTED_STATE_KEYS && !(key == "Health" && declaredHealth != null)) put(key, value)
-                    }
+                    storedState.forEach { (key, value) -> if (key !in computed) put(key, value) }
                     put("Running", alive)
                     put("ExitCode", if (alive) 0 else 1)
                     declaredHealth?.let { status -> put("Health", buildJsonObject { put("Status", status) }) }
+                    started?.let { put("StartedAt", Instant.ofEpochMilli(it).toString()) }
                 },
             )
         }
@@ -233,6 +248,7 @@ class FakeDockerClient : DockerClient {
             restartExpected += expectedStopSeconds
             if (id in failRestart) throw DockerException(500, "fake: restart failure for '$id'")
             running[id] = id !in startedThenExits
+            startedAt[id] = clock.millis()
         }
     }
 
@@ -249,6 +265,7 @@ class FakeDockerClient : DockerClient {
         op("start", id) {
             if (id in failStart) throw DockerException(500, "fake: start failure for '$id'")
             running[id] = id !in startedThenExits
+            startedAt[id] = clock.millis()
             if (id in vanishesAfterStart) {
                 containers.remove(id)
                 removed += id
@@ -282,6 +299,7 @@ class FakeDockerClient : DockerClient {
         op("remove", id) {
             if (id in failRemove) throw DockerException(500, "fake: remove failure for '$id'")
             running.remove(id)
+            startedAt.remove(id)
             renamed.remove(id)
             containers.remove(id)
             listed.removeAll { it.str("Id") == id }

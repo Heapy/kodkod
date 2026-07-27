@@ -85,15 +85,16 @@ class Autoheal(
             val again = if (attempt > 1) " (restart #$attempt for this container)" else ""
             Log.warn("$where unhealthy — restarting with $window$again")
             // Counted before the call, not after: a restart the daemon refuses is not a reason to keep
-            // asking every cycle either.
-            restarts[id] = Restart(attempt, clock.millis())
+            // asking every cycle either. The same instant is what a lost answer is read back against.
+            val issuedAt = clock.millis()
+            restarts[id] = Restart(attempt, issuedAt)
             val restarted = try {
                 api.restart(id, timeout)
                 Log.info("$where restart successful")
                 true
             } catch (e: Exception) {
                 Log.error("$where restart failed: ${e.message}")
-                restartLanded(id, where, e)
+                restartLanded(id, where, issuedAt, e)
             }
             if (restarted) restartDependents(container, name)
         }
@@ -119,26 +120,42 @@ class Autoheal(
      * A failure the daemon *did* answer (any real HTTP status: no such container, a conflict, an
      * internal error) is a verdict and is taken as one — waiting on it would only delay every other
      * unhealthy container. Only a transport failure, which carries no status at all, is unknown.
+     *
+     * What the read-back looks for is a **new** run, not merely a running container: the very case this
+     * exists for — a stop window longer than the read timeout — is one in which the daemon has not even
+     * finished stopping the container when the timeout fires, so it is still up, from before. `Running`
+     * on its own therefore answers yes at once, and autoheal would refresh the netns consumers at the
+     * moment the read timed out while the provider's namespace is torn down seconds later. So the
+     * container's own `State.StartedAt` has to be at or past [issuedAt], the instant the restart was
+     * asked for; both are readings of the same host clock (kodkod talks to a local socket).
      */
-    private fun restartLanded(id: String, where: String, failure: Exception): Boolean {
+    private fun restartLanded(id: String, where: String, issuedAt: Long, failure: Exception): Boolean {
         if (failure is DockerException && failure.status >= 400) return false
         val deadline = clock.millis() + RESTART_VERIFY_MS
         Log.warn("$where the daemon gave no usable answer — reading back whether the restart landed")
         while (true) {
             val state = runCatching { api.inspectContainer(id).obj("State") }.getOrNull()
-            if (state?.str("Running") == "true" && state.str("Restarting") != "true") {
-                Log.warn("$where it is running again — treating the restart as done and refreshing its dependents")
+            if (state != null && state.startedSince(issuedAt)) {
+                Log.warn("$where it started again — treating the restart as done and refreshing its dependents")
                 return true
             }
             if (clock.millis() >= deadline) {
                 Log.error(
-                    "$where is still not running ${RESTART_VERIFY_MS / 1000}s later — leaving its dependents " +
+                    "$where has not started again ${RESTART_VERIFY_MS / 1000}s later — leaving its dependents " +
                         "alone, restarting them against a container that is down would only spread the outage",
                 )
                 return false
             }
             sleeper.sleep(PROBE_INTERVAL_MS)
         }
+    }
+
+    /** Whether this `State` describes a container that came up again at or after [issuedAt]. */
+    private fun JsonObject.startedSince(issuedAt: Long): Boolean {
+        if (str("Running") != "true" || str("Restarting") == "true") return false
+        // A daemon that reports no start time at all leaves the restart unproven; the wait then runs out
+        // and the dependents are left alone, which is the safe half of an outcome we cannot establish.
+        return (dockerTime("StartedAt") ?: return false) >= issuedAt
     }
 
     /**

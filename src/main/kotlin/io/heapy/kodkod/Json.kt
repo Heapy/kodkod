@@ -4,6 +4,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import java.time.Instant
 
 /** Values that are treated as a truthy label/env value. */
 val TRUTHY = setOf("true", "1", "yes", "on")
@@ -29,6 +30,19 @@ val EMPTY_ARRAY = JsonArray(emptyList())
 fun JsonObject.str(key: String): String? = this[key]?.jsonPrimitive?.contentOrNull
 fun JsonObject.obj(key: String): JsonObject? = this[key] as? JsonObject
 fun JsonObject.arr(key: String): JsonArray? = this[key] as? JsonArray
+
+/**
+ * A `State` timestamp ([key] being `StartedAt` / `FinishedAt`) as epoch millis. `null` when the field is
+ * absent, unparsable, or carries the `0001-01-01T00:00:00Z` the daemon writes for "this never happened"
+ * — all three mean the same thing to a caller: the event is not on record. The daemon and kodkod share
+ * a host (the socket is local), so these are comparable with [WallClock.millis] and with each other.
+ */
+internal fun JsonObject.dockerTime(key: String): Long? =
+    str(key)
+        ?.takeIf { it.isNotBlank() }
+        ?.let { runCatching { Instant.parse(it) }.getOrNull() }
+        ?.toEpochMilli()
+        ?.takeIf { it > 0 }
 
 /** Read a container label, tolerating a missing `Labels` map. */
 fun JsonObject?.label(key: String): String? = this?.get(key)?.jsonPrimitive?.contentOrNull

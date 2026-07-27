@@ -252,6 +252,43 @@ class FakeDockerClientTest {
         assertEquals("running", state.str("Status"))
     }
 
+    /**
+     * `StartedAt` is what tells a restart the daemon carried out from one it has not got to yet — the
+     * two look identical through `Running` — so the fake has to move it exactly when a start does.
+     */
+    @Test
+    fun a_start_stamps_the_moment_it_happened_at() {
+        val clock = FakeClock(now = 1_700_000_000_000)
+        docker.clock = clock
+        docker.containers["web"] = json("""{"Name":"/web","State":{"StartedAt":"2020-01-01T00:00:00Z"}}""")
+
+        assertEquals(
+            "2020-01-01T00:00:00Z", docker.inspectContainer("web").obj("State")?.str("StartedAt"),
+            "a container nothing started answers with whatever the test registered",
+        )
+
+        docker.restart("web", timeout = null)
+
+        assertEquals(
+            "2023-11-14T22:13:20Z", docker.inspectContainer("web").obj("State")?.str("StartedAt"),
+            "the restart went through, so the container came up at the clock's `now`",
+        )
+    }
+
+    @Test
+    fun a_restart_the_daemon_refused_leaves_the_start_time_where_it_was() {
+        docker.clock = FakeClock(now = 1_700_000_000_000)
+        docker.containers["web"] = json("""{"Name":"/web","State":{"StartedAt":"2020-01-01T00:00:00Z"}}""")
+        docker.failRestart += "web"
+
+        assertThrows(DockerException::class.java) { docker.restart("web", timeout = null) }
+
+        assertEquals(
+            "2020-01-01T00:00:00Z", docker.inspectContainer("web").obj("State")?.str("StartedAt"),
+            "a restart that never happened must not read as one that did",
+        )
+    }
+
     @Test
     fun a_name_a_live_container_holds_cannot_be_taken_from_it() {
         docker.containers["web"] = json("""{"Name":"/web"}""")

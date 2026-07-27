@@ -812,6 +812,10 @@ class Updater(
                 // replacement has to prove it is actually up first.
                 verifyStarted(name, newId)
             } catch (e: Exception) {
+                // A gate that failed for want of an *answer* is not evidence about the image either:
+                // the replacement may well have been running the whole time, and remembering it would
+                // hold a good update back for `KODKOD_UPDATE_FAILURE_COOLDOWN` over a blip on the socket.
+                if (e is UnverifiableReplacement) imageBlamed = false
                 stranded = discardReplacement(name, newId)
                 throw e
             }
@@ -958,6 +962,19 @@ class Updater(
         } catch (e: Exception) {
             Log.error("[$name] could not remove ${blockingId.take(12)}, which holds the name: ${e.message}")
         }
+        // A blocker the daemon refused to delete may well still be *running* — a replacement that failed
+        // the liveness gate is stopped by nothing else — and a running container keeps this service's
+        // published ports, its network aliases and its volumes. Renaming it away would hand back the name
+        // and nothing else: the `start` that follows then fails on a port conflict and the rollback ends
+        // in ROLLBACK INCOMPLETE. No override is applied, so the container's own `StopTimeout` decides.
+        try {
+            api.stop(blockingId, config.defaultStopTimeout)
+        } catch (e: Exception) {
+            Log.warn(
+                "[$name] could not stop ${blockingId.take(12)} before moving it off the name — it may keep " +
+                    "this service's ports: ${e.message}",
+            )
+        }
         val parkedName = "${name}_kodkod_failed_${blockingId.take(12)}"
         return try {
             api.rename(blockingId, parkedName)
@@ -1040,7 +1057,7 @@ class Updater(
             if (!settled) good = 0
             if (clock.millis() >= deadline) {
                 if (readable == 0) {
-                    error(
+                    throw UnverifiableReplacement(
                         "the replacement could not be inspected once in ${config.updateVerifySeconds}s " +
                             "($unreadable unreadable probe(s)) — nothing says it is running, and the container " +
                             "it replaced is the only way back",
@@ -1209,6 +1226,15 @@ class Updater(
     }
 }
 
+/**
+ * The liveness gate ending without a single readable probe. It fails the update like any other gate
+ * failure — "we could not look" must never be spent as "it is fine" — but it is the one failure that
+ * says nothing about the *image*, and is therefore a type rather than a message: unlike a replacement
+ * seen exiting or reporting `unhealthy`, an unanswered window is just as likely to be a daemon that
+ * stopped answering while the replacement ran perfectly well.
+ */
+private class UnverifiableReplacement(message: String) : Exception(message)
+
 /** Infix of the name kodkod parks a container under while its replacement takes over the real one. */
 internal const val BACKUP_MARKER = "_kodkod_old_"
 
@@ -1228,17 +1254,6 @@ internal fun canonicalNameOfBackup(backup: String, id: String): String? =
 /** `State.Health.Status` — absent for a container whose image declares no healthcheck. */
 private fun JsonObject.healthStatus(): String? = obj("Health")?.str("Status")
 
-/**
- * A daemon timestamp ([key] being `StartedAt` / `FinishedAt`) as epoch millis. `null` when the field is
- * absent, unparsable, or carries the `0001-01-01T00:00:00Z` the daemon writes for "this never happened"
- * — all three mean the same thing to a caller: the event is not on record.
- */
-private fun JsonObject.dockerTime(key: String): Long? =
-    str(key)
-        ?.takeIf { it.isNotBlank() }
-        ?.let { runCatching { Instant.parse(it) }.getOrNull() }
-        ?.toEpochMilli()
-        ?.takeIf { it > 0 }
 
 /**
  * What one update cycle intends to do, as decided by [Updater.plan] from reads alone and carried out by

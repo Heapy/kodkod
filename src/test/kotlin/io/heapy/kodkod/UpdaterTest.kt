@@ -634,6 +634,10 @@ class UpdaterTest {
             docker.ops,
             "remove!:new-web-0",
             "rename!:web->web", // 409: the corpse owns the name
+            // Parked, but stopped first: a replacement that failed the gate may still be *running*, and
+            // a running blocker keeps this service's published ports — the `start:web` below would then
+            // fail on a port conflict and the rollback would end in ROLLBACK INCOMPLETE.
+            "stop:new-web-0",
             "rename:new-web-0->web_kodkod_failed_new-web-0",
             "rename:web->web",
             "start:web",
@@ -786,6 +790,33 @@ class UpdaterTest {
             1, log.lines().count { it.contains("could not probe the replacement") },
             "one line per unreadable window, not one per probe: $log",
         )
+    }
+
+    /**
+     * ...and it says nothing about the *image*. The blame flag is raised before `start`, so a window
+     * that failed for want of an answer used to buy the image a `KODKOD_UPDATE_FAILURE_COOLDOWN` — six
+     * hours of a service left on its old image because the socket blipped for a second. Worst with the
+     * documented `KODKOD_UPDATE_VERIFY_SECONDS=0`, where one unreadable inspect *is* the whole window.
+     */
+    @Test
+    fun a_gate_that_never_got_an_answer_is_not_held_against_the_image() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.failInspect += "new-web-0"
+        val updater = updater(docker, config(verifySeconds = "0"))
+
+        updater.runOnce()
+        val afterFirstCycle = docker.ops.size
+        docker.failInspect.clear() // the blip is over; the next replacement answers like any other
+
+        val log = captureLog { updater.runOnce() }
+
+        assertTrue(
+            docker.ops.drop(afterFirstCycle).contains("create:web"),
+            "the image was never seen failing — holding the update back for six hours over an unread " +
+                "probe is a self-inflicted outage of its own: ${docker.ops}",
+        )
+        assertFalse(log.contains("skipping this update"), "nothing was learned about the image: $log")
     }
 
     /**

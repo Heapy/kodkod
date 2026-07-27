@@ -6,6 +6,7 @@ import kotlinx.serialization.json.jsonObject
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.time.Instant
 
 /** Exercises [Autoheal.runOnce] against a [FakeDockerClient] — no Docker daemon required. */
 class AutohealTest {
@@ -276,8 +277,10 @@ class AutohealTest {
         docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
         docker.health["app000000000000"] = "unhealthy"
         docker.health["side00000000000"] = "healthy"
-        docker.containers["app000000000000"] = json("""{"Name":"/app"}""")
-        val clock = FakeClock()
+        // Up since well before the restart — and brought up again by it, which is the difference.
+        docker.containers["app000000000000"] = json("""{"Name":"/app","State":{"StartedAt":"$LONG_AGO"}}""")
+        val clock = FakeClock(now = NOW)
+        docker.clock = clock
 
         Autoheal(ReadTimeout(docker, "app000000000000"), config(monitorAll = true), null, clock, clock).runOnce()
 
@@ -285,6 +288,37 @@ class AutohealTest {
             listOf("restart:app000000000000", "restart:side00000000000"), docker.ops,
             "the daemon restarted it; only the answer was lost, and the sidecar has no eth0 either way: ${docker.ops}",
         )
+    }
+
+    /**
+     * The case the read-back exists for is a stop window longer than the socket's read timeout — which
+     * means that when the timeout fires the daemon is typically *still inside the graceful stop*: the
+     * container is up, from before, and `Running` alone answers "landed" on the very first probe. Acting
+     * on that restarts the netns consumers seconds before the provider's namespace is torn down, and
+     * says "it is running again" while doing it. Only a container that came up *since* the restart was
+     * asked for is evidence of anything.
+     */
+    @Test
+    fun a_restart_still_inside_the_graceful_stop_is_not_read_as_one_that_landed() {
+        val docker = FakeDockerClient()
+        docker.listed += summary("app000000000000", "app")
+        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
+        docker.health["app000000000000"] = "unhealthy"
+        docker.health["side00000000000"] = "healthy"
+        // Still the run it was in before the restart was asked for: nothing has happened to it yet.
+        docker.containers["app000000000000"] = json("""{"Name":"/app","State":{"StartedAt":"$LONG_AGO"}}""")
+        val clock = FakeClock(now = NOW)
+        docker.clock = clock
+        val stuck = ReadTimeout(docker, "app000000000000", carriedOut = false)
+
+        Autoheal(stuck, config(monitorAll = true), null, clock, clock).runOnce()
+
+        assertTrue(
+            docker.ops.none { it.contains("side00000000000") },
+            "the provider's namespace is about to be torn down, so refreshing its consumers now is exactly " +
+                "what abandons them: ${docker.ops}",
+        )
+        assertTrue(clock.sleeps.isNotEmpty(), "the outcome has to have been waited for, not assumed: ${clock.sleeps}")
     }
 
     @Test
@@ -297,7 +331,8 @@ class AutohealTest {
         // Registered as stopped, and it stays that way: the read-back finds nothing running.
         docker.containers["app000000000000"] = json("""{"Name":"/app","State":{"Running":false}}""")
         docker.failRestart += "app000000000000"
-        val clock = FakeClock()
+        val clock = FakeClock(now = NOW)
+        docker.clock = clock
 
         Autoheal(ReadTimeout(docker, "app000000000000"), config(monitorAll = true), null, clock, clock).runOnce()
 
@@ -465,16 +500,28 @@ class AutohealTest {
     }
 }
 /**
- * A [FakeDockerClient] whose [restart] of [target] does exactly what the daemon does and *then* reports
- * a read timeout — the shape a `stop_grace_period` longer than the socket's read timeout produces. The
- * transport error carries no HTTP status, which is what tells it apart from a daemon that said no.
+ * A [FakeDockerClient] whose [restart] of [target] reports a read timeout — the shape a
+ * `stop_grace_period` longer than the socket's read timeout produces. The transport error carries no
+ * HTTP status, which is what tells it apart from a daemon that said no.
+ *
+ * [carriedOut] is the half the caller cannot see and has to establish for itself: `true` is a daemon
+ * that did the whole restart and only lost the answer, `false` a daemon that is still inside the
+ * graceful stop — where the container is *still up from before*, which is why "is it running?" is not
+ * the question.
  */
 private class ReadTimeout(
     private val delegate: FakeDockerClient,
     private val target: String,
+    private val carriedOut: Boolean = true,
 ) : DockerClient by delegate {
     override fun restart(id: String, timeout: Int?, expectedStopSeconds: Int?) {
-        runCatching { delegate.restart(id, timeout, expectedStopSeconds) }
+        if (carriedOut || id != target) runCatching { delegate.restart(id, timeout, expectedStopSeconds) }
         if (id == target) throw DockerException(-1, "read timed out after 60000ms")
     }
 }
+
+/** A wall-clock instant the autoheal tests run "now" at — anything but the epoch, which reads as unset. */
+private val NOW = Instant.parse("2026-07-01T12:00:00Z").toEpochMilli()
+
+/** `State.StartedAt` of a container that has been up since long before this cycle. */
+private const val LONG_AGO = "2026-07-01T10:00:00.000000000Z"
