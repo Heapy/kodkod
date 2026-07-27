@@ -1690,6 +1690,11 @@ class UpdaterTest {
             log.contains("no `start` can bring back"),
             "and the reason it cannot simply be started again has to be said, not implied: $log",
         )
+        assertTrue(
+            log.contains("docker rm side"),
+            "the retry lives in this process only — a kodkod that restarts first will never look at " +
+                "this container again, so the operator has to be given the command that fixes it: $log",
+        )
         assertFalse(running(docker, "side"), "there is no way back for it this cycle: ${docker.ops}")
 
         val afterFirstCycle = docker.ops.size
@@ -1755,6 +1760,59 @@ class UpdaterTest {
         assertTrue(
             log.contains("stops trying to rebuild it"),
             "and it has to be dropped rather than chased for the life of the process: $log",
+        )
+    }
+
+    /**
+     * The other half of the stranding decision, and the half that used to be decided wrong. A netns
+     * consumer whose provider `holdBackUnsafeProviders` deliberately kept out of the cycle is recreated
+     * **alone**, against a namespace that is still there — that is the entire point of holding the
+     * provider back. If that solo recreate fails and the rollback does not land either (a port the
+     * previous process has not released is enough), what is left is a stopped container under its own
+     * name whose namespace is alive: one `docker start` away.
+     *
+     * Recording it as stranded instead means kodkod stops, renames, creates and verifies it from the
+     * image ref that has just failed here — every cycle, uncapped — and announces it with an ERROR
+     * saying its network namespace is gone, which is not true of this container at all.
+     */
+    @Test
+    fun a_consumer_whose_provider_never_moved_is_not_recorded_as_stranded() {
+        val docker = FakeDockerClient()
+        docker.container(
+            id = PROVIDER_ID, name = "app", imageRef = "app:1", currentImageId = "sha256:app-old",
+            labels = """{"kodkod.update.enable":"true"}""",
+        )
+        docker.images["app:1"] = json("""{"Id":"sha256:app-new","Config":{},"RepoDigests":[]}""")
+        // Stale as well, which is what keeps the provider out of this cycle: the recreate the provider
+        // would force on it would be built from an image ref that has moved on.
+        docker.container(
+            id = "side", imageRef = "busybox:1", currentImageId = "sha256:side-old",
+            labels = """{"kodkod.update.enable":"true"}""",
+            hostConfig = """{"NetworkMode":"container:$PROVIDER_ID"}""",
+        )
+        docker.images["busybox:1"] = json("""{"Id":"sha256:side-new","Config":{},"RepoDigests":[]}""")
+        docker.failCreate += "side"
+        docker.failStart += "side"
+        val updater = updater(docker, config(monitorAll = false))
+
+        val log = captureLog { updater.runOnce() }
+
+        assertTrue(
+            docker.ops.none { it.startsWith("create:app") },
+            "the test is worthless unless the provider really was held back: ${docker.ops}",
+        )
+        assertFalse(
+            log.contains("network namespace is gone"),
+            "the provider was never touched, so saying its namespace is gone is a falsehood: $log",
+        )
+
+        val afterFirstCycle = docker.ops.size
+        updater.runOnce()
+
+        assertTrue(
+            docker.ops.drop(afterFirstCycle).none { it.contains(":side") },
+            "a container that a `docker start` would fix must not be destroyed and rebuilt every " +
+                "cycle instead: ${docker.ops}",
         )
     }
 

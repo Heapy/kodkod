@@ -8,11 +8,29 @@ import kotlinx.serialization.json.put
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.io.ByteArrayOutputStream
+import java.io.PrintStream
 import java.time.Instant
 
 /** Exercises [Autoheal.runOnce] against a [FakeDockerClient] — no Docker daemon required. */
 class AutohealTest {
     private fun json(s: String): JsonObject = Json.parseToJsonElement(s).jsonObject
+
+    /**
+     * [Log] writes to stdout, and a decision autoheal takes about a *budget* has no other output than
+     * the line it logs — the operator's only evidence that a wait was truncated is that line.
+     */
+    private fun captureLog(block: () -> Unit): String {
+        val buffer = ByteArrayOutputStream()
+        val original = System.out
+        System.setOut(PrintStream(buffer, true))
+        try {
+            block()
+        } finally {
+            System.setOut(original)
+        }
+        return buffer.toString()
+    }
 
     /**
      * A `/containers/json` summary as the daemon returns it: compose stamps its project on every
@@ -373,6 +391,38 @@ class AutohealTest {
         assertEquals(
             listOf("restart!:app000000000000", "restart:side00000000000"), docker.ops,
             "the restart landed, late — giving up on it strands the sidecar on a dead namespace: ${docker.ops}",
+        )
+    }
+
+    /**
+     * The container's own stop window sizes the read-back, but it does not get to size it without a
+     * ceiling. The wait is held under the shared cycle lock, so it is paid by every *other* unhealthy
+     * container in the same cycle and by the whole mutating half of the update cycle — a single service
+     * with `stop_grace_period: 1h` would park kodkod for an hour. Past the cap the restart is recorded
+     * as lost, which costs this one container's dependents a refresh and nothing else.
+     */
+    @Test
+    fun a_stop_window_no_cycle_can_afford_is_capped() {
+        val docker = FakeDockerClient()
+        docker.listed += summary("app000000000000", "app")
+        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
+        docker.health["app000000000000"] = "unhealthy"
+        docker.health["side00000000000"] = "healthy"
+        docker.containers["app000000000000"] =
+            json("""{"Name":"/app","Config":{"StopTimeout":3600},"State":{"StartedAt":"$LONG_AGO"}}""")
+        val clock = FakeClock(now = NOW)
+        docker.clock = clock
+        val late = LateRestart(docker, "app000000000000", landsAfterMs = 400_000, clock = clock)
+
+        val log = captureLog { Autoheal(late, config(monitorAll = true), null, clock, clock).runOnce() }
+
+        assertEquals(
+            listOf("restart!:app000000000000"), docker.ops,
+            "an hour of stop window is not an hour the rest of the host may be held for: ${docker.ops}",
+        )
+        assertTrue(
+            log.contains("at most 300s"),
+            "and a budget that was truncated has to say so — it is why the dependents were left: $log",
         )
     }
 

@@ -183,15 +183,32 @@ class Autoheal(
      * the read timeout that already ran out — which is the safe direction: the cost of waiting too long
      * is one autoheal cycle spent on a container that is restarting, and the cost of waiting too little
      * is the silent failure above.
+     *
+     * It is capped at [RESTART_VERIFY_MAX_MS] all the same, because the wait is not paid by this
+     * container: it is spent holding the cycle lock, so every other unhealthy container in the same
+     * cycle — and the whole mutating half of the update cycle — waits behind whichever container has the
+     * longest `stop_grace_period` on the host. That value is the operator's to set and has no ceiling of
+     * its own, so this is where one is applied; the truncation is logged, and its cost is bounded (the
+     * restart is recorded as lost, which only leaves this container's dependents alone).
      */
     private fun stopWindowDeadline(inspect: JsonObject, where: String): Long? {
         val stopSeconds = inspect.obj("Config")?.str("StopTimeout")?.toIntOrNull()?.takeIf { it > 0 } ?: return null
-        val window = stopSeconds * 1000L + RESTART_VERIFY_HEADROOM_MS
+        val wanted = stopSeconds * 1000L + RESTART_VERIFY_HEADROOM_MS
+        val window = minOf(wanted, RESTART_VERIFY_MAX_MS)
         if (window <= RESTART_VERIFY_MS) return null
-        Log.info(
-            "$where its own stop timeout is ${stopSeconds}s, so the restart is given ${window / 1000}s to " +
-                "show up rather than ${RESTART_VERIFY_MS / 1000}s",
-        )
+        if (window < wanted) {
+            Log.warn(
+                "$where its own stop timeout is ${stopSeconds}s, but a restart is waited for at most " +
+                    "${RESTART_VERIFY_MAX_MS / 1000}s — every other unhealthy container and the update " +
+                    "cycle wait behind this one. If it comes back after that, its network-namespace " +
+                    "consumers are left alone rather than refreshed",
+            )
+        } else {
+            Log.info(
+                "$where its own stop timeout is ${stopSeconds}s, so the restart is given ${window / 1000}s to " +
+                    "show up rather than ${RESTART_VERIFY_MS / 1000}s",
+            )
+        }
         return clock.nanos() + millisToNanos(window)
     }
 
@@ -323,5 +340,15 @@ class Autoheal(
 
         /** Room for the SIGKILL and the teardown that follow a stop window, plus the start after them. */
         const val RESTART_VERIFY_HEADROOM_MS = 15_000L
+
+        /**
+         * The ceiling on that read-back, whatever the container's own stop window says. It is held under
+         * the shared cycle lock, so it is the one window in a cycle that an operator-set value could
+         * otherwise stretch without bound — a `stop_grace_period: 30m` would park autoheal *and* the
+         * updater for half an hour on one container. Five minutes covers every stop window a service
+         * plausibly needs (a database flushing its buffers is a minute or two) and is short enough that
+         * the next cycle is not the following hour.
+         */
+        const val RESTART_VERIFY_MAX_MS = 300_000L
     }
 }
