@@ -299,11 +299,12 @@ max-adversarial ревью репозитория дало 15 подтвержд
 - Modify: `src/e2eTest/kotlin/io/heapy/kodkod/e2e/KodkodE2eTest.kt`
 - Modify: `e2e/compose.update.yml` (при необходимости отдельный сервис)
 
-- [ ] новый e2e-сценарий: `compose up -d` → kodkod обновляет сервис → повторный `compose up -d` без изменений
-      compose-файла
-- [ ] ассерт: id контейнера после второго `compose up` совпадает с id, созданным kodkod'ом (пересоздания не было)
-- [ ] ассерт на вывод compose: сервис в состоянии `Running`, а не `Recreated`
-- [ ] прогнать `./gradlew e2eTest --tests '*composeUp*'` — зелёный (проверка «красный до задачи 4» делается
+- [x] новый e2e-сценарий: `compose up -d` → kodkod обновляет сервис → повторный `compose up -d` без изменений
+      compose-файла (`composeUpAfterKodkodUpdateKeepsTheContainer`, на существующем `compose.update.yml` —
+      отдельный сервис не понадобился: `app` уже не переопределяет ничего и несёт compose-лейблы)
+- [x] ассерт: id контейнера после второго `compose up` совпадает с id, созданным kodkod'ом (пересоздания не было)
+- [x] ассерт на вывод compose: сервис в состоянии `Running`, а не `Recreated`
+- [x] прогнать `./gradlew e2eTest --tests '*composeUp*'` — зелёный (проверка «красный до задачи 4» делается
       вручную и тест не гейтит)
 
 ### Task 6: Наследовать анонимные volume при recreate

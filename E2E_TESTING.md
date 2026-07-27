@@ -103,6 +103,7 @@ resolved config.
 |-------------|-----------------|--------------|-----------|
 | `autohealRestartsUnhealthyContainer` | Restart an unhealthy container | `compose.autoheal.yml` | no |
 | `updatePullsAndAdoptsNewImageDefaults` | Pull, recreate, adopt new image defaults | `compose.update.yml` | yes |
+| `composeUpAfterKodkodUpdateKeepsTheContainer` | A repeated `compose up -d` does not recreate what kodkod updated | `compose.update.yml` | yes |
 | `dependencyUpdateRestartsDependentAfterProvider` | `depends_on` ordering and dependent restart | `compose.deps.yml` | yes |
 | `multiNetworkContainerIsReconnectedToEveryNetwork` | Multi-network reconnect on recreate | `compose.multinet.yml` | yes |
 | `containerNetworkModeDependentIsRecreatedAfterProviderUpdate` | `network_mode: container:` rewrite | `compose.container-mode.yml` | yes |

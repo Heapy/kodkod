@@ -71,8 +71,50 @@ class KodkodE2eTest {
         assertEquals("4", inspect("{{json .Config.Healthcheck.Retries}}", "e2e-update-app-1"))
     }
 
+    /**
+     * Compose decides to recreate a container when either `com.docker.compose.config-hash` or
+     * `com.docker.compose.image` on the running container disagrees with what it computes from the
+     * (unchanged) compose file. kodkod recreates containers behind compose's back, so a plain
+     * `compose up -d` afterwards is the only honest proof that both labels survived the recreate:
+     * a stale image label makes compose throw away exactly the container kodkod just updated.
+     */
     @Test
     @Order(3)
+    fun composeUpAfterKodkodUpdateKeepsTheContainer() = e2e.scenario("update") {
+        publishVariant("v1")
+        compose("update", "up", "-d")
+        waitUntil(30, "app v1 up") { variant("e2e-update-app-1") == "v1" }
+        val originalId = inspect("{{.Id}}", "e2e-update-app-1")
+
+        publishVariant("v2")
+
+        waitUntil(90, "app updated to v2") { variant("e2e-update-app-1") == "v2" }
+        val kodkodId = inspect("{{.Id}}", "e2e-update-app-1")
+        assertNotEquals(originalId, kodkodId, "kodkod should have replaced the container before the second up")
+
+        val secondUp = compose("update", "up", "-d")
+        val appProgress = secondUp.output.lineSequence()
+            .filter { it.contains("e2e-update-app-1") }
+            .toList()
+
+        assertEquals(
+            kodkodId,
+            inspect("{{.Id}}", "e2e-update-app-1"),
+            "repeated compose up must not recreate the container kodkod created; compose said:\n${secondUp.output}",
+        )
+        assertTrue(
+            appProgress.any { it.contains("Running") },
+            "compose should report the app service as Running; got: $appProgress",
+        )
+        assertTrue(
+            appProgress.none { it.contains("Recreat", ignoreCase = true) },
+            "compose should not recreate the app service; got: $appProgress",
+        )
+        assertEquals("v2", variant("e2e-update-app-1"), "the surviving container must still be the updated one")
+    }
+
+    @Test
+    @Order(4)
     fun dependencyUpdateRestartsDependentAfterProvider() = e2e.scenario("deps") {
         publishVariant("v1")
         compose("deps", "up", "-d")
@@ -88,7 +130,7 @@ class KodkodE2eTest {
     }
 
     @Test
-    @Order(4)
+    @Order(5)
     fun multiNetworkContainerIsReconnectedToEveryNetwork() = e2e.scenario("multinet") {
         publishVariant("v1")
         compose("multinet", "up", "-d")
@@ -106,7 +148,7 @@ class KodkodE2eTest {
     }
 
     @Test
-    @Order(5)
+    @Order(6)
     fun containerNetworkModeDependentIsRecreatedAfterProviderUpdate() = e2e.scenario("container-mode") {
         publishVariant("v1")
         compose("container-mode", "up", "-d")
@@ -128,7 +170,7 @@ class KodkodE2eTest {
     }
 
     @Test
-    @Order(6)
+    @Order(7)
     fun failedRecreateRollsBackToRunningOriginal() = e2e.scenario("rollback") {
         publishVariant("v1")
         compose("rollback", "up", "-d")
@@ -148,7 +190,7 @@ class KodkodE2eTest {
     }
 
     @Test
-    @Order(7)
+    @Order(8)
     fun digestPinnedContainerIsSkipped() = e2e.scenario("digest") {
         publishVariant("v1")
         val repoDigest = inspect("{{index .RepoDigests 0}}", "${registry}/testapp:latest")
@@ -169,7 +211,7 @@ class KodkodE2eTest {
     }
 
     @Test
-    @Order(8)
+    @Order(9)
     fun monitorAllDoesNotActOnKodkodItself() = e2e.scenario("self") {
         compose("registry", "stop", check = false)
         try {
