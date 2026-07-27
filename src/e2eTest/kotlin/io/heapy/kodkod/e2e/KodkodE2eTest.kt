@@ -2,6 +2,7 @@ package io.heapy.kodkod.e2e
 
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
@@ -309,6 +310,46 @@ class KodkodE2eTest {
             "the original container must be the one running again, not a fresh replacement",
         )
         assertEquals(0, containerIdsByName("_kodkod_old_").size, "backup containers should be removed")
+    }
+
+    /**
+     * The in-process rollback covers a recreate *step* that failed; nothing in-process can cover kodkod
+     * itself being killed between `rename(app -> app_kodkod_old_<id>)` and the replacement's `start`.
+     * After that the service is down under a name no cycle looks at (discovery lists running containers
+     * only), and only a restarted kodkod can bring it back.
+     *
+     * Racing a real kodkod into that window would make a flaky test, so the window's *outcome* is
+     * reproduced with the CLI — app stopped and parked under its backup name, nothing holding the real
+     * one — which is byte-for-byte the state the daemon is left in. What only a real daemon can prove is
+     * the rest: that the `name` filter really finds the orphan, that the daemon's own name index lets
+     * the rename back through, and that the recovered container is the original one.
+     */
+    @Test
+    @Order(12)
+    fun aBackupOrphanedByAKilledKodkodIsRecoveredOnRestart() = e2e.scenario("rollback") {
+        publishVariant("v1")
+        compose("rollback", "up", "-d")
+        waitUntil(30, "app v1 up") { variant("e2e-rollback-app-1") == "v1" }
+        val originalId = inspect("{{.Id}}", "e2e-rollback-app-1")
+        assertTrue(originalId.isNotBlank(), "could not read the app container's id")
+
+        // SIGKILL, so no shutdown hook runs — then the exact daemon state that window leaves behind.
+        docker("kill", "e2e-rollback-kodkod-1")
+        docker("stop", "e2e-rollback-app-1")
+        docker("rename", "e2e-rollback-app-1", "e2e-rollback-app-1_kodkod_old_${originalId.take(12)}")
+        assertEquals(1, containerIdsByName("_kodkod_old_").size, "the orphaned backup must be set up")
+        assertFalse(running("e2e-rollback-app-1"), "nothing may be serving the service name")
+
+        docker("start", "e2e-rollback-kodkod-1")
+
+        waitUntil(60, "app recovered from the orphaned backup") { running("e2e-rollback-app-1") }
+        assertEquals(
+            originalId,
+            inspect("{{.Id}}", "e2e-rollback-app-1"),
+            "the orphaned container itself must come back, not a fresh replacement",
+        )
+        assertEquals("v1", variant("e2e-rollback-app-1"))
+        assertEquals(0, containerIdsByName("_kodkod_old_").size, "no backup name may be left behind")
     }
 }
 

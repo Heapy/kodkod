@@ -102,6 +102,23 @@ class FakeDockerClientTest {
         )
     }
 
+    @Test
+    fun the_name_filter_matches_any_part_of_a_name() {
+        summary("web", state = "running")
+        summary("web${BACKUP_MARKER}abc123456789", state = "exited")
+
+        assertEquals(
+            listOf("web${BACKUP_MARKER}abc123456789"),
+            ids(all = true, filters = mapOf("name" to listOf(BACKUP_MARKER))),
+            "the daemon matches a name filter unanchored, which is how the reconcile pass narrows all=true",
+        )
+        assertEquals(
+            listOf("web", "web${BACKUP_MARKER}abc123456789"),
+            ids(all = true, filters = mapOf("name" to listOf("web"))),
+            "a substring hit is still a hit: a name-filtered listing narrows, it does not look up",
+        )
+    }
+
     // --- ops: done vs attempted -----------------------------------------------------------
 
     @Test

@@ -131,6 +131,10 @@ class FakeDockerClient : DockerClient {
                 "status" -> state in values
                 "label" -> values.all { matchesLabel(summary.obj("Labels"), it) }
                 "health" -> health[summary.str("Id")]?.let { it in values } ?: true
+                // The daemon matches a `name` filter as an unanchored pattern over every name a
+                // container answers to, which is how the reconcile pass narrows `all=true` down to
+                // backup candidates instead of listing the whole host.
+                "name" -> values.any { needle -> summary.containerNames().any { it.contains(needle) } }
                 else -> true
             }
         }

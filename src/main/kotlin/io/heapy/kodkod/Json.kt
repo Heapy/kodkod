@@ -33,6 +33,15 @@ fun JsonObject.arr(key: String): JsonArray? = this[key] as? JsonArray
 /** Read a container label, tolerating a missing `Labels` map. */
 fun JsonObject?.label(key: String): String? = this?.get(key)?.jsonPrimitive?.contentOrNull
 
+/**
+ * Every name a `/containers/json` summary says its container answers to, without the leading slash
+ * Docker prefixes them with. A container has more than one when something links to it.
+ */
+fun JsonObject.containerNames(): List<String> =
+    arr("Names")
+        ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trimStart('/')?.takeIf(String::isNotEmpty) }
+        ?: emptyList()
+
 /** First entry of a JSON string array, or null. */
 fun JsonArray?.firstString(): String? = this?.firstOrNull()?.jsonPrimitive?.contentOrNull
 

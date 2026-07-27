@@ -39,6 +39,15 @@ data class Config(
      */
     val updateVerifyHealth: Boolean,
     val registryAuth: String?,
+    /**
+     * `KODKOD_SHUTDOWN_GRACE` — how many seconds a stopping kodkod gives the cycle in flight to
+     * finish before interrupting it. A recreate is at its most dangerous exactly here: between the
+     * rename of the old container and the start of its replacement nothing is serving the service
+     * name, so cutting the cycle short is what creates the orphaned `_kodkod_old_` backup that the
+     * next process has to reconcile. Note the operator still owns the outer deadline — Docker sends
+     * SIGKILL 10s after SIGTERM unless kodkod's own `stop_grace_period` says otherwise.
+     */
+    val shutdownGrace: Long,
 ) {
     companion object {
         fun fromEnv(get: (String) -> String? = System::getenv): Config {
@@ -63,6 +72,7 @@ data class Config(
                 updateVerifySeconds = long("KODKOD_UPDATE_VERIFY_SECONDS", 15).coerceAtLeast(0),
                 updateVerifyHealth = bool("KODKOD_UPDATE_VERIFY_HEALTH", true),
                 registryAuth = get("KODKOD_REGISTRY_AUTH")?.takeIf { it.isNotBlank() },
+                shutdownGrace = long("KODKOD_SHUTDOWN_GRACE", 30).coerceAtLeast(0),
             ).also {
                 require(it.autohealInterval > 0) { "KODKOD_AUTOHEAL_INTERVAL must be > 0 (got ${it.autohealInterval})" }
                 require(it.updateInterval > 0) { "KODKOD_UPDATE_INTERVAL must be > 0 (got ${it.updateInterval})" }

@@ -27,6 +27,24 @@ class ConfigTest {
         assertEquals(15, c.updateVerifySeconds)
         assertTrue(c.updateVerifyHealth)
         assertNull(c.registryAuth)
+        assertEquals(30, c.shutdownGrace)
+    }
+
+    @Test
+    fun reads_the_shutdown_grace_period() {
+        assertEquals(5, Config.fromEnv(env("KODKOD_SHUTDOWN_GRACE" to "5")).shutdownGrace)
+        assertEquals(
+            0, Config.fromEnv(env("KODKOD_SHUTDOWN_GRACE" to "0")).shutdownGrace,
+            "0 is a legal grace period: interrupt the cycle in flight immediately",
+        )
+        assertEquals(
+            0, Config.fromEnv(env("KODKOD_SHUTDOWN_GRACE" to "-1")).shutdownGrace,
+            "a negative grace period cannot mean \"wait backwards\" — it degrades to no wait at all",
+        )
+        assertEquals(
+            30, Config.fromEnv(env("KODKOD_SHUTDOWN_GRACE" to "soon")).shutdownGrace,
+            "an unparseable value falls back to the default rather than to no grace period at all",
+        )
     }
 
     @Test

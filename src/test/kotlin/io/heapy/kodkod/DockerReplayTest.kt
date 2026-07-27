@@ -170,6 +170,8 @@ class DockerReplayTest {
      * swallowed-error hole to fall into.
      */
     private fun syntheticExchanges(): List<RecordedExchange> = listOf(
+        // Every cycle opens with the reconcile pass looking for leftover `_kodkod_old_` backups.
+        recorded("GET", SYNTHETIC_RECONCILE_PATH, "empty"),
         recorded("GET", SYNTHETIC_LIST_PATH, "list"),
         recorded("GET", "/containers/$SYNTHETIC_ID/json", "inspect"),
     )
@@ -226,7 +228,12 @@ class DockerReplayTest {
         val SYNTHETIC_LIST_PATH = "/containers/json?all=false&filters=" +
             URLEncoder.encode("""{"status":["running"],"label":["kodkod.update.enable"]}""", StandardCharsets.UTF_8)
 
+        /** And what the reconcile pass builds: stopped containers included, narrowed to backup names. */
+        val SYNTHETIC_RECONCILE_PATH = "/containers/json?all=true&filters=" +
+            URLEncoder.encode("""{"name":["$BACKUP_MARKER"]}""", StandardCharsets.UTF_8)
+
         val SYNTHETIC_BODIES = mapOf(
+            "empty" to "[]",
             "list" to """[{"Id":"$SYNTHETIC_ID","Names":["/synthetic"],"Labels":{"kodkod.update.enable":"true"}}]""",
             // Digest-pinned, so the update check stops right after the inspect and the recording stays tiny.
             "inspect" to """

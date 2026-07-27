@@ -52,6 +52,11 @@ fun main() {
         Thread(runnable, "kodkod-worker").apply { isDaemon = true }
     }
 
+    // Before anything is scheduled, and deliberately not gated on `config.updateEnabled`: a container
+    // left parked under its `_kodkod_old_` backup name by a previous process that died mid-recreate is
+    // down *right now*, and with the updater switched off no cycle would ever come looking for it.
+    guarded("reconcile", cycleLock, updater::reconcileOrphanedBackups).run()
+
     // scheduleWithFixedDelay prevents a job from overlapping with itself; the shared lock also
     // serializes autoheal and update cycles so restart/recreate operations cannot race.
     if (config.autohealEnabled) {
@@ -70,8 +75,21 @@ fun main() {
     val shutdown = CountDownLatch(1)
     Runtime.getRuntime().addShutdownHook(
         Thread {
-            Log.info("kodkod stopping")
-            scheduler.shutdownNow()
+            // A cycle in flight may be between renaming the old container away and starting its
+            // replacement, where nothing is serving the name; interrupting it there is what leaves an
+            // orphaned backup behind. So it gets [Config.shutdownGrace] to finish on its own first, and
+            // is only interrupted if it overstays it.
+            Log.info("kodkod stopping — giving the cycle in flight up to ${config.shutdownGrace}s to finish")
+            scheduler.shutdown()
+            val finished = try {
+                scheduler.awaitTermination(config.shutdownGrace, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                false
+            }
+            if (!finished) {
+                Log.warn("the cycle in flight did not finish within ${config.shutdownGrace}s — interrupting it")
+                scheduler.shutdownNow()
+            }
             shutdown.countDown()
         },
     )

@@ -533,6 +533,32 @@ class UpdaterTest {
         assertFalse(docker.ops.contains("remove:web"), "and it must still not destroy the old container: ${docker.ops}")
     }
 
+    /**
+     * The rollback runs on the worker thread, and a shutdown interrupts exactly that thread. Every
+     * Docker call goes through a NIO channel, which refuses to do anything at all while the calling
+     * thread's interrupt flag is set — so a rollback that does not clear it first cannot rename the
+     * container back or start it, and the service stays down under its backup name with both failures
+     * merely logged.
+     */
+    @Test
+    fun a_rollback_on_an_interrupted_thread_still_restores_the_service() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        try {
+            updater(InterruptedMidRecreate(docker)).runOnce()
+
+            assertOrder(docker.ops, "rename:web->web_kodkod_old_web", "rename:web->web", "start:web")
+            assertEquals("/web", docker.inspectContainer("web").str("Name"), "the service must have its name back")
+            assertTrue(running(docker, "web"), "and it has to be running, not merely named right")
+            assertTrue(
+                Thread.currentThread().isInterrupted,
+                "the interrupt belongs to whoever asked for the shutdown and must be handed back",
+            )
+        } finally {
+            Thread.interrupted() // never leak the flag into the next test on this thread
+        }
+    }
+
     // --- liveness gate --------------------------------------------------------------------
 
     @Test
@@ -747,6 +773,108 @@ class UpdaterTest {
             "an explicitly set KODKOD_STOP_TIMEOUT is an override too: ${docker.stopTimeouts}",
         )
     }
+
+    // --- reconcile: backups orphaned by a kodkod that died mid-recreate ---------------------
+
+    @Test
+    fun an_orphaned_backup_with_nothing_serving_the_name_is_restored() {
+        val docker = FakeDockerClient()
+        docker.orphanedBackup(id = "web-old", name = "web")
+
+        // Through the cycle, not the reconcile call: an orphan is a stopped container, which the
+        // monitored set (status=running) never contains, so only a deliberate all=true look finds it.
+        updater(docker).runOnce()
+
+        assertEquals(listOf("rename:web-old->web", "start:web-old"), docker.ops)
+        assertEquals("/web", docker.inspectContainer("web-old").str("Name"))
+        assertTrue(running(docker, "web-old"), "restoring the name without starting it leaves the service down")
+    }
+
+    @Test
+    fun an_orphaned_backup_is_removed_once_its_replacement_is_running() {
+        val docker = FakeDockerClient()
+        docker.orphanedBackup(id = "web-old", name = "web")
+        docker.holder(id = "new-web", name = "web", running = true)
+
+        updater(docker).reconcileOrphanedBackups()
+
+        assertEquals(listOf("remove:web-old"), docker.ops)
+        assertEquals(
+            "/web", docker.inspectContainer("new-web").str("Name"),
+            "the running replacement keeps the name it already serves: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun an_orphaned_backup_is_restored_over_a_replacement_that_is_not_running() {
+        val docker = FakeDockerClient()
+        docker.orphanedBackup(id = "web-old", name = "web")
+        docker.holder(id = "new-web", name = "web", running = false)
+
+        updater(docker).reconcileOrphanedBackups()
+
+        assertOrder(docker.ops, "remove:new-web", "rename:web-old->web", "start:web-old")
+        assertTrue(running(docker, "web-old"), "the known-good container is the one that has to serve: ${docker.ops}")
+    }
+
+    @Test
+    fun a_backup_suffix_carrying_someone_elses_id_is_left_alone() {
+        val docker = FakeDockerClient()
+        // Looks exactly like a backup of `web` — except the short id in the suffix is not its own.
+        docker.holder(id = "impostor", name = "web_kodkod_old_deadbeef1234", running = false)
+        docker.holder(id = "web", name = "web", running = true)
+
+        updater(docker).reconcileOrphanedBackups()
+
+        assertTrue(docker.ops.isEmpty(), "a name that merely looks like a backup is somebody else's: ${docker.ops}")
+    }
+
+    /**
+     * Reconcile is not part of the update feature: with `KODKOD_UPDATE_ENABLED=false` no cycle ever
+     * runs, so if recovery were gated on it an orphan left by the previous process would stay down
+     * forever. `main` therefore calls it at startup regardless of the flag.
+     */
+    @Test
+    fun reconcile_does_not_depend_on_the_updater_being_enabled() {
+        val docker = FakeDockerClient()
+        docker.orphanedBackup(id = "web-old", name = "web")
+        val disabled = Config.fromEnv(mapOf("KODKOD_UPDATE_ENABLED" to "false")::get)
+        assertFalse(disabled.updateEnabled, "the test is worthless if the updater is on")
+
+        updater(docker, disabled).reconcileOrphanedBackups()
+
+        assertEquals(listOf("rename:web-old->web", "start:web-old"), docker.ops)
+    }
+}
+
+/**
+ * A [FakeDockerClient] that models a shutdown landing in the middle of a recreate: [create] fails the
+ * way an interrupted socket write does — leaving the thread's interrupt flag set — and every call
+ * after it keeps failing for as long as that flag is set, exactly as a NIO channel does.
+ */
+private class InterruptedMidRecreate(private val delegate: FakeDockerClient) : DockerClient by delegate {
+    override fun create(name: String, body: JsonObject, platform: String?): String {
+        Thread.currentThread().interrupt()
+        throw DockerException(-1, "fake: interrupted while creating '$name'")
+    }
+
+    override fun rename(id: String, name: String) = interruptible { delegate.rename(id, name) }
+
+    override fun start(id: String) = interruptible { delegate.start(id) }
+
+    override fun stop(id: String, timeout: Int?, expectedStopSeconds: Int?) =
+        interruptible { delegate.stop(id, timeout, expectedStopSeconds) }
+
+    override fun remove(id: String, force: Boolean) = interruptible { delegate.remove(id, force) }
+
+    override fun inspectContainer(id: String): JsonObject = interruptible { delegate.inspectContainer(id) }
+
+    private fun <T> interruptible(call: () -> T): T {
+        if (Thread.currentThread().isInterrupted) {
+            throw DockerException(-1, "fake: closed by interrupt")
+        }
+        return call()
+    }
 }
 
 /**
@@ -769,6 +897,27 @@ private class FlakyStart(
         }
         delegate.start(id)
     }
+}
+
+/**
+ * Register a container the daemon knows under [name], with no kodkod labels of its own — the shape of
+ * a bystander a reconcile pass has to reason about (who holds a name, and is it alive) rather than of
+ * an update target.
+ */
+private fun FakeDockerClient.holder(id: String, name: String, running: Boolean) {
+    val state = if (running) "running" else "exited"
+    listed += Json.parseToJsonElement("""{"Id":"$id","Names":["/$name"],"State":"$state","Labels":{}}""").jsonObject
+    containers[id] = Json.parseToJsonElement(
+        """{"Name":"/$name","Config":{},"HostConfig":{},"NetworkSettings":{"Networks":{}},"State":{"Running":$running}}""",
+    ).jsonObject
+}
+
+/**
+ * Register a container parked under its own `_kodkod_old_<short id>` backup name and stopped: exactly
+ * what a kodkod killed between `rename(old -> backup)` and the replacement's `start` leaves behind.
+ */
+private fun FakeDockerClient.orphanedBackup(id: String, name: String) {
+    holder(id = id, name = "${name}_kodkod_old_${id.take(12)}", running = false)
 }
 
 /**

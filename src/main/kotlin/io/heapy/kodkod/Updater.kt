@@ -38,7 +38,97 @@ class Updater(
 ) {
     private val ns = config.labelNamespace
 
+    /**
+     * Bring back containers a kodkod that died mid-recreate left parked under their
+     * `<name>_kodkod_old_<short id>` backup name.
+     *
+     * [rollback] covers a recreate *step* that failed, but nothing in-process can cover a SIGKILL, an
+     * OOM kill, or a host reboot between `rename(old -> backup)` and the replacement's `start`. In that
+     * window nothing holds the service name, and the container that used to serve it is stopped under a
+     * name no later cycle looks at (discovery lists running containers only) — the service is simply
+     * down until this pass finds it.
+     *
+     * Called at the top of every cycle *and* from `main` at process start, the latter regardless of
+     * [Config.updateEnabled]: an operator who switched the updater off after being burned would
+     * otherwise never get the orphan back.
+     */
+    fun reconcileOrphanedBackups() {
+        val candidates = listByName(BACKUP_MARKER) ?: return
+        for (element in candidates) {
+            val summary = element.jsonObject
+            val id = summary.str("Id") ?: continue
+            for (backupName in summary.containerNames()) {
+                val name = canonicalNameOfBackup(backupName, id) ?: continue
+                reconcileBackup(id, backupName, name)
+            }
+        }
+    }
+
+    /**
+     * Decide what a single leftover [backupName] means. The container currently holding the service
+     * [name] is what tells the two possible histories apart: a replacement that is up means the
+     * recreate got all the way through and only the cleanup was cut short, so the backup is garbage;
+     * anything else means the backup is still the only copy of a working service.
+     */
+    private fun reconcileBackup(id: String, backupName: String, name: String) {
+        // Read back from the daemon rather than from the listing above, which was narrowed to backups.
+        val holder = listByName(name)?.map { it.jsonObject }?.firstOrNull { name in it.containerNames() }
+        if (holder == null) {
+            Log.warn(
+                "[$name] found '$backupName' left over from an interrupted recreate and nothing serving " +
+                    "'$name' — restoring it",
+            )
+            restoreBackup(id, name)
+            return
+        }
+        val holderId = holder.str("Id").orEmpty()
+        if ((holder.str("State") ?: "running") == "running") {
+            Log.warn(
+                "[$name] removing '$backupName' left over from an interrupted recreate — its replacement " +
+                    "${holderId.take(12)} is running",
+            )
+            try {
+                api.remove(id, force = true)
+            } catch (e: Exception) {
+                Log.warn("[$name] could not remove the leftover backup '$backupName': ${e.message}")
+            }
+            return
+        }
+        Log.error(
+            "[$name] '$backupName' is a leftover backup and the container holding '$name' " +
+                "(${holderId.take(12)}) is not running — putting the backup back in its place",
+        )
+        if (holderId.isNotEmpty() && freeName(name, holderId)) restoreBackup(id, name)
+    }
+
+    /** Give [id] the service name back and start it; a rename that fails leaves the container alone. */
+    private fun restoreBackup(id: String, name: String) {
+        if (!renameBack(id, name)) return
+        try {
+            api.start(id)
+            Log.info("[$name] recovered from an interrupted recreate")
+        } catch (e: Exception) {
+            Log.error(
+                "[$name] restored the name of ${id.take(12)} but could not start it — the service is " +
+                    "DOWN and needs a human: ${e.message}",
+            )
+        }
+    }
+
+    /**
+     * Containers whose name contains [fragment], stopped ones included. The daemon's own `name` filter
+     * does the narrowing so the pass does not have to pull (or record) every container on the host.
+     */
+    private fun listByName(fragment: String): JsonArray? =
+        try {
+            api.listContainers(all = true, filters = mapOf("name" to listOf(fragment)))
+        } catch (e: Exception) {
+            Log.error("reconcile: could not list containers named like '$fragment': ${e.message}")
+            null
+        }
+
     fun runOnce() {
+        reconcileOrphanedBackups()
         val targets = collectTargets()
         if (targets.isEmpty()) return
 
@@ -268,7 +358,7 @@ class Updater(
             // create-time dependency moved still runs the image its label already names.
             newComposeImageId = if (target.stale) target.newImageId else null,
         )
-        val backupName = "${name}_kodkod_old_${target.id.take(12)}"
+        val backupName = backupName(name, target.id)
         // A replacement we failed to delete still owns [name], which is what the rollback needs back.
         var stranded: String? = null
 
@@ -333,15 +423,31 @@ class Updater(
      * Every step logs its own failure instead of being swallowed, and the end state is then verified
      * against the daemon: this is the last line of defence for a service kodkod itself stopped, so
      * "the rollback ran" and "the service is back" must not be the same claim.
+     *
+     * The interrupt flag is cleared for the duration and handed back afterwards. A shutdown interrupts
+     * the worker thread, and a NIO channel refuses every operation while the calling thread is
+     * interrupted — so the recreate this rollback is cleaning up after is very often one that a
+     * shutdown just killed, and running with the flag set would mean every call here fails instantly
+     * and the service stays down under its backup name with nothing but log lines to show for it.
      */
     private fun rollback(oldId: String, name: String, blockingId: String?) {
-        restoreName(oldId, name, blockingId)
-        try {
-            api.start(oldId)
-        } catch (e: Exception) {
-            Log.error("[$name] rollback: could not start the previous container ${oldId.take(12)}: ${e.message}")
+        val interrupted = Thread.interrupted()
+        if (interrupted) {
+            Log.warn("[$name] rolling back on an interrupted thread — finishing the rollback before stopping")
         }
-        verifyRolledBack(oldId, name)
+        try {
+            restoreName(oldId, name, blockingId)
+            try {
+                api.start(oldId)
+            } catch (e: Exception) {
+                Log.error("[$name] rollback: could not start the previous container ${oldId.take(12)}: ${e.message}")
+            }
+            verifyRolledBack(oldId, name)
+        } finally {
+            // The interrupt belongs to whoever asked for the shutdown; swallowing it would keep the
+            // cycle (and the JVM) running past the point it was told to stop.
+            if (interrupted) Thread.currentThread().interrupt()
+        }
     }
 
     private fun restoreName(oldId: String, name: String, blockingId: String?) {
@@ -353,33 +459,36 @@ class Updater(
         if (freeName(name, blockingId)) renameBack(oldId, name)
     }
 
+    /** Shared by the in-process rollback and the reconcile pass, hence the caller-neutral log line. */
     private fun renameBack(oldId: String, name: String): Boolean =
         try {
             api.rename(oldId, name)
             true
         } catch (e: Exception) {
-            Log.error("[$name] rollback: could not rename ${oldId.take(12)} back to '$name': ${e.message}")
+            Log.error("[$name] could not rename ${oldId.take(12)} back to '$name': ${e.message}")
             false
         }
 
     /**
      * Take [name] away from [blockingId] — by deleting it, or, if the daemon will not delete it either,
-     * by parking it under a name of its own so the original container can have its name back.
+     * by parking it under a name of its own so the container that should be serving can have its name
+     * back. Used both by the in-process rollback and by the reconcile pass, which finds the same shape
+     * of obstacle (a replacement that is not running yet owns the service name).
      */
     private fun freeName(name: String, blockingId: String): Boolean {
         try {
             api.remove(blockingId, force = true)
             return true
         } catch (e: Exception) {
-            Log.error("[$name] rollback: could not remove ${blockingId.take(12)}, which holds the name: ${e.message}")
+            Log.error("[$name] could not remove ${blockingId.take(12)}, which holds the name: ${e.message}")
         }
         val parkedName = "${name}_kodkod_failed_${blockingId.take(12)}"
         return try {
             api.rename(blockingId, parkedName)
-            Log.warn("[$name] rollback: parked the undeletable replacement as $parkedName")
+            Log.warn("[$name] parked the undeletable replacement as $parkedName")
             true
         } catch (e: Exception) {
-            Log.error("[$name] rollback: could not move ${blockingId.take(12)} off the name '$name': ${e.message}")
+            Log.error("[$name] could not move ${blockingId.take(12)} off the name '$name': ${e.message}")
             false
         }
     }
@@ -582,6 +691,22 @@ class Updater(
         const val START_RETRY_INTERVAL_MS = 1_000L
     }
 }
+
+/** Infix of the name kodkod parks a container under while its replacement takes over the real one. */
+internal const val BACKUP_MARKER = "_kodkod_old_"
+
+/** The name [id] is parked under while the replacement for [name] is created and proves itself. */
+internal fun backupName(name: String, id: String): String = "$name$BACKUP_MARKER${id.take(12)}"
+
+/**
+ * The service name [backup] is kodkod's backup *of*, or `null` when this name is not one.
+ *
+ * The discriminator is deliberately strict: the suffix has to carry the container's **own** short id,
+ * so a container an operator happened to call `web_kodkod_old_something` — or a backup of a *different*
+ * container that ended up with a similar name — is never renamed or deleted by the reconcile pass.
+ */
+internal fun canonicalNameOfBackup(backup: String, id: String): String? =
+    backup.removeSuffix(backupName("", id)).takeIf { it != backup && it.isNotEmpty() }
 
 /** `State.Health.Status` — absent for a container whose image declares no healthcheck. */
 private fun JsonObject.healthStatus(): String? = obj("Health")?.str("Status")

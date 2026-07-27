@@ -4,38 +4,45 @@
     "exchanges": [
         {
             "method": "GET",
-            "path": "/containers/json?all=false&filters=%7B%22status%22%3A%5B%22running%22%5D%2C%22label%22%3A%5B%22kodkod.update.enable%22%5D%7D",
+            "path": "/containers/json?all=true&filters=%7B%22name%22%3A%5B%22_kodkod_old_%22%5D%7D",
             "requestBodySummary": null,
             "status": 200,
             "responseFile": "0001.GET.containers-json.bin"
         },
         {
             "method": "GET",
-            "path": "/containers/e27f1ea6da076b475ba36f7d399c4e01bc7ff1b2db6f1c1da402af70701ebcd2/json",
+            "path": "/containers/json?all=false&filters=%7B%22status%22%3A%5B%22running%22%5D%2C%22label%22%3A%5B%22kodkod.update.enable%22%5D%7D",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0002.GET.containers-e27f1ea6da076b475ba36f7d399c4.bin"
+            "responseFile": "0002.GET.containers-json.bin"
         },
         {
             "method": "GET",
-            "path": "/images/sha256:aa36480a6f13b5e8a80f0690343006d526fe0dd711033d8fbeca446c273928bb/json",
+            "path": "/containers/3f67fc03ff4268b7315b9b60b1dd5ec21c66cd2eb9e0684dc1f12aad8b9d8a44/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0003.GET.images-sha256-aa36480a6f13b5e8a80f069034.bin"
+            "responseFile": "0003.GET.containers-3f67fc03ff4268b7315b9b60b1dd5.bin"
+        },
+        {
+            "method": "GET",
+            "path": "/images/sha256:8c3b127d681003161928698cfc1a2a493452ad91faab7248e98b573a64974f9b/json",
+            "requestBodySummary": null,
+            "status": 200,
+            "responseFile": "0004.GET.images-sha256-8c3b127d681003161928698cfc.bin"
         },
         {
             "method": "GET",
             "path": "/distribution/127.0.0.1:5000/testapp:latest/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0004.GET.distribution-127-0-0-1-5000-testapp-late.bin"
+            "responseFile": "0005.GET.distribution-127-0-0-1-5000-testapp-late.bin"
         },
         {
             "method": "GET",
-            "path": "/images/sha256:aa36480a6f13b5e8a80f0690343006d526fe0dd711033d8fbeca446c273928bb/json",
+            "path": "/images/sha256:8c3b127d681003161928698cfc1a2a493452ad91faab7248e98b573a64974f9b/json",
             "requestBodySummary": null,
             "status": 200,
-            "responseFile": "0005.GET.images-sha256-aa36480a6f13b5e8a80f069034.bin"
+            "responseFile": "0006.GET.images-sha256-8c3b127d681003161928698cfc.bin"
         }
     ]
 }
