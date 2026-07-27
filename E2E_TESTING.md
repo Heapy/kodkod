@@ -75,6 +75,25 @@ daemon:
 ./gradlew e2eTest -Pkodkod.e2e.useCurrentDocker=true
 ```
 
+Run the `DockerClient` contract against a real daemon:
+
+```bash
+./gradlew e2eTest -Pkodkod.e2e.useCurrentDocker=true --tests '*DockerApiContractTest*'
+```
+
+`DockerApiContractTest` is the half of the contract that proves `FakeDockerClient` is not more
+forgiving than Docker (the other half, `FakeDockerClientContractTest`, runs on every `./gradlew
+test`). It needs the flag because `DockerApi` speaks only to a unix socket while the suite's dind
+daemon is reachable over TCP — the same constraint the fixture recorder has — so without it the
+class is **skipped**, not run against the wrong daemon.
+
+It is safe to point at a working machine: every container it makes is named `kodkod-contract-*`,
+nothing else is listed, renamed or removed, and each test cleans up after itself.
+
+> **Note.** The CI job runs plain `./gradlew e2eTest`, so this class is skipped there. Until CI runs
+> it too (`TODO.md`), the daemon half of the contract is only checked when somebody runs the command
+> above — which is worth doing before trusting a change that taught the fake something new.
+
 Useful dind overrides:
 
 ```bash
@@ -143,6 +162,13 @@ see `e2eTest` sources, and that is the only reason it is here.
 ```
 
 ## What the JUnit suite does
+
+The `e2eTest` source set holds three independent things, and only the first needs the dind lifecycle:
+
+- `KodkodE2eTest` — the scenarios in the matrix above, run against Docker-in-Docker.
+- `DockerApiContractTest` — the shared `DockerClient` contract against a real daemon, gated on
+  `-Pkodkod.e2e.useCurrentDocker=true` (see Running).
+- `FixtureWriterTest` — the fixture corpus's write/swap seam, which needs no daemon at all.
 
 `KodkodE2eTest` owns the whole suite lifecycle; `E2eHarness` (same file) is the thin Docker CLI wrapper
 it drives:

@@ -81,6 +81,13 @@ recreate containers whose image tag moved (update). Kotlin, one runtime dependen
 - A new or renamed e2e scenario → the test matrix in `E2E_TESTING.md`, plus the file list when it
   brings a new compose file or `Dockerfile.<variant>`.
 - A changed request method/path/query → re-record the fixture corpus (see above).
+- Behaviour taught to `FakeDockerClient` → a case in `DockerClientContract`, so a real daemon has to
+  demonstrate it too, and a run of `DockerApiContractTest` before trusting it (see `E2E_TESTING.md`).
+- A new rule about what the cycle may leave behind → an invariant in `UpdateCycleModelTest`, not only
+  a hand-written scenario. That suite generates the stacks instead of listing them, which is the only
+  thing here that reaches a four-event sequence nobody thought to write down. Prove a new invariant
+  the way the existing ones were proven: neutralise the line that upholds it and watch that one
+  property — and only that one — go red. An invariant no mutation can break is not one.
 - **Language.** Plans (`docs/plans/`) and `TODO.md` are written in Russian; everything that ships to
   users — `README.md`, `CHANGELOG.md`, `E2E_TESTING.md`, this file, and every comment, KDoc and log
   line in the source — is English. Do not mix the two inside one file.
