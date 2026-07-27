@@ -98,12 +98,11 @@ class Updater(
      * got all the way through and only the cleanup was cut short, so the backup is garbage; nothing on
      * the name means the backup is the only copy of a working service.
      *
-     * The third case is the dangerous one, and is deliberately narrow: the holder is destroyed only
-     * when it is still in state `created`, i.e. it never ran and can only be the replacement of a
-     * recreate that was cut short between `create` and `start`. A holder that is merely *stopped* ran
-     * at some point — it may well be an up-to-date replacement an operator stopped on purpose — and
-     * force-removing a container kodkod did not create, to start an older one in its place, is not a
-     * decision this pass may take on its own.
+     * The third case — the name is held by a container that is **not** running — is the dangerous one,
+     * and is decided by [holderEverStayedUp]: a replacement that never proved itself is what a kodkod
+     * killed inside the liveness gate leaves behind, and finishing that rollback is exactly this pass's
+     * job; a replacement that ran for a long time and was stopped afterwards is somebody's decision, and
+     * force-removing it to start an older container in its place is not a call this pass may take.
      */
     private fun reconcileBackup(id: String, backupName: String, name: String) {
         // Read back from the daemon rather than from the listing above, which was narrowed to backups.
@@ -130,20 +129,63 @@ class Updater(
             }
             return
         }
-        if (holderState != "created") {
-            Log.warn(
-                "[$name] '$backupName' is a leftover backup, but the container holding '$name' " +
-                    "(${holderId.take(12)}) is $holderState rather than never-started — it has run, so it may " +
-                    "be an up-to-date replacement that was stopped on purpose. Leaving both alone: decide by " +
-                    "hand which one should serve '$name'",
-            )
+        if (holderId.isEmpty()) {
+            Log.warn("[$name] '$backupName' is a leftover backup and the daemon named no holder of '$name'")
             return
         }
-        Log.error(
-            "[$name] '$backupName' is a leftover backup and the container holding '$name' " +
-                "(${holderId.take(12)}) was created but never started — putting the backup back in its place",
-        )
-        if (holderId.isNotEmpty() && freeName(name, holderId)) restoreBackup(id, name)
+        when (holderEverStayedUp(holderId, name)) {
+            true -> Log.warn(
+                "[$name] '$backupName' is a leftover backup, but the container holding '$name' " +
+                    "(${holderId.take(12)}) is $holderState after a run long enough to have been accepted — it " +
+                    "may be an up-to-date replacement that was stopped on purpose. Leaving both alone: decide " +
+                    "by hand which one should serve '$name'",
+            )
+            null -> Log.warn(
+                "[$name] '$backupName' is a leftover backup and the container holding '$name' " +
+                    "(${holderId.take(12)}) is $holderState, but the daemon does not say how long it ran — " +
+                    "leaving both alone: decide by hand which one should serve '$name'",
+            )
+            false -> {
+                Log.error(
+                    "[$name] '$backupName' is a leftover backup and the container holding '$name' " +
+                        "(${holderId.take(12)}) never stayed up — putting the backup back in its place",
+                )
+                if (freeName(name, holderId)) restoreBackup(id, name)
+            }
+        }
+    }
+
+    /**
+     * Whether the container holding a service name ever ran long enough for kodkod to have accepted it,
+     * `null` when the daemon does not say. This is what separates the two ways a **stopped** container
+     * can come to hold the name of a service kodkod has a backup of:
+     *
+     *  - it is the replacement of a recreate that was cut short — killed before `start`, or inside
+     *    `verifyStarted` while it was crashing — and the backup is the only working copy of the service.
+     *    Discovery lists running containers only, so nothing else will ever look at either of them again;
+     *    leaving them be means the service stays down until a human notices.
+     *  - it served for a while and was stopped afterwards, which nothing in kodkod does: an operator did,
+     *    and undoing that by destroying it is not this pass's call.
+     *
+     * The discriminator is the container's own uptime against the window a replacement has to survive to
+     * be accepted ([Config.updateVerifySeconds]) — the same measure `verifyStarted` applies live, which is
+     * what makes this the completion of that decision rather than a new one. The floor underneath it
+     * matters because that window can be configured down to zero: a container that did not survive a
+     * minute never served anything, while an operator stopping one on purpose has by construction watched
+     * it run for longer.
+     */
+    private fun holderEverStayedUp(holderId: String, name: String): Boolean? {
+        val state = try {
+            api.inspectContainer(holderId).obj("State")
+        } catch (e: Exception) {
+            Log.warn("[$name] could not inspect ${holderId.take(12)}, which holds the name: ${e.message}")
+            return null
+        } ?: return null
+        // No start time at all is an answer, and the clearest one: the container was created and never
+        // run, which only a recreate cut short between `create` and `start` leaves behind.
+        val startedAt = state.dockerTime("StartedAt") ?: return false
+        val finishedAt = state.dockerTime("FinishedAt") ?: return null
+        return finishedAt - startedAt >= maxOf(config.updateVerifySeconds * 1000L, MIN_PROVEN_UPTIME_MS)
     }
 
     /** Give [id] the service name back and start it; a rename that fails leaves the container alone. */
@@ -313,10 +355,13 @@ class Updater(
      * because "sidecar with no network" is a state nothing else in the system reports.
      */
     private fun refreshCreateTimeDependents(targets: List<Target>) {
-        // Both ids of every target: what the cycle already handled must not be handled twice, and a
-        // dependent the graph recreated answers under a *new* id whose NetworkMode now names the
-        // provider by name — which would otherwise read as a fresh find and recreate it again.
-        val handled = targets.flatMapTo(HashSet()) { listOf(it.id, it.liveId) }
+        // Both ids of every target the cycle actually brought back: what it already handled must not be
+        // handled twice, and a dependent the graph recreated answers under a *new* id whose NetworkMode
+        // now names the provider by name — which would otherwise read as a fresh find and recreate it
+        // again. A target the cycle did *not* touch is not "handled" and stays in scope: the graph can
+        // only relate targets to each other, so a monitored container wired at create time to something
+        // outside the monitored set is found here or not at all.
+        val handled = targets.filter { it.toRestart }.flatMapTo(HashSet()) { listOf(it.id, it.liveId) }
         // A dependent that had to be refreshed becomes a provider in its own right: `c` joined to `b`
         // joined to `a` loses its namespace when `b` is recreated, exactly as `b` lost it when `a` was.
         // Chains are short in practice, so the queue is bounded rather than cycle-detected.
@@ -647,8 +692,8 @@ class Updater(
             "[${target.name}] skipping this update: ${newImageId.shortId()} already failed to come up on " +
                 "this container, and retrying it means stopping a healthy container for nothing — " +
                 "next attempt no earlier than ${Instant.ofEpochMilli(nextAttempt)} " +
-                "(KODKOD_UPDATE_FAILURE_COOLDOWN=${config.updateFailureCooldown}s). It is also left out of " +
-                "this cycle's dependency restarts, since recreating it would create it from that same image",
+                "(KODKOD_UPDATE_FAILURE_COOLDOWN=${config.updateFailureCooldown}s). It still follows its own " +
+                "dependencies this cycle: being left on a dead network namespace is the worse outcome",
         )
         return true
     }
@@ -1155,6 +1200,12 @@ class Updater(
          * shape kodkod should keep paying for.
          */
         const val MAX_DEPENDENT_SCANS = 32
+
+        /**
+         * Uptime below which a stopped container that holds a service name proved nothing, whatever
+         * `KODKOD_UPDATE_VERIFY_SECONDS` was set to (it may be `0`). See [holderEverStayedUp].
+         */
+        const val MIN_PROVEN_UPTIME_MS = 60_000L
     }
 }
 
@@ -1176,6 +1227,18 @@ internal fun canonicalNameOfBackup(backup: String, id: String): String? =
 
 /** `State.Health.Status` — absent for a container whose image declares no healthcheck. */
 private fun JsonObject.healthStatus(): String? = obj("Health")?.str("Status")
+
+/**
+ * A daemon timestamp ([key] being `StartedAt` / `FinishedAt`) as epoch millis. `null` when the field is
+ * absent, unparsable, or carries the `0001-01-01T00:00:00Z` the daemon writes for "this never happened"
+ * — all three mean the same thing to a caller: the event is not on record.
+ */
+private fun JsonObject.dockerTime(key: String): Long? =
+    str(key)
+        ?.takeIf { it.isNotBlank() }
+        ?.let { runCatching { Instant.parse(it) }.getOrNull() }
+        ?.toEpochMilli()
+        ?.takeIf { it > 0 }
 
 /**
  * What one update cycle intends to do, as decided by [Updater.plan] from reads alone and carried out by
@@ -1219,10 +1282,11 @@ internal class Target(
      * An update *is* available for this container but kodkod is holding it back — the same image
      * already failed to come up here and its cooldown has not run out (see `suppressedByCooldown`).
      *
-     * Such a container must not be dragged into somebody else's restart either: a recreate builds the
-     * replacement from the image **ref**, which by now resolves to exactly the image that failed, so a
-     * dependency-driven recreate would apply the very update the cooldown exists to prevent — and a
-     * plain restart of a create-time dependent would only leave it stopped. It keeps running instead.
+     * It suppresses the update and only the update. The container still follows its dependencies
+     * ([propagateLinkedRestart]): a dependency-driven recreate does build the replacement from the
+     * image **ref**, which by now resolves to exactly the image that failed — but the alternative is a
+     * create-time dependent left joined to a namespace that was destroyed this cycle, which no gate
+     * catches, no rollback undoes and no log line reports. A recreate that fails is loud and rolls back.
      */
     var updateSuppressed: Boolean = false
 
@@ -1371,9 +1435,11 @@ internal fun parseDependsOn(label: String?): List<DependsOnEdge> =
  * dependents are decided from [Target.createTimeDeps], which this subtraction does not touch, so a
  * netns consumer is never left pointing at a namespace that no longer exists.
  *
- * A container whose own update is being held back ([Target.updateSuppressed]) is left out entirely,
- * and so cannot propagate onwards either: recreating it is how the held-back image would get applied
- * anyway, and the whole point of the cooldown is that this container is not to be taken down again.
+ * A container whose own update is being held back ([Target.updateSuppressed]) takes part like any
+ * other: the cooldown suppresses that container's **image update**, and nothing else. Leaving it out
+ * of the graph would leave a create-time dependent of a container replaced this cycle pointing at a
+ * network namespace that no longer exists — `Running` with no interfaces, the one failure nothing in
+ * the system reports — and would hide it behind a log line about an update cooldown.
  */
 internal fun propagateLinkedRestart(targets: List<Target>, respectDependsOnRestart: Boolean = false) {
     val byId = targets.associateBy { it.id }
@@ -1381,7 +1447,6 @@ internal fun propagateLinkedRestart(targets: List<Target>, respectDependsOnResta
     while (changed) {
         changed = false
         for (target in targets) {
-            if (target.updateSuppressed) continue
             val restartDeps = if (respectDependsOnRestart) target.deps - target.noRestartDeps else target.deps
             if (!target.toRecreate && target.createTimeDeps.any { byId[it]?.toRestart == true }) {
                 target.linkedToRecreate = true

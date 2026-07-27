@@ -926,13 +926,14 @@ class UpdaterTest {
     }
 
     /**
-     * A recreate builds the replacement from the image **ref**, and by the time a container is being
-     * held back that ref resolves to exactly the image that failed on it. So a dependency of its being
-     * updated must not drag it through a recreate: that applies the very update the cooldown exists to
-     * prevent, and a rollback afterwards is an outage kodkod caused twice for the same reason.
+     * The cooldown suppresses the *image update*, and only that. `web` is joined to `db`'s network
+     * namespace, so replacing `db` destroys the namespace `web` is in: a `web` left out of the cycle
+     * goes on reporting `Running` with no interfaces, and the only line about it is one about an update
+     * cooldown. A recreate does build it from the ref that now resolves to the image that failed — and
+     * that failure is loud and rolls back, which a dead namespace never does.
      */
     @Test
-    fun a_container_held_back_by_a_cooldown_is_not_recreated_for_a_dependency_either() {
+    fun a_container_held_back_by_a_cooldown_still_follows_a_create_time_dependency() {
         val docker = FakeDockerClient()
         // web shares db's network namespace, so an update of db normally recreates web too.
         docker.container(
@@ -958,11 +959,13 @@ class UpdaterTest {
 
         val second = docker.ops.drop(afterFirstCycle)
         assertTrue(second.contains("create:db"), "db itself still has to be updated: $second")
-        assertTrue(
-            second.none { it.endsWith(":web") },
-            "web must not be stopped, restarted or recreated against the image that already failed: $second",
+        assertOrder(second, "stop:web", "create:db", "create:web")
+        assertEquals(
+            "container:db",
+            docker.created.last { it.first == "web" }.second.obj("HostConfig")?.str("NetworkMode"),
+            "and it has to be pointed at the replacement — by name, the reference that survives the swap",
         )
-        assertTrue(log.contains("left out of this cycle's dependency restarts"), "and it has to say so: $log")
+        assertTrue(log.contains("skipping this update"), "web's own update is still held back: $log")
     }
 
     /**
@@ -1542,20 +1545,57 @@ class UpdaterTest {
     /**
      * The one shape that must NOT be resolved by force. A recreate that got all the way through and
      * only failed to delete the backup leaves the *replacement* holding the name; an operator who then
-     * runs `docker compose stop app` leaves it stopped. Destroying it and starting the pre-update
-     * container in its place would silently undo a completed update — and destroy a container kodkod
-     * did not create, on nothing but the guess that it was ours.
+     * runs `docker compose stop app` leaves it stopped, hours later. Destroying it and starting the
+     * pre-update container in its place would silently undo a completed update — and destroy a container
+     * kodkod did not create, on nothing but the guess that it was ours.
      */
     @Test
-    fun a_stopped_holder_that_has_run_is_not_destroyed_for_the_backup() {
+    fun a_stopped_holder_that_served_for_hours_is_not_destroyed_for_the_backup() {
         val docker = FakeDockerClient()
         docker.orphanedBackup(id = "web-old", name = "web")
-        docker.holder(id = "new-web", name = "web", state = "exited")
+        docker.holder(
+            id = "new-web", name = "web", state = "exited",
+            startedAt = "2026-07-01T10:00:00.000000000Z", finishedAt = "2026-07-01T14:00:00.000000000Z",
+        )
 
         val log = captureLog { updater(docker).reconcileOrphanedBackups() }
 
         assertTrue(docker.ops.isEmpty(), "neither container may be touched on a guess: ${docker.ops}")
         assertTrue(log.contains("stopped on purpose"), "and the operator has to be told what was found: $log")
+    }
+
+    /**
+     * And the shape that must be: with the liveness gate in place kodkod sits in `verifyStarted` for
+     * seconds after every `start`, so a SIGKILL there leaves the *crashing replacement* holding the name
+     * and the known-good container parked as a backup. It is `exited`, not `created` — and discovery
+     * lists running containers only, so a pass that walks away from it leaves the service down for good.
+     */
+    @Test
+    fun a_replacement_that_died_inside_the_liveness_window_gives_the_name_back() {
+        val docker = FakeDockerClient()
+        docker.orphanedBackup(id = "web-old", name = "web")
+        docker.holder(
+            id = "new-web", name = "web", state = "exited",
+            startedAt = "2026-07-01T10:00:00.000000000Z", finishedAt = "2026-07-01T10:00:02.000000000Z",
+        )
+
+        updater(docker).reconcileOrphanedBackups()
+
+        assertOrder(docker.ops, "remove:new-web", "rename:web-old->web", "start:web-old")
+        assertTrue(running(docker, "web-old"), "the known-good container is the one that has to serve: ${docker.ops}")
+    }
+
+    /** Neither verdict can be reached without the daemon's own timestamps, so nothing is done by force. */
+    @Test
+    fun a_stopped_holder_the_daemon_gives_no_timestamps_for_is_left_alone() {
+        val docker = FakeDockerClient()
+        docker.orphanedBackup(id = "web-old", name = "web")
+        docker.holder(id = "new-web", name = "web", state = "exited", startedAt = "2026-07-01T10:00:00.000000000Z")
+
+        val log = captureLog { updater(docker).reconcileOrphanedBackups() }
+
+        assertTrue(docker.ops.isEmpty(), "a guess is not a reason to destroy a container: ${docker.ops}")
+        assertTrue(log.contains("does not say how long it ran"), "and the operator has to be told: $log")
     }
 
     @Test
@@ -1826,11 +1866,22 @@ private const val PROVIDER_ID = "app1234567890abcdef"
  * a bystander a reconcile pass has to reason about (who holds a name, and is it alive) rather than of
  * an update target.
  */
-private fun FakeDockerClient.holder(id: String, name: String, state: String) {
+private fun FakeDockerClient.holder(
+    id: String,
+    name: String,
+    state: String,
+    /** `State.StartedAt` as the daemon spells it; absent is how a container that never ran reads. */
+    startedAt: String? = null,
+    /** `State.FinishedAt`; absent for a container that never ran, or never stopped. */
+    finishedAt: String? = null,
+) {
     val running = state == "running"
+    val times = listOfNotNull(startedAt?.let { "StartedAt" to it }, finishedAt?.let { "FinishedAt" to it })
+        .joinToString("") { (key, value) -> ""","$key":"$value"""" }
     listed += Json.parseToJsonElement("""{"Id":"$id","Names":["/$name"],"State":"$state","Labels":{}}""").jsonObject
     containers[id] = Json.parseToJsonElement(
-        """{"Name":"/$name","Config":{},"HostConfig":{},"NetworkSettings":{"Networks":{}},"State":{"Running":$running}}""",
+        """{"Name":"/$name","Config":{},"HostConfig":{},"NetworkSettings":{"Networks":{}},""" +
+            """"State":{"Running":$running$times}}""",
     ).jsonObject
 }
 
