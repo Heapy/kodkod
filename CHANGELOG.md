@@ -10,7 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Liveness gate before anything irreversible: a replacement container is probed for
   `KODKOD_UPDATE_VERIFY_SECONDS` (default 15) after `start`, and the old container and image are only
   released once it has stayed up. `KODKOD_UPDATE_VERIFY_HEALTH` (default `true`) also fails an update
-  whose replacement reports `unhealthy`; a container still inside its `start_period` is accepted.
+  whose replacement reports `unhealthy`; a container still inside its `start_period` is accepted. The
+  window is watched in full unless the replacement's own healthcheck reports `healthy` — the one
+  positive answer a container can give. Without a healthcheck, "it has not exited yet" is all there is,
+  and the failures worth catching (a config error, a database that cannot be reached) surface seconds
+  in, so nothing shorter than the configured window is spent on them.
 - Memory of an image that could not come up on a container: the same update is not retried for
   `KODKOD_UPDATE_FAILURE_COOLDOWN` seconds (default 6h), so an unstartable `:latest` no longer costs a
   self-inflicted outage every cycle. Cleared as soon as the tag resolves to a different image. What

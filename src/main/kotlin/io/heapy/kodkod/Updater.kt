@@ -1424,11 +1424,22 @@ class Updater(
      * container and image on the strength of that `204` turns a bad image into an outage, so the gate
      * runs before either of them is touched and a failure goes down the ordinary rollback path.
      *
-     * [REQUIRED_GOOD_PROBES] consecutive good probes end the wait early — the happy path must not pay
-     * for the whole window. `Health=starting` is *not* good enough to exit early but is never a
-     * failure either: it is the image author's own `start_period` talking, and a container still
-     * inside it is accepted once the window runs out. Treating it as a failure would roll back healthy
-     * updates of every slow-starting service.
+     * The wait ends early on [REQUIRED_HEALTHY_PROBES] consecutive probes reporting `Health=healthy`,
+     * and on nothing else. That is the one *positive* answer a container can give — its own healthcheck
+     * ran and passed — so the window has already done its job and making a healthy stack pay the rest of
+     * it would hold the cycle lock for nothing. For an image that declares no healthcheck the only
+     * signal there is is "it has not exited yet", and a second of that proves nothing at all: a service
+     * that cannot reach its database, or whose new config is wrong, exits *after* its init, which is
+     * precisely the failure this gate exists to catch. Those replacements are watched for the whole
+     * window — which is what setting `KODKOD_UPDATE_VERIFY_SECONDS` asks for, and what its
+     * documentation promises.
+     *
+     * `Health=starting` is not an early exit either, and never a failure: it is the image author's own
+     * `start_period` talking, and a container still inside it is accepted once the window runs out.
+     * Treating it as a failure would roll back healthy updates of every slow-starting service.
+     * `healthy` is read regardless of [Config.updateVerifyHealth] — that flag decides whether a
+     * *failing* healthcheck is a verdict against the update, while a passing one is evidence the
+     * replacement is serving either way.
      *
      * A probe that could not be *read* is not a verdict — a blip on the socket says nothing about the
      * container — but neither is it evidence. A window in which no probe ever came back therefore
@@ -1440,7 +1451,7 @@ class Updater(
      */
     private fun verifyStarted(name: String, newId: String) {
         val deadline = clock.nanos() + secondsToNanos(config.updateVerifySeconds)
-        var good = 0
+        var healthy = 0
         var readable = 0
         var unreadable = 0
         while (true) {
@@ -1458,13 +1469,15 @@ class Updater(
             }
             if (state != null) readable++
             livenessFailure(state)?.let { error("the replacement did not stay up: $it") }
-            val settled = state != null && !(config.updateVerifyHealth && state.healthStatus() == "starting")
-            if (settled && ++good >= REQUIRED_GOOD_PROBES) {
+            healthy = if (state?.healthStatus() == "healthy") healthy + 1 else 0
+            if (healthy >= REQUIRED_HEALTHY_PROBES) {
                 if (unreadable > 0) Log.warn("[$name] $unreadable liveness probe(s) could not be read")
-                Log.info("[$name] replacement is up ($good consecutive probes)")
+                Log.info(
+                    "[$name] replacement reports healthy ($healthy consecutive probes) — accepting it without " +
+                        "waiting out the rest of the ${config.updateVerifySeconds}s window",
+                )
                 return
             }
-            if (!settled) good = 0
             if (clock.nanos() >= deadline) {
                 if (readable == 0) {
                     throw UnverifiableReplacement(
@@ -1474,8 +1487,8 @@ class Updater(
                     )
                 }
                 if (unreadable > 0) Log.warn("[$name] $unreadable of ${readable + unreadable} liveness probes could not be read")
-                val why = if (settled) "up but only $good/$REQUIRED_GOOD_PROBES probes in" else "still starting up"
-                Log.info("[$name] replacement is $why after ${config.updateVerifySeconds}s — accepting it")
+                val health = state?.healthStatus()?.let { " (health: $it)" }.orEmpty()
+                Log.info("[$name] replacement stayed up for ${config.updateVerifySeconds}s$health — accepting it")
                 return
             }
             sleeper.sleep(PROBE_INTERVAL_MS)
@@ -1612,8 +1625,13 @@ class Updater(
         /** Gap between liveness probes; the daemon's own state transitions are far coarser than this. */
         const val PROBE_INTERVAL_MS = 500L
 
-        /** Consecutive good probes that end the liveness wait early. */
-        const val REQUIRED_GOOD_PROBES = 3
+        /**
+         * Consecutive probes reporting `Health=healthy` that end the liveness wait early. Nothing else
+         * does: a container with no healthcheck offers no positive evidence at all, and three probes'
+         * worth of "it has not exited yet" is not a reason to destroy the only way back — see
+         * [verifyStarted].
+         */
+        const val REQUIRED_HEALTHY_PROBES = 3
 
         /** Attempts at starting a container this cycle stopped for a dependency of its own. */
         const val START_ATTEMPTS = 3

@@ -2,7 +2,9 @@ package io.heapy.kodkod
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
@@ -716,18 +718,74 @@ class UpdaterTest {
         )
     }
 
+    /**
+     * A healthcheck that passes is the one *positive* answer a replacement can give, and it is what the
+     * early exit is for: the window has already done its job, and holding the cycle lock for the rest of
+     * it buys nothing.
+     */
     @Test
-    fun a_live_replacement_ends_the_wait_early() {
+    fun a_replacement_that_reports_healthy_ends_the_wait_early() {
         val docker = FakeDockerClient()
         staleWeb(docker)
+        docker.health["new-web-0"] = "healthy" // its own healthcheck ran and passed
 
         updater(docker).runOnce()
 
         assertOrder(docker.ops, "start:new-web-0", "remove:web", "removeImage:sha256:old")
         assertEquals(
             listOf(500L, 500L), clock.sleeps,
-            "three good probes end the wait; the default 15s window would be 30 sleeps: ${clock.sleeps}",
+            "three consecutive healthy probes end the wait; the default 15s window would be 30 sleeps: ${clock.sleeps}",
         )
+    }
+
+    /**
+     * Without a healthcheck there is no positive evidence to exit on — "it has not exited yet" is the
+     * only thing the daemon says, and a second of it says nothing. So the whole configured window is
+     * spent, which is what the operator asked for by setting it.
+     */
+    @Test
+    fun a_replacement_with_no_healthcheck_is_watched_for_the_whole_window() {
+        val docker = FakeDockerClient()
+        staleWeb(docker) // the image declares no healthcheck, so `State.Health` is absent
+
+        updater(docker, config(verifySeconds = "2")).runOnce()
+
+        assertTrue(docker.ops.contains("remove:web"), "a replacement that stayed up is still accepted: ${docker.ops}")
+        assertEquals(
+            4, clock.sleeps.size,
+            "a 2s window is 2s of watching when nothing better than 'still running' is on offer: ${clock.sleeps}",
+        )
+    }
+
+    /**
+     * The failure the early exit used to walk straight into. Three good probes at 500ms ended the gate
+     * ~1s after `start` for any image without a healthcheck, whatever `KODKOD_UPDATE_VERIFY_SECONDS`
+     * said — and a replacement that cannot reach its database, or whose new config is wrong, exits
+     * *after* its init: seconds in, inside the window and far outside that second. Everything the gate
+     * guards then ran on a container that was already dying — the old container force-removed, the old
+     * image pruned — and the dead replacement was left holding the service name, invisible to every
+     * later cycle (discovery lists running containers only).
+     */
+    @Test
+    fun a_replacement_that_exits_after_the_first_probes_is_rolled_back() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        // Alive for exactly the three probes the old early exit needed, dead on the fourth (t=1.5s).
+        val dying = ExitsAfterProbes(docker, "new-web-0", probesAlive = 3)
+
+        Updater(dying, config(), selfId = null, clock, clock).runOnce()
+
+        assertOrder(docker.ops, "start:new-web-0", "remove:new-web-0", "rename:web->web", "start:web")
+        assertFalse(
+            docker.ops.contains("remove:web"),
+            "the replacement died inside the window it was supposed to be watched for, and the container " +
+                "it replaced is the only way back: ${docker.ops}",
+        )
+        assertTrue(
+            docker.removedImages.isEmpty(),
+            "nor may the image the rollback runs on be pruned: ${docker.removedImages}",
+        )
+        assertTrue(running(docker, "web"), "and the original has to be serving again, not merely intact")
     }
 
     @Test
@@ -885,16 +943,16 @@ class UpdaterTest {
     }
 
     /**
-     * The gate's early exit is on *consecutive* good probes, and the word carries the whole guarantee.
-     * Counting good probes in total lets a replacement that flapped — a probe the socket ate here, a
-     * `starting` there — collect three of them across a window it was never once stable in, and leave
-     * the gate while it is still deciding what it is. What follows is irreversible: the container it
-     * replaced is force-removed and the image it was running is pruned.
+     * The gate's early exit is on *consecutive* healthy probes, and the word carries the whole
+     * guarantee. Counting healthy probes in total lets a replacement that flapped — a probe the socket
+     * ate here, a failing healthcheck there — collect three of them across a window it was never once
+     * healthy in, and leave the gate while it is still deciding what it is. What follows is
+     * irreversible: the container it replaced is force-removed and the image it was running is pruned.
      *
      * So the run below is scripted to turn unhealthy on the one probe an early exit would never make.
      */
     @Test
-    fun a_replacement_that_flapped_does_not_leave_the_gate_on_three_good_probes_in_total() {
+    fun a_replacement_that_flapped_does_not_leave_the_gate_on_three_healthy_probes_in_total() {
         val docker = FakeDockerClient()
         staleWeb(docker)
         // Probe 4 is the third *good* probe but only the second consecutive one; probe 5 is the verdict.
@@ -2547,6 +2605,38 @@ private class ProbeScript(
             ?: throw DockerException(500, "fake: probe $probes of '$id' was not answered")
         delegate.health[target] = status
         return delegate.inspectContainer(id)
+    }
+}
+
+/**
+ * A [FakeDockerClient] whose [target] is reported running for its first [probesAlive] inspects and
+ * exited from then on — a replacement that starts, runs for a while, and dies part-way through the
+ * liveness window. [FakeDockerClient.startedThenExits] can only express a container that is dead the
+ * moment it is started, which is the one shape a gate watching a single second still catches.
+ */
+private class ExitsAfterProbes(
+    private val delegate: FakeDockerClient,
+    private val target: String,
+    private val probesAlive: Int,
+) : DockerClient by delegate {
+    private var probes = 0
+
+    override fun inspectContainer(id: String): JsonObject {
+        val inspect = delegate.inspectContainer(id)
+        if (id != target || probes++ < probesAlive) return inspect
+        return buildJsonObject {
+            inspect.forEach { (key, value) -> if (key != "State") put(key, value) }
+            put(
+                "State",
+                buildJsonObject {
+                    inspect.obj("State")?.forEach { (key, value) ->
+                        if (key != "Running" && key != "ExitCode") put(key, value)
+                    }
+                    put("Running", false)
+                    put("ExitCode", 3)
+                },
+            )
+        }
     }
 }
 

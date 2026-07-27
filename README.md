@@ -77,8 +77,8 @@ All configuration is via environment variables:
 | `KODKOD_UPDATE_START_PERIOD`   | `0`                      | Seconds to wait before the first update check.                        |
 | `KODKOD_UPDATE_MONITOR_ALL`    | `false`                  | Update **all** running containers (label becomes opt-out).            |
 | `KODKOD_UPDATE_CLEANUP`        | `true`                   | Remove the previous image after a successful update. Skipped when that image still carries a tag other than the one just updated, so a pinned rollback tag (`app:1.26`) is never untagged. |
-| `KODKOD_UPDATE_VERIFY_SECONDS` | `15`                     | How long a replacement container is watched after `start` before the container and image it replaced are destroyed. Three consecutive good probes end the wait early; `0` means one probe and move on. |
-| `KODKOD_UPDATE_VERIFY_HEALTH`  | `true`                   | Treat a replacement that has already *failed* its healthcheck as a failed update. A container still inside its `start_period` (`Health=starting`) is always accepted. |
+| `KODKOD_UPDATE_VERIFY_SECONDS` | `15`                     | How long a replacement container is watched after `start` before the container and image it replaced are destroyed. The whole window is spent unless the container's own healthcheck reports `healthy` (three consecutive probes), which is the only positive answer there is: without a healthcheck the only signal is "it has not exited yet", and a service that cannot reach its database exits *after* its init. `0` means one probe and move on. |
+| `KODKOD_UPDATE_VERIFY_HEALTH`  | `true`                   | Treat a replacement that has already *failed* its healthcheck as a failed update. A container still inside its `start_period` (`Health=starting`) is always accepted. This governs the failing verdict only — a replacement reporting `healthy` ends the wait early either way. |
 | `KODKOD_UPDATE_FAILURE_COOLDOWN` | `21600`                | Seconds an image that failed to come up on a container is left alone before that exact update is tried again — otherwise an unstartable `:latest` costs one self-inflicted outage per cycle, forever. A replacement that ran and did not stay up counts on the first failure; a `start` the daemon refused outright counts only on the second in a row, since that answer is a host problem (a port still in teardown, a resource limit) as often as an image one. `0` disables the memory. |
 | `KODKOD_DEPENDENCY_HEALTH_TIMEOUT` | `120`                | Seconds a container waits for a dependency marked `condition: service_healthy` to become healthy before starting anyway. `0` means check once and carry on. |
 | `KODKOD_RESPECT_DEPENDS_ON_RESTART` | `false`             | Obey compose's `depends_on[*].restart: false` when deciding whether to restart a dependent (see below).  |
@@ -119,7 +119,12 @@ What carries over to the replacement:
 Nothing irreversible happens on the strength of a `204` from `POST /start`: the replacement is
 probed for up to `KODKOD_UPDATE_VERIFY_SECONDS` and only then are the old container and image
 released. A replacement that exits, crash-loops or (with `KODKOD_UPDATE_VERIFY_HEALTH`) reports
-`unhealthy` is discarded and the previous container is put back.
+`unhealthy` is discarded and the previous container is put back. The wait ends early only on three
+consecutive probes reporting `Health=healthy` — the container's own healthcheck saying it is serving.
+An image that declares no healthcheck offers nothing but "it has not exited yet", so it is watched to
+the end of the window: the failures worth catching (a config error, a database that cannot be reached)
+surface *after* the process has started, and a second of watching would let every one of them through.
+That is time held under the cycle lock, once per recreated container, and the window is the knob for it.
 
 If anything fails after the container is stopped, kodkod rolls the service back: it removes the
 failed replacement, frees the service name if a corpse is still holding it, renames the original
@@ -156,10 +161,12 @@ window a replacement has to survive to be accepted:
   tests only. The recorded-fixture and end-to-end runs go with `KODKOD_UPDATE_VERIFY_HEALTH=false`,
   because the number of probes is otherwise a race between the probe interval and the replacement's
   own healthcheck.
-- With `KODKOD_UPDATE_VERIFY_HEALTH=true` (the default), a replacement reporting `Health=starting`
-  never satisfies the early exit, so a service with a long `start_period` pays the **full**
-  `KODKOD_UPDATE_VERIFY_SECONDS` — under the cycle lock, which also holds off autoheal for that long.
-  Shorten the window, or turn the health check of the gate off, if that matters more than the check.
+- Every recreate of an image **without a passing healthcheck** pays the full
+  `KODKOD_UPDATE_VERIFY_SECONDS` — under the cycle lock, which holds off autoheal for that long, once
+  per container. That covers images with no healthcheck at all as well as any replacement still inside
+  its `start_period`. Shorten the window if that matters more than how much of a bad update kodkod can
+  still take back; the trade is deliberate, since a shorter look accepts replacements that die a few
+  seconds in, and by then the container and image they replaced are gone.
 - Dependents that live **outside** the provider's compose project are only found when the project
   contains at least one create-time dependent of its own. The scan starts narrowed to the provider's
   `com.docker.compose.project` and widens to the whole daemon only when that narrow look finds

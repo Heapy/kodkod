@@ -40,3 +40,7 @@ services:
       KODKOD_AUTOHEAL_ENABLED: "false"
       KODKOD_UPDATE_INTERVAL: "15"
       KODKOD_UPDATE_START_PERIOD: "5"
+      # This scenario is about ordering and create-time fidelity, not the liveness gate — and none
+      # of its images declares a healthcheck, so the gate has no positive evidence to end on and
+      # every recreate would hold the cycle for the whole 15s default before the next one starts.
+      KODKOD_UPDATE_VERIFY_SECONDS: "2"

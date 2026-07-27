@@ -4,9 +4,13 @@
 #   stop old -> rename old -> create new (ok) -> start new (ok) -> probe: exited ->
 #   remove new -> rename old back -> start old  => original is running again, old image intact.
 #
-# The exit must happen well before the gate's three good probes (~1s) can accumulate, hence the
-# fraction of a second: a container still alive at the third probe would be accepted as a good update.
+# It dies three seconds in, and the timing is the point of the scenario. This image declares no
+# healthcheck, so the gate has no positive evidence to end on and watches the whole
+# KODKOD_UPDATE_VERIFY_SECONDS window (8s in compose.rollback.yml). Three seconds is comfortably
+# past the ~1s three-probe mark an earlier gate exited on — the shape this scenario exists to
+# catch is exactly the container that survives the first probes and then exits — and comfortably
+# inside the window, so the gate must still be watching when it happens.
 FROM busybox:1.36
 ENV APP_VARIANT=crasher
 LABEL app.variant=crasher
-CMD ["sh", "-c", "echo '[testapp] starting, then dying on purpose'; sleep 0.2; exit 1"]
+CMD ["sh", "-c", "echo '[testapp] starting, then dying on purpose'; sleep 3; exit 1"]

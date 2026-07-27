@@ -29,9 +29,9 @@ class DockerReplayTest {
 
     /**
      * Fake time, so replaying a recreate does not really sleep through the liveness gate's probe
-     * interval. The gate exits on three good probes, which the recording contains, so the clock never
-     * reaches the verification window. One per scenario: a shared clock accumulates the virtual time
-     * of every scenario before it, which would make each one's waiting budget depend on test order.
+     * interval. The gate's window is pinned to the three probes the recording contains (see
+     * [updateConfig]). One per scenario: a shared clock accumulates the virtual time of every scenario
+     * before it, which would make each one's waiting budget depend on test order.
      */
     private fun clock() = FakeClock()
 
@@ -215,11 +215,20 @@ class DockerReplayTest {
     }
 
     // Must match the recorder's config so the listContainers filter (hence request paths) line up:
-    // monitorAll=false scopes to kodkod-labelled containers. KODKOD_UPDATE_VERIFY_HEALTH=false is what
-    // makes the number of liveness probes — and therefore the number of recorded inspects of the
-    // replacement — a constant instead of a race against the new container's healthcheck.
+    // monitorAll=false scopes to kodkod-labelled containers. The number of liveness probes — and
+    // therefore the number of recorded inspects of the replacement — is what
+    // KODKOD_UPDATE_VERIFY_SECONDS=1 pins: a window only the gate's own 500ms probe interval divides,
+    // so a recreate is three inspects here and three inspects on the daemon that produced the corpus.
+    // KODKOD_UPDATE_VERIFY_HEALTH=false keeps a healthcheck that fails a beat inside that window from
+    // turning a recorded update into a recorded rollback.
     private fun updateConfig(): Config =
-        Config.fromEnv(mapOf("KODKOD_UPDATE_CLEANUP" to "true", "KODKOD_UPDATE_VERIFY_HEALTH" to "false")::get)
+        Config.fromEnv(
+            mapOf(
+                "KODKOD_UPDATE_CLEANUP" to "true",
+                "KODKOD_UPDATE_VERIFY_HEALTH" to "false",
+                "KODKOD_UPDATE_VERIFY_SECONDS" to "1",
+            )::get,
+        )
 
     private fun autohealConfig(): Config =
         Config.fromEnv(emptyMap<String, String>()::get)

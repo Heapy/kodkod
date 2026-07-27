@@ -3,8 +3,9 @@
 # app starts on a good image (v1). The runbook then pushes a bad variant to testapp:latest:
 #
 #   * `broken`  — entrypoint that cannot exec: `POST /start` itself fails.
-#   * `crasher` — starts fine and exits a moment later: `POST /start` returns 204 and only the
-#                 liveness gate's probes notice (plan task 10).
+#   * `crasher` — starts fine and exits three seconds later: `POST /start` returns 204 and only the
+#                 liveness gate's probes notice (plan task 10) — and only if the gate is still
+#                 watching that far in, which is what this flavour pins.
 #
 # Either way kodkod stops+renames app, creates the replacement, and on failure removes it and rolls
 # app back to running on v1. The container must never be left stopped, and — because the old image is
@@ -26,6 +27,7 @@ services:
       KODKOD_UPDATE_START_PERIOD: "5"
       # Don't delete the "old" image on a rollback test run.
       KODKOD_UPDATE_CLEANUP: "false"
-      # Shorter than the 15s default so a crashing replacement is judged within one update interval;
-      # still long enough for the three good probes a healthy replacement needs.
+      # Shorter than the 15s default so a crashing replacement is judged within one update interval,
+      # and comfortably longer than the three seconds the `crasher` variant stays up: testapp declares
+      # no healthcheck, so the gate has nothing to end on early and watches this whole window.
       KODKOD_UPDATE_VERIFY_SECONDS: "8"

@@ -40,12 +40,20 @@ data class Config(
      * before the container and image it replaced are destroyed. A `204` from `POST /start` only says
      * the process was launched, not that it survived, so nothing irreversible happens until this
      * window either confirms the replacement or expires. `0` means "one probe and move on".
+     *
+     * The whole window is spent unless the container's own healthcheck reports `healthy` — the one
+     * positive answer there is, which ends the wait after three consecutive probes. Without a
+     * healthcheck the only signal is "it has not exited yet", so the replacement is watched to the end
+     * of the window; a service that dies once it fails to reach its database dies *after* its init, and
+     * a shorter look would pass it. That is time the cycle lock is held, once per recreated container:
+     * this is the knob that trades it against how much of a bad update kodkod can still take back.
      */
     val updateVerifySeconds: Long,
     /**
      * `KODKOD_UPDATE_VERIFY_HEALTH` — whether a replacement that has already *failed* its healthcheck
      * counts as a failed update. A container still inside its `start_period` (`Health=starting`) never
-     * does: that period is the image author's own statement about acceptable startup time.
+     * does: that period is the image author's own statement about acceptable startup time. It governs
+     * the *failing* verdict only — a replacement reporting `healthy` ends the wait early either way.
      */
     val updateVerifyHealth: Boolean,
     /**
