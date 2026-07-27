@@ -75,15 +75,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the provider's old container is gone and the dependent's original cannot be started at all (it is
   joined to a namespace that no longer exists). The provider is therefore kept out of the cycle until
   the dependent's own image has settled, one update per cycle instead of an outage with no way back.
-- A create-time dependent that could not be recreated *and* could not be rolled back is remembered and
-  brought back on every later cycle, instead of being left stopped under its own name where neither
-  discovery (`status=running`) nor the backup reconcile (`_kodkod_old_*`) would ever look at it again.
-  What it takes is decided each cycle from the daemon: while the namespace it names is still its
-  provider's, a `start` is issued and nothing is destroyed; once that container is gone — which a later
-  cycle can do at any time, since a stopped dependent no longer holds its provider back — only a rebuild
-  against the container serving the provider's name can work, and that is what it gets. Like the
-  cooldown, this memory lives in the process: the log line says so, and names the command to run by hand
-  if kodkod restarts before the container is serving again.
+- Every container kodkod stops and does not bring back is remembered and brought back on every later
+  cycle, instead of being left stopped under its own name where neither discovery (`status=running`) nor
+  the backup reconcile (`_kodkod_old_*`) would ever look at it again. That covers a rollback that did
+  not land, a `start` the daemon refused three times over, and — this is new — an ordinary container
+  with no create-time reference at all, which used to be left to whichever human noticed first. What it
+  takes is decided each cycle from the daemon: a `start` for most of them; for a create-time dependent,
+  a `start` while the namespace it names is still its provider's, and once that container is gone —
+  which a later cycle can do at any time, since a stopped dependent no longer holds its provider back —
+  a rebuild against the container serving the provider's name. Like the cooldown, this memory lives in
+  the process: the log line says so, and names the command to run by hand if kodkod restarts before the
+  container is serving again.
+- A cycle that unwinds between its two passes no longer leaves containers stopped. The stop pass takes
+  down everything the cycle will touch before the bring-back pass starts, so an exception — or the
+  interrupt a shutdown sends once `KODKOD_SHUTDOWN_GRACE` has run out — used to leave every container it
+  had already stopped down under its own name, invisible to every later cycle. `apply` now starts them
+  again on the way out (clearing the interrupt flag for the duration, as the rollback does, since a NIO
+  channel refuses everything while it is set) and remembers any it could not. The shutdown hook waits a
+  few seconds more after interrupting the worker, so that recovery gets to make its calls before the JVM
+  exits. A `SIGKILL`, an OOM kill or a `stop_grace_period` that expires mid-recovery still leaves them
+  stopped — nothing durable tells them from containers an operator stopped, and the README says so.
 - Recreate create-time dependents (`--link` / `network_mode: container:`) when a dependency is updated,
   and resolve `network_mode: container:<id>` to a container name before any old ids are removed. This
   now also covers dependents kodkod does not monitor itself.

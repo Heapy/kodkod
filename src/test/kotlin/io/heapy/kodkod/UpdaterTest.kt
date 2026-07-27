@@ -8,6 +8,7 @@ import kotlinx.serialization.json.put
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
@@ -1577,22 +1578,111 @@ class UpdaterTest {
         assertEquals(2, clock.sleeps.count { it == 1000L }, "with a pause before each retry: ${clock.sleeps}")
     }
 
+    /**
+     * Giving up on the third attempt is not the end of it. Discovery only lists running containers, so
+     * a dependent abandoned here is in no listing kodkod ever makes again — which used to be stated in
+     * the ERROR as a fact and left at that. It is tracked instead, and every later cycle of this
+     * process tries again, which is usually all it takes: what refuses a `start` here is a port the
+     * previous process still holds or a network being rewired, not a permanent verdict.
+     */
     @Test
-    fun a_dependent_that_never_starts_is_reported_as_left_stopped() {
+    fun a_dependent_that_never_starts_is_reported_and_brought_back_by_a_later_cycle() {
         val docker = FakeDockerClient()
         dependentWeb(docker)
         docker.failStart += "web"
+        val updater = updater(docker)
 
-        val log = captureLog { updater(docker).runOnce() }
+        val log = captureLog { updater.runOnce() }
 
         assertEquals(3, docker.ops.count { it == "start!:web" }, "three attempts before giving up: ${docker.ops}")
         assertEquals(2, clock.sleeps.count { it == 1000L }, "with a pause between them: ${clock.sleeps}")
         assertTrue(
             log.contains("[web] could not be started after 3 attempts") && log.contains("LEFT STOPPED"),
-            "discovery only lists running containers, so a container abandoned here is invisible to every " +
-                "later cycle — that has to be an ERROR, not a shrug: $log",
+            "a container kodkod stopped and could not start is an ERROR, not a shrug: $log",
+        )
+        assertTrue(
+            log.contains("[web] is DOWN and could not be put back"),
+            "and it has to be tracked by name, since nothing else in the system ever will: $log",
         )
         assertFalse(running(docker, "web"), "the test is worthless if the fake started it anyway")
+
+        docker.failStart -= "web" // whatever was holding the port has let go of it
+        val second = captureLog { updater.runOnce() }
+
+        assertTrue(
+            running(docker, "web"),
+            "the container kodkod stopped is kodkod's to bring back, and no later cycle would discover " +
+                "it (discovery filters status=running): ${docker.ops}",
+        )
+        assertTrue(second.contains("[web] started again"), "which is what the operator waits to read: $second")
+    }
+
+    /**
+     * The same for a container whose *rollback* did not land: kodkod stopped it, the recreate failed,
+     * and the `start` that should have put it back was refused. It is left stopped under its own name —
+     * the one state nothing else in kodkod looks at — so it is tracked and started again next cycle.
+     * This used to be recorded only for create-time dependents, on the grounds that an ordinary
+     * container is "startable by anybody": true, but only by a human who notices first.
+     */
+    @Test
+    fun a_container_a_failed_rollback_left_stopped_is_started_by_a_later_cycle() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.failCreate += "web" // the recreate fails before a replacement exists
+        docker.failStart += "web" // ...and the rollback's own start is refused
+        val updater = updater(docker)
+
+        val log = captureLog { updater.runOnce() }
+
+        assertFalse(running(docker, "web"), "the premise: the rollback could not put the service back")
+        assertTrue(log.contains("ROLLBACK INCOMPLETE"), "which must be reported as the outage it is: $log")
+        assertTrue(
+            log.contains("[web] is DOWN and could not be put back"),
+            "and tracked, or the service stays down with nothing left to notice it: $log",
+        )
+
+        docker.failStart -= "web"
+        val second = captureLog { updater.runOnce() }
+
+        assertTrue(running(docker, "web"), "the next cycle has to put it back: ${docker.ops}")
+        assertTrue(second.contains("[web] started again"), "and say so: $second")
+    }
+
+    /**
+     * A cycle stops everything it is going to touch *before* it brings any of it back, so every
+     * container between the two passes is down. A cycle that never reaches the end of the second pass —
+     * an exception out of a health wait, or the interrupt a shutdown that ran out of
+     * `KODKOD_SHUTDOWN_GRACE` sends — used to leave all of them stopped under their own names, where
+     * discovery (`status=running`) and the backup reconcile (`_kodkod_old_*`) both walk straight past.
+     *
+     * The interrupt is modelled the way `shutdownNow` really lands: the flag is set, and a NIO channel
+     * then refuses every call made while it is — so the recovery has to clear it to do anything at all,
+     * and hand it back afterwards, exactly as the rollback does.
+     */
+    @Test
+    fun a_cycle_the_shutdown_interrupted_puts_back_what_it_had_stopped() {
+        val docker = FakeDockerClient()
+        dependentWeb(docker, dependsOn = "db:service_healthy:false")
+        docker.health["new-db-0"] = "starting" // web waits for it, and the interrupt lands in that wait
+        val daemon = ClosedByInterrupt(docker)
+
+        try {
+            assertThrows(InterruptedException::class.java) {
+                Updater(daemon, config(verifyHealth = false, verifySeconds = "0"), selfId = null, clock, Interrupting)
+                    .runOnce()
+            }
+
+            assertTrue(
+                running(docker, "web"),
+                "web was stopped for db's update and the cycle never got back to it: ${docker.ops}",
+            )
+            assertTrue(
+                Thread.currentThread().isInterrupted,
+                "the interrupt belongs to whoever asked for the shutdown and must be handed back",
+            )
+        } finally {
+            Thread.interrupted() // never leak the flag into the next test on this thread
+        }
     }
 
     // --- stop timeout ---------------------------------------------------------------------
@@ -1987,7 +2077,7 @@ class UpdaterTest {
             "a container that is gone is nobody's to rebuild: ${docker.ops}",
         )
         assertTrue(
-            log.contains("stops trying to rebuild it"),
+            log.contains("stops trying to bring it back"),
             "and it has to be dropped rather than chased for the life of the process: $log",
         )
     }
@@ -2605,6 +2695,36 @@ private class ProbeScript(
             ?: throw DockerException(500, "fake: probe $probes of '$id' was not answered")
         delegate.health[target] = status
         return delegate.inspectContainer(id)
+    }
+}
+
+/**
+ * A [Sleeper] on which `shutdownNow` lands: the worker's interrupt flag is set and the wait throws,
+ * which is what an interrupted cycle unwinds from.
+ */
+private object Interrupting : Sleeper {
+    override fun sleep(millis: Long) {
+        Thread.currentThread().interrupt()
+        throw InterruptedException("fake: the shutdown interrupted the cycle")
+    }
+}
+
+/**
+ * A [FakeDockerClient] that refuses every call made while the calling thread's interrupt flag is set,
+ * as a NIO channel does — so code unwinding from an interrupt can only reach the daemon by clearing
+ * the flag first.
+ */
+private class ClosedByInterrupt(private val delegate: FakeDockerClient) : DockerClient by delegate {
+    override fun start(id: String) = interruptible { delegate.start(id) }
+
+    override fun stop(id: String, timeout: Int?, expectedStopSeconds: Int?) =
+        interruptible { delegate.stop(id, timeout, expectedStopSeconds) }
+
+    override fun inspectContainer(id: String): JsonObject = interruptible { delegate.inspectContainer(id) }
+
+    private fun <T> interruptible(call: () -> T): T {
+        if (Thread.currentThread().isInterrupted) throw DockerException(-1, "fake: closed by interrupt")
+        return call()
     }
 }
 

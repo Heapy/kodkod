@@ -22,6 +22,12 @@ recreate containers whose image tag moved (update). Kotlin, one runtime dependen
 - **The update cycle is `plan()` (reads only, no lock) then `apply()` (mutates, under the cycle lock).**
   A pull must not hold the lock — that starves autoheal. `apply` re-checks that the world did not move
   under the plan before acting on it.
+- **A container kodkod stopped is kodkod's to bring back.** `apply` stops the whole set before bringing
+  any of it back, so anything that ends that pass early leaves containers stopped under their own names
+  — a state discovery (`status=running`) and the backup reconcile (`_kodkod_old_*`) both walk past. Every
+  such container goes into `stoppedByKodkod` and is retried each cycle; a new failure path that leaves
+  one stopped has to record it there. The memory dies with the process, and no heuristic may replace it:
+  nothing durable tells a container kodkod stopped from one an operator stopped.
 
 ## Test doubles
 

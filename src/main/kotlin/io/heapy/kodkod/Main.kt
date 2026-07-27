@@ -1,6 +1,7 @@
 package io.heapy.kodkod
 
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
@@ -83,26 +84,63 @@ fun main() {
     val shutdown = CountDownLatch(1)
     Runtime.getRuntime().addShutdownHook(
         Thread {
-            // A cycle in flight may be between renaming the old container away and starting its
-            // replacement, where nothing is serving the name; interrupting it there is what leaves an
-            // orphaned backup behind. So it gets [Config.shutdownGrace] to finish on its own first, and
-            // is only interrupted if it overstays it.
             Log.info("kodkod stopping — giving the cycle in flight up to ${config.shutdownGrace}s to finish")
-            scheduler.shutdown()
-            val finished = try {
-                scheduler.awaitTermination(config.shutdownGrace, TimeUnit.SECONDS)
-            } catch (_: InterruptedException) {
-                false
-            }
-            if (!finished) {
-                Log.warn("the cycle in flight did not finish within ${config.shutdownGrace}s — interrupting it")
-                scheduler.shutdownNow()
-            }
+            stopScheduler(scheduler, config.shutdownGrace)
             shutdown.countDown()
         },
     )
     shutdown.await()
 }
+
+/**
+ * Stop [scheduler], in two waits.
+ *
+ * The first is [graceSeconds] (`KODKOD_SHUTDOWN_GRACE`), because a cycle in flight may be between
+ * renaming the old container away and starting its replacement, where nothing is serving the name;
+ * interrupting it there is what leaves an orphaned backup behind.
+ *
+ * The second is what makes the interrupt survivable when the first one runs out. `Updater.apply` stops
+ * the whole set it is going to touch before bringing any of it back, and unwinds through a pass that
+ * starts again whatever it had stopped (`bringBackWhatIsStillDown`) — but that pass is Docker calls, and
+ * it only happens if the process is still alive to make them. Without this wait the hook returns the
+ * moment it has interrupted the worker, `main` returns, and the JVM exits out from under a recovery that
+ * had barely begun, leaving containers stopped under their own names that no later cycle will list.
+ *
+ * Both waits sit inside the operator's own deadline: Docker sends `SIGKILL` 10s after `SIGTERM` unless
+ * the container's `stop_grace_period` says otherwise, and no amount of waiting here survives that.
+ *
+ * @return whether the cycle finished on its own, without being interrupted.
+ */
+internal fun stopScheduler(scheduler: ExecutorService, graceSeconds: Long): Boolean {
+    scheduler.shutdown()
+    if (awaitTermination(scheduler, graceSeconds)) return true
+    Log.warn("the cycle in flight did not finish within ${graceSeconds}s — interrupting it")
+    scheduler.shutdownNow()
+    if (!awaitTermination(scheduler, UNWIND_GRACE_SECONDS)) {
+        Log.error(
+            "the interrupted cycle did not unwind within ${UNWIND_GRACE_SECONDS}s — a container it had " +
+                "stopped may be left stopped, under its own name, where no later cycle will look for it " +
+                "(discovery only lists running containers)",
+        )
+    }
+    return false
+}
+
+/**
+ * How long an interrupted cycle is given to put back what it had stopped. It is a handful of `start`
+ * calls against a local socket, not a wait on anything: long enough that a busy daemon can answer them,
+ * short enough to stay inside a `stop_grace_period` an operator has already stretched once for
+ * `KODKOD_SHUTDOWN_GRACE`.
+ */
+private const val UNWIND_GRACE_SECONDS = 5L
+
+/** [ExecutorService.awaitTermination], with an interrupt of our own reading as "it did not finish". */
+private fun awaitTermination(scheduler: ExecutorService, seconds: Long): Boolean =
+    try {
+        scheduler.awaitTermination(seconds, TimeUnit.SECONDS)
+    } catch (_: InterruptedException) {
+        false
+    }
 
 /**
  * One update cycle, in two halves, and only the second one under [cycleLock].

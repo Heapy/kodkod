@@ -90,8 +90,10 @@ data class Config(
      * finish before interrupting it. A recreate is at its most dangerous exactly here: between the
      * rename of the old container and the start of its replacement nothing is serving the service
      * name, so cutting the cycle short is what creates the orphaned `_kodkod_old_` backup that the
-     * next process has to reconcile. Note the operator still owns the outer deadline — Docker sends
-     * SIGKILL 10s after SIGTERM unless kodkod's own `stop_grace_period` says otherwise.
+     * next process has to reconcile — and every container the cycle had already stopped for a
+     * dependency of its own is down until it unwinds. An interrupted cycle gets a few seconds more to
+     * put those back (see `stopScheduler`). Note the operator still owns the outer deadline — Docker
+     * sends SIGKILL 10s after SIGTERM unless kodkod's own `stop_grace_period` says otherwise.
      */
     val shutdownGrace: Long,
 ) {

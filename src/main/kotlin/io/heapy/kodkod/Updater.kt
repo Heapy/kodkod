@@ -121,38 +121,43 @@ class Updater(
     }
 
     /**
-     * Create-time dependents kodkod stopped for a recreate and could not put back, by the id of the
-     * container it left stopped — see [recoverStrandedDependents].
+     * Containers kodkod stopped and did not get to bring back, by id — see [recoverStoppedContainers].
      *
-     * `holdBackUnsafeProviders` keeps the *likely* version of this failure from ever being set up, but a
-     * recreate can still fail for a reason that has nothing to do with the image (a port the previous
-     * process has not released, a network being rewired, a daemon that stopped answering mid-way). What
-     * is left when it does is a stopped container that nothing else in the system will ever look at
-     * again: discovery lists running containers only, the reconcile pass looks for `_kodkod_old_*`
-     * names, and this one is stopped under its own name.
+     * A cycle stops every container it is going to touch *first*, in reverse dependency order, and only
+     * then brings them back one at a time. Anything that ends that pass early leaves the rest stopped
+     * under their own names, and a container in that state is one nothing else in the system will ever
+     * look at again: discovery lists running containers only, and the reconcile pass looks for
+     * `_kodkod_old_*` names. The shapes that get here are a recreate whose rollback did not land, a
+     * dependent whose `start` was refused [START_ATTEMPTS] times, and the bring-back loop being cut
+     * short — by an exception, or by the interrupt a shutdown sends it.
      *
-     * That is true whether or not the namespace it is joined to is still alive, which is why both are
-     * kept here. A consumer whose provider was merely held back is one `start` from serving — but only
-     * until a later cycle updates that provider (the consumer is stopped, so nothing holds it back any
-     * more) and force-removes the container this one names by id. Forgetting it because it looks
-     * recoverable *today* is what turns a recoverable outage into a permanent, silent one.
+     * For a create-time dependent the entry also carries the name of the container whose network
+     * namespace it belongs in, because for that one a `start` may not be enough. It is kept whether or
+     * not the namespace is still alive: a consumer whose provider was merely held back is one `start`
+     * from serving *today*, and beyond one the moment a later cycle updates that provider (the consumer
+     * is stopped, so nothing holds it back any more) and force-removes the container it names by id.
+     * Forgetting it because it looks recoverable now is what turns a recoverable outage into a
+     * permanent, silent one.
      *
-     * The same sentence is why this memory is process-local and cannot be rebuilt after a restart of
-     * kodkod itself. What the daemon holds is a stopped container whose `HostConfig.NetworkMode` names
-     * an id that resolves to nothing — and nothing anywhere naming the provider it should be rebuilt
-     * against, since that id died with the container. Nor is there a marker kodkod could leave: Docker
-     * has no way to label or annotate a container that already exists, and the container that is
-     * stranded is the *original*, not one kodkod created. So [rememberStranded] states the limit out
-     * loud and names the command that fixes it instead of promising a recovery that a restart drops.
+     * This memory is process-local and cannot be rebuilt after a restart of kodkod itself, because
+     * nothing durable tells a container *kodkod* stopped from one an operator stopped: both are simply
+     * `exited`, with an exit code as likely to be 143 for one as for the other. Docker has no way to
+     * label or annotate a container that already exists, and these are the operator's *original*
+     * containers, not ones kodkod created — there is nowhere to write the intent. So [rememberStopped]
+     * states the limit out loud and names the command that fixes it instead of promising a recovery a
+     * restart drops, and no heuristic is invented to guess at it later: one that started containers
+     * again would sooner or later fight a deliberate `docker stop`.
      */
-    private val strandedDependents = LinkedHashMap<String, StrandedDependent>()
+    private val stoppedByKodkod = LinkedHashMap<String, StoppedContainer>()
 
     /**
-     * A container [recoverStrandedDependents] has to bring back, and the name of the container whose
-     * network namespace it belongs in — the one reference that survives the provider being replaced,
-     * and what says whether the namespace it is joined to right now is still the right one.
+     * A container [recoverStoppedContainers] has to bring back, and — for a create-time dependent — the
+     * name of the container whose network namespace it belongs in, the one reference that survives the
+     * provider being replaced and what says whether the namespace it is joined to right now is still the
+     * right one. `null` for every container a plain `start` puts back, and for a netns consumer whose
+     * provider kodkod never managed to resolve a name for (there is nothing to rebuild it against).
      */
-    private class StrandedDependent(val name: String, val providerName: String)
+    private class StoppedContainer(val name: String, val providerName: String?)
 
     /**
      * Bring back containers a kodkod that died mid-recreate left parked under their
@@ -318,11 +323,11 @@ class Updater(
         }
 
     /**
-     * Bring back the create-time dependents a failed recreate left stopped (see [strandedDependents]),
-     * by whichever of the two means the container actually needs.
+     * Bring back the containers kodkod stopped and did not put back (see [stoppedByKodkod]), by
+     * whichever of the two means each one actually needs.
      *
      * Which one that is, is asked of the daemon **here**, every cycle, rather than decided once when the
-     * container was recorded: the same container is one `start` away while the namespace it names is
+     * container was recorded: a create-time dependent is one `start` away while the namespace it names is
      * alive, and beyond one the moment a later cycle replaces the container that provided it. A rebuild
      * stops, renames, creates and verifies from an image ref that may well have moved on, so it is only
      * spent where nothing cheaper can work — and a `start` is only offered where it can actually
@@ -335,38 +340,35 @@ class Updater(
      * image the tag has since moved on from) is one that later cycles fix by themselves. An entry is
      * dropped as soon as it stops meaning anything: the container came back up, somebody removed it, or
      * kodkod put it back.
-     *
-     * A rollback that failed for a container with no create-time reference at all is deliberately not
-     * remembered: that one is intact under its own name and startable by anybody, today and in a week,
-     * so it is a human's call rather than a memory that dies with this process.
      */
-    private fun recoverStrandedDependents() {
-        if (strandedDependents.isEmpty()) return
+    private fun recoverStoppedContainers() {
+        if (stoppedByKodkod.isEmpty()) return
         // A snapshot: a rebuild that fails puts its own entry straight back.
-        for ((id, stranded) in strandedDependents.toList()) {
+        for ((id, stopped) in stoppedByKodkod.toList()) {
             val inspect = try {
                 api.inspectContainer(id)
             } catch (e: Exception) {
                 if (e is DockerException && e.status == 404) {
                     Log.warn(
-                        "[${stranded.name}] the container kodkod left stopped is gone — whoever removed it owns " +
-                            "the service now, kodkod stops trying to rebuild it",
+                        "[${stopped.name}] the container kodkod left stopped is gone — whoever removed it owns " +
+                            "the service now, kodkod stops trying to bring it back",
                     )
-                    strandedDependents.remove(id)
+                    stoppedByKodkod.remove(id)
                 } else {
-                    Log.warn("[${stranded.name}] could not check on the container kodkod left stopped: ${e.message}")
+                    Log.warn("[${stopped.name}] could not check on the container kodkod left stopped: ${e.message}")
                 }
                 continue
             }
             if (inspect.obj("State")?.str("Running") == "true") {
-                Log.info("[${stranded.name}] is running again — nothing left to rebuild")
-                strandedDependents.remove(id)
+                Log.info("[${stopped.name}] is running again — nothing left to bring back")
+                stoppedByKodkod.remove(id)
                 continue
             }
-            if (netnsStillHeldBy(inspect, stranded.providerName)) {
-                startStranded(id, stranded)
+            val provider = stopped.providerName
+            if (provider == null || netnsStillHeldBy(inspect, provider)) {
+                startStopped(id, stopped)
             } else {
-                rebuildStranded(id, inspect, stranded)
+                rebuildStopped(id, inspect, stopped, provider)
             }
         }
     }
@@ -394,36 +396,36 @@ class Updater(
         return provider.str("Name")?.trimStart('/') == providerName
     }
 
-    /** The `start` the rollback could not make, for a container whose namespace is still there. */
-    private fun startStranded(id: String, stranded: StrandedDependent) {
+    /** The `start` the cycle could not make, for a container nothing else stands in the way of. */
+    private fun startStopped(id: String, stopped: StoppedContainer) {
+        val why = stopped.providerName
+            ?.let { ", and the namespace it is joined to is still $it's" }
+            .orEmpty()
         try {
             api.start(id)
-            Log.info(
-                "[${stranded.name}] started again — it was left stopped by a recreate that could not be " +
-                    "rolled back, and the namespace it is joined to is still ${stranded.providerName}'s",
-            )
-            strandedDependents.remove(id)
+            Log.info("[${stopped.name}] started again — kodkod had left it stopped$why")
+            stoppedByKodkod.remove(id)
         } catch (e: Exception) {
             Log.error(
-                "[${stranded.name}] is still DOWN — kodkod left it stopped and starting it again failed, so it " +
+                "[${stopped.name}] is still DOWN — kodkod left it stopped and starting it again failed, so it " +
                     "will be tried on every cycle: ${e.message}",
             )
         }
     }
 
     /** The only thing left for a container whose namespace died with the container that provided it. */
-    private fun rebuildStranded(id: String, inspect: JsonObject, stranded: StrandedDependent) {
+    private fun rebuildStopped(id: String, inspect: JsonObject, stopped: StoppedContainer, providerName: String) {
         Log.warn(
-            "[${stranded.name}] was left stopped by a recreate that could not be rolled back, and its " +
-                "network namespace is gone — rebuilding it against ${stranded.providerName}",
+            "[${stopped.name}] was left stopped by a recreate that could not be rolled back, and its " +
+                "network namespace is gone — rebuilding it against $providerName",
         )
-        val target = netnsRecreateTarget(id, inspect, stranded.providerName)
+        val target = netnsRecreateTarget(id, inspect, providerName)
         try {
             recreate(target)
-            strandedDependents.remove(id)
-            Log.info("[${stranded.name}] is serving again")
+            stoppedByKodkod.remove(id)
+            Log.info("[${stopped.name}] is serving again")
         } catch (e: Exception) {
-            Log.error("[${stranded.name}] could not be rebuilt and is still DOWN: ${e.message}")
+            Log.error("[${stopped.name}] could not be rebuilt and is still DOWN: ${e.message}")
         }
     }
 
@@ -529,39 +531,128 @@ class Updater(
      * Carry out [plan] — the half that stops, renames, creates, starts and removes, and therefore the
      * only half that has to be serialized against autoheal.
      *
-     * [reconcileOrphanedBackups] and [recoverStrandedDependents] belong here rather than in [plan] for the
+     * [reconcileOrphanedBackups] and [recoverStoppedContainers] belong here rather than in [plan] for the
      * same reason: they rename, create and start containers. They stay first in the cycle, and
      * unconditional — both are about a service that is down right now, and a cycle that found nothing to
      * update is exactly the cycle that would otherwise walk past it.
+     *
+     * The two loops are wrapped in a `finally` because everything between them is a container that is
+     * **down**: the pass stops the whole set before bringing any of it back, so anything that ends the
+     * second loop early — an exception, or the interrupt a shutdown sends — would otherwise leave those
+     * containers stopped under their own names, where discovery (`status=running`) and
+     * [reconcileOrphanedBackups] (`_kodkod_old_*`) both walk straight past them. See
+     * [bringBackWhatIsStillDown] for what that covers and what only a `SIGKILL` can still leave behind.
      */
     internal fun apply(plan: UpdatePlan) {
         reconcileOrphanedBackups()
-        recoverStrandedDependents()
+        recoverStoppedContainers()
         if (!plan.hasWork || !isCurrent(plan)) return
         val ordered = plan.targets
 
-        // Stop dependents before the dependencies they rely on.
-        for (target in ordered.asReversed()) {
-            if (!target.toRestart) continue
-            try {
-                stopGracefully(target)
-            } catch (e: Exception) {
-                Log.error("[${target.name}] stop failed: ${e.message}")
+        // Ids this cycle has taken down and not yet put back. A target is added *before* its stop, not
+        // after: a stop that failed may have stopped the container anyway, and the recovery below asks
+        // the daemon what state each one is really in rather than assuming.
+        val down = HashSet<String>()
+        try {
+            // Stop dependents before the dependencies they rely on.
+            for (target in ordered.asReversed()) {
+                if (!target.toRestart) continue
+                down += target.id
+                try {
+                    stopGracefully(target)
+                } catch (e: Exception) {
+                    Log.error("[${target.name}] stop failed: ${e.message}")
+                }
             }
-        }
-        // Bring everything back in dependency order: recreate stale/create-time-linked containers,
-        // restart ordinary dependents.
-        val byId = ordered.associateBy { it.id }
-        for (target in ordered) {
-            if (!target.toRestart) continue
-            awaitHealthyDependencies(target, byId)
-            try {
-                if (target.toRecreate) recreate(target) else startDependent(target)
-            } catch (e: Exception) {
-                Log.error("[${target.name}] ${if (target.toRecreate) "recreate" else "restart"} failed: ${e.message}")
+            // Bring everything back in dependency order: recreate stale/create-time-linked containers,
+            // restart ordinary dependents.
+            val byId = ordered.associateBy { it.id }
+            for (target in ordered) {
+                if (!target.toRestart) continue
+                awaitHealthyDependencies(target, byId)
+                try {
+                    // A recreate that returns has removed the old container; a `start` that returns
+                    // false has already recorded the container it could not bring back.
+                    if (target.toRecreate) {
+                        recreate(target)
+                        down -= target.id
+                    } else if (startDependent(target)) {
+                        down -= target.id
+                    }
+                } catch (e: Exception) {
+                    Log.error("[${target.name}] ${if (target.toRecreate) "recreate" else "restart"} failed: ${e.message}")
+                }
             }
+        } finally {
+            bringBackWhatIsStillDown(ordered, down)
         }
         refreshCreateTimeDependents(ordered)
+    }
+
+    /**
+     * Start whatever this cycle stopped and never brought back, in dependency order, and remember any
+     * container that would not start so later cycles keep trying ([recoverStoppedContainers]).
+     *
+     * This runs on the way out of [apply] whether it returned or threw, because the shape it exists for
+     * is the one that never reaches the end of the bring-back loop: an exception out of a health wait,
+     * or the `InterruptedException` a shutdown that ran out of [Config.shutdownGrace] delivers. Both
+     * used to leave every container the cycle had already stopped stopped **under its own name** — a
+     * state nothing else in kodkod ever looks at again.
+     *
+     * The daemon is asked about each one rather than assumed: a container that is running was put back
+     * by the rollback of the recreate that failed, and one the daemon no longer knows was consumed by a
+     * recreate that got that far. Neither is this pass's business, and starting a container somebody
+     * else's code already dealt with is how a recovery becomes a bug of its own. A container
+     * [rememberStopped] already recorded is skipped for the same reason — that entry knows more about
+     * what it needs (a rebuild, not a `start`) than this pass does.
+     *
+     * The interrupt flag is cleared for the duration and handed back afterwards, exactly as [rollback]
+     * does and for the same reason: a NIO channel refuses every operation while the calling thread is
+     * interrupted, so the one case this pass matters most for is the one where it could otherwise do
+     * nothing at all.
+     *
+     * What it cannot cover is a process that does not unwind: `SIGKILL`, an OOM kill, a host that lost
+     * power — or a `SIGTERM` whose grace period runs out before this pass finishes (see `main`). Those
+     * leave the containers stopped, and nothing distinguishes them from ones an operator stopped, so
+     * nothing goes looking. That residue is documented in the README's Limitations.
+     */
+    private fun bringBackWhatIsStillDown(ordered: List<Target>, down: Set<String>) {
+        if (down.isEmpty()) return
+        val interrupted = Thread.interrupted()
+        if (interrupted) {
+            Log.warn("update: the cycle was interrupted — putting back what it had stopped before stopping")
+        }
+        try {
+            for (target in ordered) {
+                if (target.id !in down || target.id in stoppedByKodkod) continue
+                val state = try {
+                    api.inspectContainer(target.id).obj("State")
+                } catch (e: Exception) {
+                    if (e is DockerException && e.status == 404) continue
+                    Log.error(
+                        "[${target.name}] was stopped by this cycle and could not be inspected afterwards, so " +
+                            "kodkod cannot tell whether it is serving: ${e.message}",
+                    )
+                    rememberStopped(target)
+                    continue
+                }
+                if (state?.str("Running") == "true") continue
+                try {
+                    api.start(target.id)
+                    Log.warn(
+                        "[${target.name}] was stopped for an update this cycle did not finish — started it " +
+                            "again, unchanged",
+                    )
+                } catch (e: Exception) {
+                    Log.error("[${target.name}] could not be started again: ${e.message}")
+                    rememberStopped(target)
+                }
+            }
+        } finally {
+            // The interrupt belongs to whoever asked for the shutdown; swallowing it would keep the
+            // cycle (and the JVM) running past the point it was told to stop.
+            if (interrupted) Thread.currentThread().interrupt()
+        }
     }
 
     /**
@@ -695,7 +786,7 @@ class Updater(
             // a container that refuses to start much later, for no visible reason. One kodkod itself
             // left stopped is a different sentence: it is tracked, and the next cycle brings it back.
             val doomed = when {
-                dependent.id in strandedDependents ->
+                dependent.id in stoppedByKodkod ->
                     " — kodkod left it stopped itself and will bring it back against ${provider.name} " +
                         "on the next cycle"
                 dependent.pinnedToProviderId && replaced ->
@@ -833,16 +924,19 @@ class Updater(
      * `start` is far more likely to be a transient daemon state (a port the previous process has not
      * released yet, a network being rewired) than a permanent verdict.
      *
-     * Giving up is loud on purpose: discovery filters `status=running`, so a container left stopped
-     * here is invisible to every later cycle and would sit dead until a human noticed.
+     * Giving up is loud on purpose, and it is not the end of it: discovery filters `status=running`, so
+     * nothing would ever list this container again — [rememberStopped] is what keeps the retry alive,
+     * for as long as this process does.
+     *
+     * @return whether the container is running again.
      */
-    private fun startDependent(target: Target) {
+    private fun startDependent(target: Target): Boolean {
         var lastError: Exception? = null
         for (attempt in 1..START_ATTEMPTS) {
             try {
                 api.start(target.id)
                 Log.info("[${target.name}] restarted (a dependency was updated)")
-                return
+                return true
             } catch (e: Exception) {
                 lastError = e
                 Log.warn("[${target.name}] start failed (attempt $attempt/$START_ATTEMPTS): ${e.message}")
@@ -851,9 +945,11 @@ class Updater(
         }
         Log.error(
             "[${target.name}] could not be started after $START_ATTEMPTS attempts — the container is LEFT " +
-                "STOPPED and later cycles will not see it (discovery only lists running containers): " +
-                "${lastError?.message}",
+                "STOPPED and no listing kodkod makes will show it again (discovery only lists running " +
+                "containers): ${lastError?.message}",
         )
+        rememberStopped(target)
+        return false
     }
 
     // --- Discovery ------------------------------------------------------------------------
@@ -905,7 +1001,7 @@ class Updater(
     /**
      * A [Target] for a container that is being **rebuilt onto [providerName]'s network namespace**
      * rather than updated — the one shape [recreate] can be handed from outside the graph, by
-     * [rebuildStranded] and [recreateForeignDependent].
+     * [rebuildStopped] and [recreateForeignDependent].
      *
      * Both flags have to be set, and neither is obvious from the call site, which is why this is a
      * function rather than two lines repeated:
@@ -1148,9 +1244,9 @@ class Updater(
         )
         val backupName = backupName(name, target.id)
         // A replacement we failed to delete still owns [name], which is what the rollback needs back.
-        // Deliberately not called "stranded": in this class that word means the ORIGINAL container, left
-        // stopped by a rollback that did not land (see [strandedDependents]). This is the opposite end —
-        // the replacement — and `rollback` already has the right name for it.
+        // Deliberately not called "left stopped": in this class that phrase means the ORIGINAL
+        // container, left behind by a rollback that did not land (see [stoppedByKodkod]). This is the
+        // opposite end — the replacement — and `rollback` already has the right name for it.
         var blockingId: String? = null
         // Whether the name was actually taken away from the old container yet.
         var parked = false
@@ -1208,44 +1304,57 @@ class Updater(
             // Any failure after we stopped the container must restore the original, running container.
             Log.error("[$name] recreate failed — rolling back: ${e.message}")
             rememberFailedUpdate(target, blame)
-            if (!rollback(target.id, name, blockingId, parked)) rememberStranded(target)
+            if (!rollback(target.id, name, blockingId, parked)) rememberStopped(target)
             throw e
         }
     }
 
     /**
-     * Remember a create-time dependent whose rollback did not land, so [recoverStrandedDependents] keeps
+     * Remember a container kodkod stopped and could not put back, so [recoverStoppedContainers] keeps
      * bringing it back until it is serving again.
      *
-     * *Every* netns consumer left stopped this way is recorded, whether or not its provider moved. What
-     * differs between the two is the action, and that is decided per cycle from the daemon
-     * ([netnsStillHeldBy]) rather than fixed here — because it changes: recording only the consumers
-     * whose provider had already been replaced ended the same way as recording none. A consumer whose
-     * provider `holdBackUnsafeProviders` had deliberately kept out of the cycle is a `start` away *at
-     * that moment*, but the hold-back only protects it while it is still a target, and a stopped
-     * container is in no listing the next cycle makes. That cycle then updates the provider unopposed,
-     * force-removes the container this one names by id, and leaves it unstartable with nothing tracking
-     * it and nothing that would ever look at it again.
+     * *Every* such container is recorded, whatever it is joined to. What differs between them is the
+     * action, and that is decided per cycle from the daemon ([netnsStillHeldBy]) rather than fixed here —
+     * because it changes: recording only the netns consumers whose provider had already been replaced
+     * ended the same way as recording none. A consumer whose provider `holdBackUnsafeProviders` had
+     * deliberately kept out of the cycle is a `start` away *at that moment*, but the hold-back only
+     * protects it while it is still a target, and a stopped container is in no listing the next cycle
+     * makes. That cycle then updates the provider unopposed, force-removes the container this one names
+     * by id, and leaves it unstartable with nothing tracking it and nothing that would ever look at it
+     * again.
      *
-     * Which of the two it is *is* still said out loud, because it is what an operator needs to fix it by
+     * A container with no create-time reference at all is recorded too, and that is not a nicety: it is
+     * intact and startable by anybody, but "anybody" means a human who has to notice first, and nothing
+     * in kodkod would ever report it again. kodkod stopped it, so kodkod keeps trying to start it.
+     *
+     * What each one needs *is* still said out loud, because it is what an operator needs to fix it by
      * hand — the retry lives in this process only, and there is no way to leave a marker on a container
      * that already exists.
      */
-    private fun rememberStranded(target: Target) {
-        val provider = target.networkModeContainerName ?: return
-        if (netnsRef(target.inspect.obj("HostConfig")) == null) return
+    private fun rememberStopped(target: Target) {
         val name = target.name
-        strandedDependents[target.id] = StrandedDependent(name, provider)
-        val (state, byHand) = if (netnsStillHeldBy(target.inspect, provider)) {
-            "it is stopped under its own name and the namespace it is joined to is still $provider's, so a " +
-                "`start` is all it needs — kodkod will retry that on every cycle until it is serving again" to
-                "start it by hand (`docker start $name`)"
-        } else {
-            "it is joined to the network namespace of a container this cycle replaced, which no `start` can " +
-                "bring back — kodkod will rebuild it against $provider on every cycle until it is serving " +
-                "again" to
-                "recreate it by hand (`docker rm $name`, then bring it back up the way it was created, e.g. " +
-                "`docker compose up -d`)"
+        val joined = netnsRef(target.inspect.obj("HostConfig")) != null
+        val provider = target.networkModeContainerName?.takeIf { joined }
+        stoppedByKodkod[target.id] = StoppedContainer(name, provider)
+        val (state, byHand) = when {
+            !joined || (provider != null && netnsStillHeldBy(target.inspect, provider)) -> {
+                val namespace = provider?.let { " and the namespace it is joined to is still $it's" }.orEmpty()
+                "it is stopped under its own name$namespace, so a `start` is all it needs — kodkod will retry " +
+                    "that on every cycle until it is serving again" to
+                    "start it by hand (`docker start $name`)"
+            }
+            provider == null ->
+                "it is joined to another container's network namespace and kodkod never resolved that " +
+                    "container's name, so all it can do is keep trying to start this one — which works only " +
+                    "if that namespace is still there" to
+                    "check what `network_mode` names and bring this container back up against it, e.g. " +
+                        "`docker compose up -d`"
+            else ->
+                "it is joined to the network namespace of a container this cycle replaced, which no `start` " +
+                    "can bring back — kodkod will rebuild it against $provider on every cycle until it is " +
+                    "serving again" to
+                    "recreate it by hand (`docker rm $name`, then bring it back up the way it was created, " +
+                        "e.g. `docker compose up -d`)"
         }
         Log.error(
             "[$name] is DOWN and could not be put back as it was: $state. But only for as long as THIS " +
@@ -1313,7 +1422,7 @@ class Updater(
      * and the service stays down under its backup name with nothing but log lines to show for it.
      *
      * @return whether the service really is being served again by [oldId] — the caller has a last resort
-     * for the cases where it is not (see [rememberStranded]), and must not be handed the mere fact that
+     * for the cases where it is not (see [rememberStopped]), and must not be handed the mere fact that
      * the rollback ran.
      */
     private fun rollback(oldId: String, name: String, blockingId: String?, parked: Boolean): Boolean {
@@ -1375,7 +1484,10 @@ class Updater(
         // the liveness gate is stopped by nothing else — and a running container keeps this service's
         // published ports, its network aliases and its volumes. Renaming it away would hand back the name
         // and nothing else: the `start` that follows then fails on a port conflict and the rollback ends
-        // in ROLLBACK INCOMPLETE. No override is applied, so the container's own `StopTimeout` decides.
+        // in ROLLBACK INCOMPLETE. The stop is sent kodkod's own `KODKOD_STOP_TIMEOUT` if the operator set
+        // one, and no `?t=` at all otherwise, which leaves the container's own `StopTimeout` deciding —
+        // the same rule `stopGracefully` follows, minus the per-container label, since the container this
+        // is aimed at is a replacement whose labels are the ones kodkod just created it with.
         try {
             api.stop(blockingId, config.defaultStopTimeout)
         } catch (e: Exception) {

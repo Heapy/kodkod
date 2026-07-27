@@ -6,6 +6,9 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 
 /**
@@ -95,6 +98,39 @@ class UpdateCycleTest {
         assertTrue(
             log.contains("planning failed"),
             "scheduleWithFixedDelay drops a task whose exception escapes — it has to be caught and named",
+        )
+    }
+
+    /**
+     * A cycle that overstays `KODKOD_SHUTDOWN_GRACE` is interrupted, and what it does on the way out is
+     * the point: `Updater.apply` unwinds through a pass that starts again every container it had
+     * stopped and not yet brought back. That pass is Docker calls, so it only happens if the process is
+     * still there to make them — the hook used to interrupt the worker and return in the same breath,
+     * after which `main` returns and the JVM exits out from under a recovery that had barely begun.
+     */
+    @Test
+    fun an_interrupted_cycle_is_given_time_to_put_back_what_it_stopped() {
+        val scheduler = Executors.newSingleThreadScheduledExecutor { Thread(it, "test-worker").apply { isDaemon = true } }
+        val running = CountDownLatch(1)
+        val unwound = AtomicBoolean(false)
+        scheduler.execute {
+            try {
+                running.countDown()
+                Thread.sleep(60_000) // a cycle that will not finish on its own
+            } catch (_: InterruptedException) {
+                Thread.sleep(250) // what putting the stopped containers back costs
+                unwound.set(true)
+            }
+        }
+        running.await()
+
+        val finished = stopScheduler(scheduler, graceSeconds = 0)
+
+        assertFalse(finished, "the cycle did not finish on its own — it was interrupted")
+        assertTrue(
+            unwound.get(),
+            "the hook has to outlive the recovery it just triggered, or the containers the cycle stopped " +
+                "stay stopped with nothing left to look for them",
         )
     }
 }
