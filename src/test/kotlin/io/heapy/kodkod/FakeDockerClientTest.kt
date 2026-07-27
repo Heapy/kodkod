@@ -319,6 +319,44 @@ class FakeDockerClientTest {
         )
     }
 
+    /**
+     * The lie this one closes was the load-bearing one: a container joined to another's network
+     * namespace was started whether or not that other container still existed, so the rollback of a
+     * create-time dependent — which is exactly the case where the provider has just been destroyed —
+     * looked like it worked. Every test asserting that it did was asserting production behaviour that
+     * the daemon cannot produce.
+     */
+    @Test
+    fun a_container_cannot_join_the_namespace_of_one_that_is_gone_or_down() {
+        docker.containers["app"] = json("""{"Name":"/app"}""")
+        docker.containers["side"] = json("""{"Name":"/side","HostConfig":{"NetworkMode":"container:app"}}""")
+
+        docker.start("side")
+        assertTrue(running("side"), "the provider is up, so this is an ordinary start")
+
+        docker.stop("app", timeout = null)
+        val down = assertThrows(DockerException::class.java) { docker.start("side") }
+        assertTrue(down.message!!.contains("non running"), "a stopped namespace cannot be joined either")
+
+        docker.remove("app", force = true)
+        val gone = assertThrows(DockerException::class.java) { docker.restart("side", timeout = null) }
+        assertEquals(404, gone.status, "and a provider the daemon has forgotten answers 'no such container'")
+    }
+
+    /** By name, id or short id — whichever spelling the reference uses, the daemon resolves it. */
+    @Test
+    fun a_namespace_reference_resolves_the_way_the_daemon_resolves_it() {
+        docker.containers["app1234567890abcdef"] = json("""{"Name":"/app"}""")
+        docker.containers["byName"] = json("""{"Name":"/a","HostConfig":{"NetworkMode":"container:app"}}""")
+        docker.containers["byId"] =
+            json("""{"Name":"/b","HostConfig":{"NetworkMode":"container:app1234567890abcdef"}}""")
+        docker.containers["byShortId"] = json("""{"Name":"/c","HostConfig":{"NetworkMode":"container:app123456"}}""")
+
+        listOf("byName", "byId", "byShortId").forEach { docker.start(it) }
+
+        assertTrue(listOf("byName", "byId", "byShortId").all(::running), "all three name the same container")
+    }
+
     private fun running(id: String): Boolean =
         docker.inspectContainer(id).obj("State")!!["Running"]!!.jsonPrimitive.booleanOrNull!!
 }

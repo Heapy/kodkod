@@ -14,9 +14,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Memory of an image that could not come up on a container: the same update is not retried for
   `KODKOD_UPDATE_FAILURE_COOLDOWN` seconds (default 6h), so an unstartable `:latest` no longer costs a
   self-inflicted outage every cycle. Cleared as soon as the tag resolves to a different image. A
-  container held back this way is also kept out of the cycle's dependency restarts, since a recreate
-  would build it from that same image. Note the memory lives in the process: restarting kodkod forgets
-  every cooldown.
+  container held back this way still follows its own dependencies — being left on a network namespace
+  that was destroyed is the worse outcome — but nothing may force it onto that image either, so the
+  container it is joined to is the one that waits (see below). Note the memory lives in the process:
+  restarting kodkod forgets every cooldown.
 - Reconciliation of orphaned `_kodkod_old_` backups, at startup and at the beginning of every cycle:
   restored when nothing serves the service name, removed once the replacement is running. It runs even
   with `KODKOD_UPDATE_ENABLED=false`, since otherwise a backup left by a killed process would never
@@ -60,6 +61,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   disposable Docker-in-Docker daemon by default.
 
 ### Fixed
+- A create-time dependent is no longer forced through a recreate that could not be undone. Its
+  replacement is built from its image *ref*, so once that ref has moved on — the dependent has an update
+  of its own pending, or is inside the cooldown of one that failed — the recreate can fail, and by then
+  the provider's old container is gone and the dependent's original cannot be started at all (it is
+  joined to a namespace that no longer exists). The provider is therefore kept out of the cycle until
+  the dependent's own image has settled, one update per cycle instead of an outage with no way back.
+- A create-time dependent that could not be recreated *and* could not be rolled back is remembered and
+  rebuilt against its provider on every later cycle, instead of being left stopped under its own name
+  where neither discovery (`status=running`) nor the backup reconcile (`_kodkod_old_*`) would ever look
+  at it again.
 - Recreate create-time dependents (`--link` / `network_mode: container:`) when a dependency is updated,
   and resolve `network_mode: container:<id>` to a container name before any old ids are removed. This
   now also covers dependents kodkod does not monitor itself.

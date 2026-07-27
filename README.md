@@ -174,6 +174,15 @@ kodkod updates the whole monitored set together so it can respect dependencies:
   one case this scan does not cover;
 - `network_mode: container:<id>` is rewritten to the target's **name** so it survives that container
   being recreated;
+- a container whose create-time dependent has an update pending of its own (or is inside the cooldown
+  of one that failed) **waits a cycle**. That dependent's forced recreate is built from its image ref,
+  which no longer names the image it is running, and once the provider's old container is gone a
+  failed recreate has nothing to roll back to: the dependent's original container is joined to a
+  namespace that no longer exists. So the dependent updates alone first — where a failure *can* be
+  rolled back — and the provider follows on a later cycle. The delay is logged every cycle;
+- a create-time dependent kodkod could neither recreate nor roll back is **rebuilt on every later
+  cycle** until it serves again: it is the one container nothing else would ever look at, since
+  discovery lists running containers only;
 - a dependency compose marked `condition: service_healthy` is **waited for** before its dependent is
   started, bounded by `KODKOD_DEPENDENCY_HEALTH_TIMEOUT`. Only dependencies this cycle brought back
   are waited for, and the timeout starts the dependent anyway: the condition may delay a container,

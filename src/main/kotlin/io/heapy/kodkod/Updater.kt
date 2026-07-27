@@ -72,6 +72,24 @@ class Updater(
     private class FailedUpdate(val imageId: String, val attemptedAtNanos: Long, val attemptedAtMillis: Long)
 
     /**
+     * Create-time dependents kodkod stopped for a recreate and could not put back, by the id of the
+     * container it left stopped — see [recoverStrandedDependents].
+     *
+     * `holdBackUnsafeProviders` keeps the *likely* version of this failure from ever being set up, but a
+     * recreate can still fail for a reason that has nothing to do with the image (a port the previous
+     * process has not released, a network being rewired, a daemon that stopped answering mid-way). When
+     * it does, the container that used to serve the name is joined to a network namespace this cycle
+     * destroyed and cannot be started by anybody — not by kodkod's rollback, not by a human's
+     * `docker start`. Only a recreate against the container now holding the provider's name can bring
+     * it back, and nothing else in the system would ever attempt one: discovery lists running containers
+     * only, and the name is held by the very container that is down.
+     */
+    private val strandedDependents = LinkedHashMap<String, StrandedDependent>()
+
+    /** A container [recoverStrandedDependents] has to rebuild, and the provider name to rebuild it against. */
+    private class StrandedDependent(val name: String, val providerName: String)
+
+    /**
      * Bring back containers a kodkod that died mid-recreate left parked under their
      * `<name>_kodkod_old_<short id>` backup name.
      *
@@ -219,6 +237,61 @@ class Updater(
             null
         }
 
+    /**
+     * Rebuild the create-time dependents a failed recreate left stopped (see [strandedDependents]),
+     * against whatever holds their provider's name now.
+     *
+     * Retried every cycle rather than once: the container is already down, so an attempt that fails
+     * again costs nothing but a create and the liveness window it was going to spend anyway — and the
+     * most likely reason for the first failure (an image the tag has since moved on from, a daemon that
+     * was busy) is one that later cycles fix by themselves. An entry is dropped as soon as it stops
+     * meaning anything: the container came back up, somebody removed it, or the rebuild went through.
+     *
+     * A rollback that failed for any *other* reason is deliberately not remembered here: that container
+     * is intact and under its own name, so `docker start` puts it back, whereas one joined to a
+     * destroyed namespace cannot be started by anybody.
+     */
+    private fun recoverStrandedDependents() {
+        if (strandedDependents.isEmpty()) return
+        // A snapshot: a rebuild that fails puts its own entry straight back.
+        for ((id, stranded) in strandedDependents.toList()) {
+            val inspect = try {
+                api.inspectContainer(id)
+            } catch (e: Exception) {
+                if (e is DockerException && e.status == 404) {
+                    Log.warn(
+                        "[${stranded.name}] the container kodkod left stopped is gone — whoever removed it owns " +
+                            "the service now, kodkod stops trying to rebuild it",
+                    )
+                    strandedDependents.remove(id)
+                } else {
+                    Log.warn("[${stranded.name}] could not check on the container kodkod left stopped: ${e.message}")
+                }
+                continue
+            }
+            if (inspect.obj("State")?.str("Running") == "true") {
+                Log.info("[${stranded.name}] is running again — nothing left to rebuild")
+                strandedDependents.remove(id)
+                continue
+            }
+            Log.warn(
+                "[${stranded.name}] was left stopped by a recreate that could not be rolled back, and its " +
+                    "network namespace is gone — rebuilding it against ${stranded.providerName}",
+            )
+            val target = toTarget(id, inspect).also {
+                it.linkedToRecreate = true
+                it.networkModeContainerName = stranded.providerName
+            }
+            try {
+                recreate(target)
+                strandedDependents.remove(id)
+                Log.info("[${stranded.name}] is serving again")
+            } catch (e: Exception) {
+                Log.error("[${stranded.name}] could not be rebuilt and is still DOWN: ${e.message}")
+            }
+        }
+    }
+
     /** A whole cycle: decide what to do, then do it. The two halves are separate for [main]'s sake. */
     fun runOnce() = apply(plan())
 
@@ -242,6 +315,7 @@ class Updater(
 
         markStale(targets)
         propagateLinkedRestart(targets, config.respectDependsOnRestart)
+        holdBackUnsafeProviders(targets)
         if (targets.none { it.toRestart }) {
             Log.info("update: all monitored containers are up to date")
             return UpdatePlan.NOTHING
@@ -250,16 +324,80 @@ class Updater(
     }
 
     /**
+     * Take a container out of this cycle when restarting it would force a create-time dependent through
+     * a recreate that **cannot be rolled back**.
+     *
+     * A netns consumer (`network_mode: service:x`, `--link`) is recreated whenever its provider moves,
+     * and that recreate is built from the consumer's image *ref*. While the ref still names the image the
+     * consumer is running, the replacement is the container that is already up and a failure is a blip;
+     * once the ref has moved on — the consumer's own update is pending ([Target.stale]) or is being held
+     * back because that exact image already failed here ([Target.updateSuppressed]) — the recreate
+     * genuinely can fail. And by then it is beyond rescue: the provider's old container was force-removed
+     * the moment its replacement passed the liveness gate, so the consumer's original container, whose
+     * `HostConfig.NetworkMode` still names that id, can no longer be started at all. The rollback's
+     * `start` is refused, and the service is left stopped under its own name — where discovery
+     * (`status=running`) and [reconcileOrphanedBackups] (`_kodkod_old_*`) both walk straight past it.
+     *
+     * So the provider waits instead. The consumer's own update goes ahead this cycle *by itself*, which
+     * is the one shape that is safe: nothing else moved, so a failure rolls back onto a namespace that is
+     * still there. The provider's update follows a cycle later, when the ref names what the consumer runs.
+     * A consumer whose image is broken for good therefore keeps its provider back for as long as the
+     * cooldown does — deliberately: a delayed update is recoverable and is announced every cycle, while
+     * the alternative is a container that is down with no way back.
+     *
+     * The hold-back follows create-time edges transitively: a provider that is itself joined to another
+     * container's namespace would be dragged along by *its* provider, which would drag the consumer along
+     * with it.
+     */
+    private fun holdBackUnsafeProviders(targets: List<Target>) {
+        val byId = targets.associateBy { it.id }
+        // provider to hold back -> what a log line should say it is being held back for.
+        val queue = ArrayDeque<Pair<Target, String>>()
+        for (dependent in targets) {
+            if (!dependent.stale && !dependent.updateSuppressed) continue
+            val moving = dependent.createTimeDeps.mapNotNull(byId::get).filter { it.toRestart }
+            if (moving.isEmpty()) continue
+            for (provider in moving) {
+                queue += provider to (
+                    "${dependent.name} ${dependent.createTimeRelationTo(provider.name)} and its own image has " +
+                        "moved on, so the recreate this restart forces would build ${dependent.name} from " +
+                        "${dependent.imageRef} — and once ${provider.name}'s old container is gone that recreate " +
+                        "cannot be undone. ${dependent.name}'s own update goes ahead alone this cycle; " +
+                        "${provider.name} follows once it has settled"
+                    )
+            }
+        }
+        if (queue.isEmpty()) return
+        while (queue.isNotEmpty()) {
+            val (provider, why) = queue.removeFirst()
+            if (provider.restartHeldBack) continue
+            provider.restartHeldBack = true
+            Log.warn("[${provider.name}] not restarting it this cycle — $why")
+            provider.createTimeDeps.mapNotNull(byId::get).mapTo(queue) {
+                it to "restarting it would restart ${provider.name}, which is being held back"
+            }
+        }
+        // What propagated through a container that is no longer moving has to be recomputed from scratch:
+        // a dependent marked only because of it must not be restarted for a restart that is not happening.
+        for (target in targets) {
+            target.linkedToRestarting = false
+            target.linkedToRecreate = false
+        }
+        propagateLinkedRestart(targets, config.respectDependsOnRestart)
+    }
+
+    /**
      * Carry out [plan] — the half that stops, renames, creates, starts and removes, and therefore the
      * only half that has to be serialized against autoheal.
      *
-     * [reconcileOrphanedBackups] belongs here rather than in [plan] for the same reason: it renames and
-     * starts containers. It stays first in the cycle, and unconditional — an orphan is a service that is
-     * down right now, and a cycle that found nothing to update is exactly the cycle that would otherwise
-     * walk past it.
+     * [reconcileOrphanedBackups] and [recoverStrandedDependents] belong here rather than in [plan] for the
+     * same reason: they rename, create and start containers. They stay first in the cycle, and
+     * unconditional — both are about a service that is down right now, and a cycle that found nothing to
+     * update is exactly the cycle that would otherwise walk past it.
      */
     internal fun apply(plan: UpdatePlan) {
         reconcileOrphanedBackups()
+        recoverStrandedDependents()
         if (!plan.hasWork || !isCurrent(plan)) return
         val ordered = plan.targets
 
@@ -861,9 +999,27 @@ class Updater(
             // Any failure after we stopped the container must restore the original, running container.
             Log.error("[$name] recreate failed — rolling back: ${e.message}")
             if (imageBlamed) rememberFailedUpdate(target)
-            rollback(target.id, name, stranded, parked)
+            if (!rollback(target.id, name, stranded, parked)) rememberStranded(target)
             throw e
         }
+    }
+
+    /**
+     * Remember a create-time dependent whose rollback did not land, so [recoverStrandedDependents] keeps
+     * trying to rebuild it. Only a container joined to a namespace **this cycle destroyed** is recorded:
+     * [Target.networkModeContainerName] is set exactly when the create body's netns reference had to be
+     * rewritten to the provider's name, which is also what says the original reference is dead. Anything
+     * else that failed to roll back is still startable as it stands and stays a human's call.
+     */
+    private fun rememberStranded(target: Target) {
+        val provider = target.networkModeContainerName ?: return
+        if (netnsRef(target.inspect.obj("HostConfig")) == null) return
+        strandedDependents[target.id] = StrandedDependent(target.name, provider)
+        Log.error(
+            "[${target.name}] cannot be put back as it was — it is joined to the network namespace of a " +
+                "container this cycle replaced, which no `start` can bring back. kodkod will rebuild it " +
+                "against $provider on every cycle until it is serving again",
+        )
     }
 
     /**
@@ -923,8 +1079,12 @@ class Updater(
      * interrupted — so the recreate this rollback is cleaning up after is very often one that a
      * shutdown just killed, and running with the flag set would mean every call here fails instantly
      * and the service stays down under its backup name with nothing but log lines to show for it.
+     *
+     * @return whether the service really is being served again by [oldId] — the caller has a last resort
+     * for the cases where it is not (see [rememberStranded]), and must not be handed the mere fact that
+     * the rollback ran.
      */
-    private fun rollback(oldId: String, name: String, blockingId: String?, parked: Boolean) {
+    private fun rollback(oldId: String, name: String, blockingId: String?, parked: Boolean): Boolean {
         val interrupted = Thread.interrupted()
         if (interrupted) {
             Log.warn("[$name] rolling back on an interrupted thread — finishing the rollback before stopping")
@@ -939,7 +1099,7 @@ class Updater(
             } catch (e: Exception) {
                 Log.error("[$name] rollback: could not start the previous container ${oldId.take(12)}: ${e.message}")
             }
-            verifyRolledBack(oldId, name)
+            return verifyRolledBack(oldId, name)
         } finally {
             // The interrupt belongs to whoever asked for the shutdown; swallowing it would keep the
             // cycle (and the JVM) running past the point it was told to stop.
@@ -1004,24 +1164,25 @@ class Updater(
     }
 
     /** Ask the daemon what actually happened, so a rollback that did not land is reported as such. */
-    private fun verifyRolledBack(oldId: String, name: String) {
+    private fun verifyRolledBack(oldId: String, name: String): Boolean {
         val inspect = try {
             api.inspectContainer(oldId)
         } catch (e: Exception) {
             Log.error("[$name] rollback could not be verified — inspect of ${oldId.take(12)} failed: ${e.message}")
-            return
+            return false
         }
         val actualName = inspect.str("Name")?.trimStart('/')
         val running = inspect.obj("State")?.str("Running") == "true"
         if (actualName == name && running) {
             Log.info("[$name] rolled back to the previous container")
-            return
+            return true
         }
         Log.error(
             "[$name] ROLLBACK INCOMPLETE — the previous container ${oldId.take(12)} is " +
                 "${if (running) "running" else "stopped"} under the name '${actualName ?: "?"}': " +
                 "nothing is serving as '$name' and it needs a human",
         )
+        return false
     }
 
     /**
@@ -1314,11 +1475,17 @@ internal class Target(
      * An update *is* available for this container but kodkod is holding it back — the same image
      * already failed to come up here and its cooldown has not run out (see `suppressedByCooldown`).
      *
-     * It suppresses the update and only the update. The container still follows its dependencies
-     * ([propagateLinkedRestart]): a dependency-driven recreate does build the replacement from the
-     * image **ref**, which by now resolves to exactly the image that failed — but the alternative is a
-     * create-time dependent left joined to a namespace that was destroyed this cycle, which no gate
-     * catches, no rollback undoes and no log line reports. A recreate that fails is loud and rolls back.
+     * It suppresses the update and only the update: the container still follows its dependencies
+     * ([propagateLinkedRestart]), because a create-time dependent left joined to a namespace that was
+     * destroyed this cycle is `Running` with no interfaces — which no gate catches, no rollback undoes
+     * and no log line reports.
+     *
+     * That is not free, and the cost is paid on the other side of the edge: a dependency-driven recreate
+     * builds the replacement from the image **ref**, which by now resolves to exactly the image already
+     * known to fail here, so the recreate is not merely risky but certain to fail — and its rollback
+     * cannot work, since the provider that was replaced took the namespace this container's original
+     * would have to rejoin. So the *provider* is the one that gives way: `holdBackUnsafeProviders` keeps
+     * it out of the cycle for as long as this flag is set, and nothing is forced anywhere.
      */
     var updateSuppressed: Boolean = false
 
@@ -1327,6 +1494,14 @@ internal class Target(
 
     /** A create-time dependency changed, so this container must be recreated rather than merely started. */
     var linkedToRecreate: Boolean = false
+
+    /**
+     * This container is out of the cycle no matter what else it says — a create-time dependent of it
+     * could not be put back if the recreate this restart forces were to fail (see
+     * `holdBackUnsafeProviders`). It wins over [stale] and over both propagated flags, and is the only
+     * thing that does: a container held back is one kodkod deliberately does not touch this cycle.
+     */
+    var restartHeldBack: Boolean = false
 
     /** Ids (within this cycle's set) of the containers this one depends on. */
     var deps: Set<String> = emptySet()
@@ -1362,9 +1537,15 @@ internal class Target(
      */
     var newImageId: String? = null
 
-    val toRecreate: Boolean get() = stale || linkedToRecreate
+    val toRecreate: Boolean get() = !restartHeldBack && (stale || linkedToRecreate)
 
-    val toRestart: Boolean get() = toRecreate || linkedToRestarting
+    val toRestart: Boolean get() = !restartHeldBack && (stale || linkedToRecreate || linkedToRestarting)
+
+    /** How this container is wired to [providerName] at create time, as a log line says it. */
+    fun createTimeRelationTo(providerName: String): String {
+        val kind = if (netnsRef(inspect.obj("HostConfig")) != null) DependencyKind.NETNS else DependencyKind.LINK
+        return kind.relationTo(providerName)
+    }
 }
 
 /**
@@ -1471,7 +1652,13 @@ internal fun parseDependsOn(label: String?): List<DependsOnEdge> =
  * other: the cooldown suppresses that container's **image update**, and nothing else. Leaving it out
  * of the graph would leave a create-time dependent of a container replaced this cycle pointing at a
  * network namespace that no longer exists — `Running` with no interfaces, the one failure nothing in
- * the system reports — and would hide it behind a log line about an update cooldown.
+ * the system reports — and would hide it behind a log line about an update cooldown. What keeps that
+ * from forcing it onto the very image that failed is that the *provider* is taken out of the cycle
+ * instead (`holdBackUnsafeProviders`), which is why this pass is run again after that decision.
+ *
+ * [Target.restartHeldBack] is the one verdict this pass does not overrule: a container held back is
+ * one that must not move at all this cycle, and it neither takes a flag nor hands one on (the flags
+ * are read through [Target.toRestart], which is false for it).
  */
 internal fun propagateLinkedRestart(targets: List<Target>, respectDependsOnRestart: Boolean = false) {
     val byId = targets.associateBy { it.id }
@@ -1479,6 +1666,7 @@ internal fun propagateLinkedRestart(targets: List<Target>, respectDependsOnResta
     while (changed) {
         changed = false
         for (target in targets) {
+            if (target.restartHeldBack) continue
             val restartDeps = if (respectDependsOnRestart) target.deps - target.noRestartDeps else target.deps
             if (!target.toRecreate && target.createTimeDeps.any { byId[it]?.toRestart == true }) {
                 target.linkedToRecreate = true

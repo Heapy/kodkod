@@ -247,6 +247,7 @@ class FakeDockerClient : DockerClient {
             restartTimeouts += timeout
             restartExpected += expectedStopSeconds
             if (id in failRestart) throw DockerException(500, "fake: restart failure for '$id'")
+            requireNamespaceProvider(id)
             running[id] = id !in startedThenExits
             startedAt[id] = clock.millis()
         }
@@ -264,6 +265,7 @@ class FakeDockerClient : DockerClient {
     override fun start(id: String) {
         op("start", id) {
             if (id in failStart) throw DockerException(500, "fake: start failure for '$id'")
+            requireNamespaceProvider(id)
             running[id] = id !in startedThenExits
             startedAt[id] = clock.millis()
             if (id in vanishesAfterStart) {
@@ -271,6 +273,36 @@ class FakeDockerClient : DockerClient {
                 removed += id
             }
         }
+    }
+
+    /**
+     * A container joined to another's network namespace (`HostConfig.NetworkMode=container:<ref>`) can only
+     * be started while that other container exists **and is running** — the daemon answers `No such
+     * container` / `cannot join network of a non running container` otherwise. The fake used to start such a
+     * container regardless, which made a namespace destroyed by a recreate indistinguishable from a live one:
+     * the rollback of a create-time dependent looked like it worked, and every test asserting that it did was
+     * asserting production behaviour that cannot happen.
+     */
+    private fun requireNamespaceProvider(id: String) {
+        val ref = netnsRef(containers[id]?.obj("HostConfig")) ?: return
+        val provider = netnsProvider(ref) ?: throw DockerException(404, "fake: no such container: $ref")
+        if (!isRunning(provider)) {
+            throw DockerException(500, "fake: cannot join network of a non running container: $ref")
+        }
+    }
+
+    /** The container a `container:<ref>` names, resolved the way the daemon does: by id, prefix or name. */
+    private fun netnsProvider(ref: String): String? =
+        (containers.keys + renamed.keys).firstOrNull {
+            it !in removed && (it == ref || nameOf(it) == ref || (ref.length >= 4 && it.startsWith(ref)))
+        }
+
+    /** Whether the daemon still knows [id] and reports it running — this fake's lifecycle model wins. */
+    private fun isRunning(id: String): Boolean {
+        if (id in removed || id !in containers) return false
+        running[id]?.let { return it }
+        containers[id]?.obj("State")?.get("Running")?.jsonPrimitive?.booleanOrNull?.let { return it }
+        return (listed.firstOrNull { it.str("Id") == id }?.str("State") ?: "running") == "running"
     }
 
     /**

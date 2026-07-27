@@ -980,23 +980,27 @@ class UpdaterTest {
     }
 
     /**
-     * The cooldown suppresses the *image update*, and only that. `web` is joined to `db`'s network
-     * namespace, so replacing `db` destroys the namespace `web` is in: a `web` left out of the cycle
-     * goes on reporting `Running` with no interfaces, and the only line about it is one about an update
-     * cooldown. A recreate does build it from the ref that now resolves to the image that failed — and
-     * that failure is loud and rolls back, which a dead namespace never does.
+     * `web` is joined to `db`'s network namespace by *id*, the way compose writes `network_mode:
+     * service:db`, and its own update is inside the cooldown a failed attempt bought. Replacing `db`
+     * would force `web` through a recreate built from `web:1`, which by now names exactly the image
+     * that failed here — a recreate that is certain to fail, and whose rollback cannot work either:
+     * `db`'s old container is force-removed the moment its replacement is accepted, so the `web` that
+     * would be started back is joined to a namespace that no longer exists.
+     *
+     * Neither half of that may happen, and leaving `web` out of the cycle is no better — it would go
+     * on reporting `Running` with no interfaces. So `db` is the one that waits.
      */
     @Test
-    fun a_container_held_back_by_a_cooldown_still_follows_a_create_time_dependency() {
+    fun a_provider_waits_while_its_netns_consumer_is_held_back_by_a_cooldown() {
         val docker = FakeDockerClient()
         // web shares db's network namespace, so an update of db normally recreates web too.
         docker.container(
-            id = "db", imageRef = "db:1", currentImageId = "sha256:db-old",
+            id = "db1234567890abc", name = "db", imageRef = "db:1", currentImageId = "sha256:db-old",
             currentRepoDigests = listOf("db@sha256:db-1"),
         )
         docker.container(
             id = "web", imageRef = "web:1", currentImageId = "sha256:web-old",
-            hostConfig = """{"NetworkMode":"container:db"}""",
+            hostConfig = """{"NetworkMode":"container:db1234567890abc"}""",
         )
         docker.distribution["db:1"] = "sha256:db-1" // db is up to date in the first cycle
         docker.images["web:1"] = json("""{"Id":"sha256:web-bad","Config":{},"RepoDigests":[]}""")
@@ -1012,14 +1016,98 @@ class UpdaterTest {
         val log = captureLog { updater.runOnce() }
 
         val second = docker.ops.drop(afterFirstCycle)
-        assertTrue(second.contains("create:db"), "db itself still has to be updated: $second")
-        assertOrder(second, "stop:web", "create:db", "create:web")
-        assertEquals(
-            "container:db",
-            docker.created.last { it.first == "web" }.second.obj("HostConfig")?.str("NetworkMode"),
-            "and it has to be pointed at the replacement — by name, the reference that survives the swap",
+        assertTrue(
+            second.none { it.startsWith("create:") || it.startsWith("stop:") },
+            "nothing may move: updating db forces a recreate of web that cannot be undone: $second",
         )
+        assertTrue(running(docker, "db1234567890abc"), "db keeps serving on its old image: ${docker.ops}")
+        assertTrue(running(docker, "web"), "and web keeps serving, which is the whole point: ${docker.ops}")
+        assertTrue(log.contains("not restarting it this cycle"), "the delay has to be announced: $log")
         assertTrue(log.contains("skipping this update"), "web's own update is still held back: $log")
+    }
+
+    /**
+     * And the hold-back reaches exactly as far as the reason for it. `web` is an ordinary `depends_on`
+     * dependent, so replacing `db` costs it a restart and nothing else — the container it would be
+     * rolled back to is the one that is running, and it does not care which `db` process it was
+     * started against. Holding `db` back here would trade a real update for no risk at all.
+     */
+    @Test
+    fun a_plain_dependent_inside_its_cooldown_does_not_keep_its_dependency_back() {
+        val docker = FakeDockerClient()
+        docker.container(
+            id = "db", imageRef = "db:1", currentImageId = "sha256:db-old",
+            currentRepoDigests = listOf("db@sha256:db-1"),
+            labels = """{"com.docker.compose.project":"proj","com.docker.compose.service":"db"}""",
+        )
+        docker.container(
+            id = "web", imageRef = "web:1", currentImageId = "sha256:web-old",
+            labels = """{"com.docker.compose.project":"proj","com.docker.compose.service":"web",""" +
+                """"com.docker.compose.depends_on":"db:service_started:true"}""",
+        )
+        docker.distribution["db:1"] = "sha256:db-1"
+        docker.images["web:1"] = json("""{"Id":"sha256:web-bad","Config":{},"RepoDigests":[]}""")
+        docker.startedThenExits += "new-web-0"
+        val updater = updater(docker)
+
+        updater.runOnce()
+        val afterFirstCycle = docker.ops.size
+        docker.distribution["db:1"] = "sha256:db-2"
+        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-2"]}""")
+
+        updater.runOnce()
+
+        val second = docker.ops.drop(afterFirstCycle)
+        assertTrue(second.contains("create:db"), "db's update has nothing to wait for: $second")
+        assertOrder(second, "stop:web", "create:db", "start:web")
+        assertTrue(
+            second.none { it == "create:web" },
+            "web is restarted, not recreated — its update is still suppressed: $second",
+        )
+    }
+
+    /**
+     * The same hold-back without any cooldown involved: both containers have an update pending and
+     * `web` shares `db`'s namespace. Doing them in one cycle means `web`'s replacement is built from a
+     * moved tag *after* `db`'s old container is gone — so if the new `web` image is bad, the liveness
+     * gate has nothing to roll back to. Split across two cycles, each half can be undone.
+     */
+    @Test
+    fun a_netns_consumer_with_an_update_of_its_own_is_updated_a_cycle_before_its_provider() {
+        val docker = FakeDockerClient()
+        docker.container(
+            id = "db1234567890abc", name = "db", imageRef = "db:1", currentImageId = "sha256:db-old",
+        )
+        docker.container(
+            id = "web", imageRef = "web:1", currentImageId = "sha256:web-old",
+            hostConfig = """{"NetworkMode":"container:db1234567890abc"}""",
+        )
+        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":[]}""")
+        docker.images["web:1"] = json("""{"Id":"sha256:web-new","Config":{},"RepoDigests":[]}""")
+        val updater = updater(docker)
+
+        val log = captureLog { updater.runOnce() }
+
+        assertTrue(docker.ops.contains("create:web"), "web's own update goes ahead: ${docker.ops}")
+        assertTrue(
+            docker.ops.none { it == "create:db" || it == "stop:db1234567890abc" },
+            "db waits a cycle so web's update has something to roll back to: ${docker.ops}",
+        )
+        assertTrue(log.contains("not restarting it this cycle"), "and the delay is announced: $log")
+        assertEquals(
+            "container:db", docker.created.single().second.obj("HostConfig")?.str("NetworkMode"),
+            "web's replacement still joins the (unchanged) provider by name: ${docker.created}",
+        )
+
+        val afterFirstCycle = docker.ops.size
+        updater.runOnce()
+
+        val second = docker.ops.drop(afterFirstCycle)
+        assertTrue(second.contains("create:db"), "and db follows the next cycle: $second")
+        assertTrue(
+            second.contains("create:web"),
+            "which recreates web against the replacement — now from a ref that names what it runs: $second",
+        )
     }
 
     /**
@@ -1574,20 +1662,100 @@ class UpdaterTest {
         )
     }
 
+    /**
+     * A sidecar whose recreate fails cannot be rolled back at all, and saying otherwise is the more
+     * dangerous half of this test. Its original container is joined to the namespace of the provider
+     * this cycle *replaced* — force-removed the moment the replacement passed the liveness gate — so
+     * the daemon refuses to start it ("No such container"). What the rollback leaves behind is a
+     * container stopped under its own name, which discovery (`status=running`) and the reconcile pass
+     * (`_kodkod_old_*`) both walk past: nothing would ever look at it again.
+     *
+     * So kodkod remembers it instead and rebuilds it against the provider on the next cycle, which is
+     * also when the reason for the first failure has usually gone away.
+     */
     @Test
-    fun a_sidecar_that_cannot_be_recreated_is_rolled_back_and_reported() {
+    fun a_sidecar_that_cannot_be_recreated_is_reported_and_rebuilt_on_the_next_cycle() {
         val docker = FakeDockerClient()
         staleProviderWithSidecar(docker)
         docker.failCreate += "side"
+        val updater = updater(docker, config(monitorAll = false))
 
-        val log = captureLog { updater(docker, config(monitorAll = false)).runOnce() }
+        val log = captureLog { updater.runOnce() }
 
         assertTrue(
             log.contains("may be left without a working network"),
             "a dependent kodkod found and could not fix is exactly what must not be silent: $log",
         )
-        assertTrue(running(docker, "side"), "the rollback has to put the sidecar back: ${docker.ops}")
-        assertEquals("/side", docker.inspectContainer("side").str("Name"), "under its own name: ${docker.ops}")
+        assertTrue(
+            log.contains("no `start` can bring back"),
+            "and the reason it cannot simply be started again has to be said, not implied: $log",
+        )
+        assertFalse(running(docker, "side"), "there is no way back for it this cycle: ${docker.ops}")
+
+        val afterFirstCycle = docker.ops.size
+        docker.failCreate -= "side"
+        val second = captureLog { updater.runOnce() }
+
+        assertTrue(
+            docker.ops.drop(afterFirstCycle).contains("create:side"),
+            "the sidecar has to be rebuilt against the provider, by the only pass that can see it: ${docker.ops}",
+        )
+        assertEquals(
+            "container:app", docker.created.last { (name, _) -> name == "side" }.second
+                .obj("HostConfig")?.str("NetworkMode"),
+            "against the container holding the provider's name now: ${docker.created}",
+        )
+        val rebuilt = docker.ops.last { it.startsWith("start:new-side-") }.removePrefix("start:")
+        assertTrue(running(docker, rebuilt), "and it has to be up again: ${docker.ops}")
+        assertTrue(second.contains("is serving again"), "which is the one thing the operator waits for: $second")
+    }
+
+    /** A rebuild that keeps failing keeps being retried: the container is down either way. */
+    @Test
+    fun a_sidecar_that_cannot_be_rebuilt_is_tried_again_every_cycle() {
+        val docker = FakeDockerClient()
+        staleProviderWithSidecar(docker)
+        docker.failCreate += "side"
+        val updater = updater(docker, config(monitorAll = false))
+
+        updater.runOnce()
+        val afterFirstCycle = docker.ops.size
+        updater.runOnce()
+        val afterSecondCycle = docker.ops.size
+        updater.runOnce()
+
+        assertTrue(
+            docker.ops.drop(afterFirstCycle).take(afterSecondCycle - afterFirstCycle).contains("create!:side"),
+            "the second cycle has to try: ${docker.ops}",
+        )
+        assertTrue(
+            docker.ops.drop(afterSecondCycle).contains("create!:side"),
+            "and so does the third — nothing else in the system is looking at it: ${docker.ops}",
+        )
+    }
+
+    /** Somebody who removes the stranded container by hand owns the decision; kodkod stops chasing it. */
+    @Test
+    fun a_stranded_sidecar_that_was_removed_by_hand_is_forgotten() {
+        val docker = FakeDockerClient()
+        staleProviderWithSidecar(docker)
+        docker.failCreate += "side"
+        val updater = updater(docker, config(monitorAll = false))
+
+        updater.runOnce()
+        docker.remove("side", force = true)
+        val afterRemoval = docker.ops.size
+        val log = captureLog { updater.runOnce() }
+        updater.runOnce()
+
+        assertTrue(
+            docker.ops.drop(afterRemoval).none { it.contains(":side") },
+            "a container that is gone is nobody's to rebuild: ${docker.ops}",
+        )
+        assertTrue(
+            log.contains("stops trying to rebuild it"),
+            "and it has to be dropped rather than chased for the life of the process: $log",
+        )
     }
 
     // --- reconcile: backups orphaned by a kodkod that died mid-recreate ---------------------
