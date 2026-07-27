@@ -32,6 +32,21 @@ class AutohealTest {
         )
     }
 
+    /**
+     * Register a container the daemon reports as unhealthy: the listing entry *and* the health the
+     * `health=unhealthy` filter reads. Both are needed — the fake filters by modelled health, so a
+     * summary alone is a container of unknown health and appears in no health-filtered listing.
+     */
+    private fun FakeDockerClient.unhealthy(
+        id: String,
+        name: String = id,
+        state: String = "running",
+        labels: String = "{}",
+    ) {
+        listed += json("""{"Id":"$id","Names":["/$name"],"State":"$state","Labels":$labels}""")
+        health[id] = "unhealthy"
+    }
+
     private fun config(
         monitorAll: Boolean = true,
         stopTimeout: String? = null,
@@ -75,7 +90,7 @@ class AutohealTest {
     @Test
     fun restarts_an_unhealthy_container() {
         val docker = FakeDockerClient()
-        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+        docker.unhealthy("app")
 
         Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
 
@@ -85,7 +100,7 @@ class AutohealTest {
     @Test
     fun without_an_override_the_container_decides_its_own_stop_timeout() {
         val docker = FakeDockerClient()
-        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+        docker.unhealthy("app")
 
         Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
 
@@ -98,7 +113,7 @@ class AutohealTest {
     @Test
     fun the_label_overrides_the_stop_timeout() {
         val docker = FakeDockerClient()
-        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{"kodkod.stop.timeout":"45"}}""")
+        docker.unhealthy("app", labels = """{"kodkod.stop.timeout":"45"}""")
 
         Autoheal(docker, config(monitorAll = true, stopTimeout = "25"), selfId = null).runOnce()
 
@@ -108,7 +123,7 @@ class AutohealTest {
     @Test
     fun the_env_default_overrides_the_stop_timeout() {
         val docker = FakeDockerClient()
-        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+        docker.unhealthy("app")
 
         Autoheal(docker, config(monitorAll = true, stopTimeout = "25"), selfId = null).runOnce()
 
@@ -118,7 +133,7 @@ class AutohealTest {
     @Test
     fun skips_a_container_that_is_already_restarting() {
         val docker = FakeDockerClient()
-        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"restarting","Labels":{}}""")
+        docker.unhealthy("app", state = "restarting")
 
         Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
 
@@ -128,7 +143,7 @@ class AutohealTest {
     @Test
     fun never_restarts_itself() {
         val docker = FakeDockerClient()
-        docker.listed += json("""{"Id":"self","Names":["/self"],"State":"running","Labels":{"$SELF_LABEL":"true"}}""")
+        docker.unhealthy("self", labels = """{"$SELF_LABEL":"true"}""")
 
         Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
 
@@ -220,10 +235,56 @@ class AutohealTest {
         )
     }
 
+    /**
+     * `POST /restart` is answered only once the daemon has stopped *and* started the container, so a
+     * container whose stop window outlasts the socket's read timeout reports a failure for a restart
+     * that is going through perfectly well. Believing that report is what leaves every consumer of its
+     * network namespace joined to a namespace that has already been torn down — while still reporting
+     * `Running`, which is precisely the state nothing else notices.
+     */
+    @Test
+    fun a_restart_whose_answer_never_arrived_still_refreshes_the_dependents() {
+        val docker = FakeDockerClient()
+        docker.listed += summary("app000000000000", "app")
+        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
+        docker.health["app000000000000"] = "unhealthy"
+        docker.health["side00000000000"] = "healthy"
+        docker.containers["app000000000000"] = json("""{"Name":"/app"}""")
+        val clock = FakeClock()
+
+        Autoheal(ReadTimeout(docker, "app000000000000"), config(monitorAll = true), null, clock, clock).runOnce()
+
+        assertEquals(
+            listOf("restart:app000000000000", "restart:side00000000000"), docker.ops,
+            "the daemon restarted it; only the answer was lost, and the sidecar has no eth0 either way: ${docker.ops}",
+        )
+    }
+
+    @Test
+    fun a_restart_that_really_did_not_happen_leaves_the_dependents_alone() {
+        val docker = FakeDockerClient()
+        docker.listed += summary("app000000000000", "app")
+        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
+        docker.health["app000000000000"] = "unhealthy"
+        docker.health["side00000000000"] = "healthy"
+        // Registered as stopped, and it stays that way: the read-back finds nothing running.
+        docker.containers["app000000000000"] = json("""{"Name":"/app","State":{"Running":false}}""")
+        docker.failRestart += "app000000000000"
+        val clock = FakeClock()
+
+        Autoheal(ReadTimeout(docker, "app000000000000"), config(monitorAll = true), null, clock, clock).runOnce()
+
+        assertEquals(
+            listOf("restart!:app000000000000"), docker.ops,
+            "restarting the consumers of a namespace that never came back only spreads the outage: ${docker.ops}",
+        )
+        assertTrue(clock.sleeps.isNotEmpty(), "the outcome has to have been waited for, not assumed: ${clock.sleeps}")
+    }
+
     @Test
     fun does_not_restart_a_still_unhealthy_container_every_interval() {
         val docker = FakeDockerClient()
-        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+        docker.unhealthy("app")
 
         val times = restartTimes(docker, config(monitorAll = true), cycles = 5, everyMs = 30_000)
 
@@ -238,7 +299,7 @@ class AutohealTest {
     @Test
     fun the_wait_between_restarts_doubles() {
         val docker = FakeDockerClient()
-        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+        docker.unhealthy("app")
 
         val times = restartTimes(docker, config(monitorAll = true), cycles = 300, everyMs = 1_000)
 
@@ -251,7 +312,7 @@ class AutohealTest {
     @Test
     fun the_wait_between_restarts_stops_growing_at_the_ceiling() {
         val docker = FakeDockerClient()
-        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+        docker.unhealthy("app")
 
         val times = restartTimes(docker, config(monitorAll = true, maxInterval = "60"), cycles = 300, everyMs = 1_000)
 
@@ -264,19 +325,18 @@ class AutohealTest {
     @Test
     fun the_backoff_resets_once_the_container_is_healthy_again() {
         val docker = FakeDockerClient()
-        val app = json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
-        docker.listed += app
+        docker.unhealthy("app")
         val clock = FakeClock()
         val autoheal = autoheal(docker, config(monitorAll = true), clock)
 
         autoheal.runOnce()
         clock.advance(30_000)
         autoheal.runOnce()
-        // Recovered: a healthy container is simply absent from a `health=unhealthy` listing.
-        docker.listed.clear()
+        // Recovered — and the daemon says so: the container is still there, reporting `healthy`.
+        docker.health["app"] = "healthy"
         clock.advance(1_000)
         autoheal.runOnce()
-        docker.listed += app
+        docker.health["app"] = "unhealthy"
         clock.advance(1_000)
         autoheal.runOnce()
 
@@ -287,15 +347,84 @@ class AutohealTest {
         )
     }
 
+    /**
+     * The bug this distinction exists for. `docker restart` resets the healthcheck to `starting`, so a
+     * restarted container drops out of the `health=unhealthy` listing for as long as its `start_period`
+     * and retries take — byte for byte the same signal a recovered container gives. Reading that as
+     * recovery wiped the counter before the container was ever seen unhealthy again, which made the
+     * whole backoff inert on the defaults: a restart every interval, forever.
+     */
+    @Test
+    fun a_container_that_is_merely_starting_again_does_not_reset_the_backoff() {
+        val docker = FakeDockerClient()
+        docker.unhealthy("app")
+        val clock = FakeClock()
+        val autoheal = autoheal(docker, config(monitorAll = true), clock)
+
+        autoheal.runOnce() // 0s: restart #1
+        // The restart reset the healthcheck: `starting` is in neither the unhealthy nor the healthy list.
+        docker.health["app"] = "starting"
+        clock.advance(30_000)
+        autoheal.runOnce()
+        clock.advance(30_000)
+        autoheal.runOnce()
+        // The healthcheck finally gives its verdict — the restart did not fix anything.
+        docker.health["app"] = "unhealthy"
+        clock.advance(30_000)
+        autoheal.runOnce() // 90s: restart #2, which buys a 60s window
+        clock.advance(30_000)
+        autoheal.runOnce() // 120s: still inside it
+
+        assertEquals(
+            listOf("restart:app", "restart:app"), docker.ops,
+            "the restart at 90s is this container's second, so the next one is not due before 150s — " +
+                "counting it as a first (because `starting` looked like recovery) would buy a fresh 30s " +
+                "window and restart it again right here: ${docker.ops}",
+        )
+    }
+
+    /**
+     * The counter may not be kept forever either: a container that is in no listing at all — removed,
+     * unlabelled, or simply stopped — is never going to produce the healthy sighting that resets it.
+     */
+    @Test
+    fun a_container_that_disappears_for_good_is_forgotten_eventually() {
+        val docker = FakeDockerClient()
+        docker.unhealthy("app")
+        val clock = FakeClock()
+        val autoheal = autoheal(docker, config(monitorAll = true), clock)
+
+        autoheal.runOnce() // restart #1
+        docker.listed.clear() // removed from the daemon: in neither listing any more
+        docker.health.clear()
+        clock.advance(30_000)
+        autoheal.runOnce()
+        clock.advance(3_600_000) // a whole KODKOD_AUTOHEAL_MAX_INTERVAL of being gone
+        autoheal.runOnce()
+        // A container with the same id is back, and unhealthy — a new spell, not the old one.
+        docker.unhealthy("app")
+        clock.advance(1_000)
+        autoheal.runOnce()
+        clock.advance(30_000)
+        autoheal.runOnce()
+
+        assertEquals(
+            3, docker.ops.size,
+            "the entry was dropped, so the restart at 3631s counts as the first of a new spell and buys " +
+                "the base 30s window — a remembered entry would have made it the second and bought 60s, " +
+                "leaving only two restarts: ${docker.ops}",
+        )
+    }
+
     @Test
     fun counts_the_restarts_of_each_container_separately() {
         val docker = FakeDockerClient()
-        docker.listed += json("""{"Id":"app","Names":["/app"],"State":"running","Labels":{}}""")
+        docker.unhealthy("app")
         val clock = FakeClock()
         val autoheal = autoheal(docker, config(monitorAll = true), clock)
 
         autoheal.runOnce()
-        docker.listed += json("""{"Id":"db","Names":["/db"],"State":"running","Labels":{}}""")
+        docker.unhealthy("db")
         clock.advance(30_000)
         autoheal.runOnce()
         clock.advance(30_000)
@@ -306,5 +435,19 @@ class AutohealTest {
             "at 60s `app` is on its second restart and held back, while `db` — unhealthy since 30s — is " +
                 "still owed its second: one flapping container must not throttle another: ${docker.ops}",
         )
+    }
+}
+/**
+ * A [FakeDockerClient] whose [restart] of [target] does exactly what the daemon does and *then* reports
+ * a read timeout — the shape a `stop_grace_period` longer than the socket's read timeout produces. The
+ * transport error carries no HTTP status, which is what tells it apart from a daemon that said no.
+ */
+private class ReadTimeout(
+    private val delegate: FakeDockerClient,
+    private val target: String,
+) : DockerClient by delegate {
+    override fun restart(id: String, timeout: Int?, expectedStopSeconds: Int?) {
+        runCatching { delegate.restart(id, timeout, expectedStopSeconds) }
+        if (id == target) throw DockerException(-1, "read timed out after 60000ms")
     }
 }

@@ -26,7 +26,7 @@ class Autoheal(
     private val config: Config,
     private val selfId: String?,
     private val clock: TimeSource = TimeSource.SYSTEM,
-    @Suppress("unused") private val sleeper: Sleeper = Sleeper.SYSTEM,
+    private val sleeper: Sleeper = Sleeper.SYSTEM,
 ) {
     private val ns = config.labelNamespace
 
@@ -40,19 +40,20 @@ class Autoheal(
      */
     private val restarts = HashMap<String, Restart>()
 
-    /** How many restarts a container has had in its current unhealthy spell, and when the last was. */
-    private class Restart(val count: Int, val at: Long)
+    /**
+     * How many restarts a container has had in its current unhealthy spell, when the last one was, and
+     * since when it has been missing from the `health=unhealthy` listing (`null` while it is still in
+     * it) — see [forgetRecovered].
+     */
+    private class Restart(val count: Int, val at: Long, val absentSince: Long? = null) {
+        /** The same record, with the container observed as unhealthy again right now. */
+        fun seen(): Restart = if (absentSince == null) this else Restart(count, at)
+    }
 
     fun runOnce() {
-        val filters = linkedMapOf("health" to listOf("unhealthy"))
-        // When not monitoring everything, let Docker pre-filter to labelled containers.
-        if (!config.autohealMonitorAll) filters["label"] = listOf("$ns.autoheal.enable")
+        val containers = api.listContainers(all = false, filters = unhealthyFilters())
 
-        val containers = api.listContainers(all = false, filters = filters)
-
-        // A container that recovered, was removed, or dropped out of the monitored set is simply absent
-        // from a `health=unhealthy` listing, so absence resets the counter for all three at once.
-        restarts.keys.retainAll(containers.mapNotNullTo(HashSet()) { it.jsonObject.str("Id") })
+        forgetRecovered(containers.mapNotNullTo(HashSet()) { it.jsonObject.str("Id") })
 
         for (element in containers) {
             val container = element.jsonObject
@@ -72,9 +73,9 @@ class Autoheal(
             // No override means no `?t=`: the daemon then applies the container's own Config.StopTimeout.
             // Autoheal works off the container list alone — deliberately no inspect per unhealthy
             // container — so in that case it cannot know that value and the read timeout keeps its 60s
-            // floor. A container with a longer stop window may therefore report a read timeout while the
-            // daemon is still stopping it (the restart itself still completes); paying an inspect per
-            // unhealthy container just to size a timeout is not worth it.
+            // floor. A container with a longer stop window therefore reports a read timeout while the
+            // daemon is still restarting it; that outcome is read back from the daemon rather than
+            // believed (see [restartLanded]), which is cheaper than an inspect per unhealthy container.
             val where = "[$name ($short)]"
             if (backoffHolds(id, where)) continue
 
@@ -86,16 +87,107 @@ class Autoheal(
             // Counted before the call, not after: a restart the daemon refuses is not a reason to keep
             // asking every cycle either.
             restarts[id] = Restart(attempt, clock.millis())
-            try {
+            val restarted = try {
                 api.restart(id, timeout)
-                Log.info("[$name ($short)] restart successful")
+                Log.info("$where restart successful")
+                true
             } catch (e: Exception) {
-                Log.error("[$name ($short)] restart failed: ${e.message}")
-                continue
+                Log.error("$where restart failed: ${e.message}")
+                restartLanded(id, where, e)
             }
-            restartDependents(container, name)
+            if (restarted) restartDependents(container, name)
         }
     }
+
+    /** The listing autoheal works off: unhealthy containers, narrowed to the labelled ones if asked. */
+    private fun unhealthyFilters(): Map<String, List<String>> =
+        linkedMapOf<String, List<String>>("health" to listOf("unhealthy")).also {
+            // When not monitoring everything, let Docker pre-filter to labelled containers.
+            if (!config.autohealMonitorAll) it["label"] = listOf("$ns.autoheal.enable")
+        }
+
+    /**
+     * Whether the restart happened after all, despite the call reporting a failure.
+     *
+     * A read timeout is not an answer. `POST /restart` is answered only once the daemon has stopped and
+     * started the container, so a container whose stop window is longer than the socket's read timeout
+     * reports a failure for a restart that is going through perfectly well — and treating that as "did
+     * not happen" is what leaves every consumer of its network namespace joined to a namespace that has
+     * already been torn down, with nothing but `Running` to show for it. So the daemon is asked what
+     * actually happened instead.
+     *
+     * A failure the daemon *did* answer (any real HTTP status: no such container, a conflict, an
+     * internal error) is a verdict and is taken as one — waiting on it would only delay every other
+     * unhealthy container. Only a transport failure, which carries no status at all, is unknown.
+     */
+    private fun restartLanded(id: String, where: String, failure: Exception): Boolean {
+        if (failure is DockerException && failure.status >= 400) return false
+        val deadline = clock.millis() + RESTART_VERIFY_MS
+        Log.warn("$where the daemon gave no usable answer — reading back whether the restart landed")
+        while (true) {
+            val state = runCatching { api.inspectContainer(id).obj("State") }.getOrNull()
+            if (state?.str("Running") == "true" && state.str("Restarting") != "true") {
+                Log.warn("$where it is running again — treating the restart as done and refreshing its dependents")
+                return true
+            }
+            if (clock.millis() >= deadline) {
+                Log.error(
+                    "$where is still not running ${RESTART_VERIFY_MS / 1000}s later — leaving its dependents " +
+                        "alone, restarting them against a container that is down would only spread the outage",
+                )
+                return false
+            }
+            sleeper.sleep(PROBE_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * Drop the backoff state of containers that actually recovered, and only those.
+     *
+     * Absence from a `health=unhealthy` listing is **not** recovery: `docker restart` resets the
+     * healthcheck to `starting`, so the container leaves that listing for as long as its `start_period`
+     * and retries take — which is exactly the window the counter has to survive for the backoff to mean
+     * anything at all. Resetting on absence made the backoff inert on the defaults: the counter was
+     * always wiped before the container was seen unhealthy again, and it was restarted every interval
+     * forever, which is the behaviour the backoff exists to stop.
+     *
+     * So the reset needs positive evidence — the daemon reporting the container `healthy` — and the one
+     * extra listing that takes is paid only while something is actually being backed off. A container
+     * that is in neither listing (removed, unlabelled, or stopped) is forgotten once it has been gone
+     * for a whole [Config.autohealMaxInterval]: nothing else would ever clear it.
+     */
+    private fun forgetRecovered(unhealthyIds: Set<String>) {
+        if (restarts.isEmpty()) return
+        val missing = restarts.keys.filterNot { it in unhealthyIds }
+        val recovered = if (missing.isEmpty()) emptySet() else healthyAmong(missing)
+        val now = clock.millis()
+        val kept = HashMap<String, Restart>(restarts.size)
+        for ((id, restart) in restarts) {
+            when {
+                id in unhealthyIds -> kept[id] = restart.seen()
+                id in recovered ->
+                    Log.info("[${id.take(12)}] is healthy again — its restart backoff starts from scratch")
+                else -> {
+                    val absentSince = restart.absentSince ?: now
+                    if (now - absentSince < config.autohealMaxInterval * 1000L) {
+                        kept[id] = Restart(restart.count, restart.at, absentSince)
+                    }
+                }
+            }
+        }
+        restarts.clear()
+        restarts.putAll(kept)
+    }
+
+    /** Which of [ids] the daemon currently reports as healthy. A listing that fails forgets nothing. */
+    private fun healthyAmong(ids: List<String>): Set<String> =
+        try {
+            api.listContainers(all = false, filters = mapOf("health" to listOf("healthy"), "id" to ids))
+                .mapNotNullTo(HashSet()) { it.jsonObject.str("Id") }
+        } catch (e: Exception) {
+            Log.warn("could not check whether backed-off containers recovered: ${e.message}")
+            emptySet()
+        }
 
     /**
      * Restart what the container we just restarted was holding up.
@@ -163,4 +255,16 @@ class Autoheal(
 
     private fun stopTimeout(labels: JsonObject?): Int? =
         labels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
+
+    private companion object {
+        /** Gap between state reads while waiting out a restart whose outcome the socket did not carry. */
+        const val PROBE_INTERVAL_MS = 500L
+
+        /**
+         * How long a restart that reported a transport failure is given to show up as a running
+         * container. Generous on purpose: what is being waited out is a graceful stop window that
+         * already outlasted the socket's own read timeout.
+         */
+        const val RESTART_VERIFY_MS = 60_000L
+    }
 }

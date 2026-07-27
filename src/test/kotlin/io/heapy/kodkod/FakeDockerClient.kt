@@ -3,6 +3,7 @@ package io.heapy.kodkod
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
@@ -45,11 +46,22 @@ class FakeDockerClient : DockerClient {
     /** Bodies passed to [create], paired with the requested name, in call order. */
     val created = mutableListOf<Pair<String, JsonObject>>()
 
-    /** Timeouts passed to [stop], in call order. */
+    /** Timeouts passed to [stop], in call order — the `?t=` the daemon is actually sent. */
     val stopTimeouts = mutableListOf<Int?>()
+
+    /**
+     * `expectedStopSeconds` passed to [stop], in call order. It never reaches the daemon (it only sizes
+     * the caller's own read timeout), so nothing else can tell whether it was computed at all — and a
+     * stop whose read timeout is shorter than its stop window reports a perfectly good stop as a
+     * failure.
+     */
+    val stopExpected = mutableListOf<Int?>()
 
     /** Timeouts passed to [restart], in call order. */
     val restartTimeouts = mutableListOf<Int?>()
+
+    /** `expectedStopSeconds` passed to [restart], in call order; see [stopExpected]. */
+    val restartExpected = mutableListOf<Int?>()
 
     /** Refs passed to [removeImage], in call order. */
     val removedImages = mutableListOf<String>()
@@ -88,6 +100,19 @@ class FakeDockerClient : DockerClient {
      * reports `State.Running=false, ExitCode=1`, the shape a crash-looping replacement has.
      */
     val startedThenExits = mutableSetOf<String>()
+
+    /**
+     * Container ids whose [start] succeeds and whose container the daemon then forgets entirely, so
+     * every later [inspectContainer] answers 404 — what an `AutoRemove` container that exits at once
+     * (or somebody else's `docker rm`) leaves behind.
+     */
+    val vanishesAfterStart = mutableSetOf<String>()
+
+    /** Container ids whose [inspectContainer] throws — a daemon that cannot answer, not a 404. */
+    val failInspect = mutableSetOf<String>()
+
+    /** Container ids for which [stop] should throw — used to drive the "stop failed" branches. */
+    val failStop = mutableSetOf<String>()
 
     /** id -> `State.Health.Status` reported by [inspectContainer] and matched by the `health` filter. */
     val health = mutableMapOf<String, String>()
@@ -132,21 +157,32 @@ class FakeDockerClient : DockerClient {
     /**
      * The daemon's own filtering, modelled only as far as kodkod uses it: values within one filter are
      * OR'd, filters are AND'd, and an unknown filter key is ignored. A summary without `State` counts
-     * as running, and a container whose health this fake does not model matches any `health` filter —
-     * both keep hand-written fixtures, which register containers the daemon already filtered, valid.
+     * as running, which keeps hand-written fixtures valid.
+     *
+     * A `health` filter, however, matches only containers whose health this fake actually models. It
+     * used to match unmodelled ones too, which made "is it unhealthy?" and "is it healthy again?"
+     * indistinguishable — and any code that tells them apart untestable.
      */
     private fun matches(summary: JsonObject, all: Boolean, filters: Map<String, List<String>>): Boolean {
-        val state = summary.str("State") ?: "running"
+        val id = summary.str("Id")
+        // The lifecycle wins over the registered summary: a container this fake started or stopped
+        // reports the state it is actually in, exactly as a listing taken afterwards would.
+        val state = running[id]?.let { if (it) "running" else "exited" } ?: summary.str("State") ?: "running"
         if (!all && state !in LISTED_WITHOUT_ALL) return false
+        // Same for the name: after a rename the daemon's index knows only the new one.
+        val names = renamed[id]?.let(::listOf) ?: summary.containerNames()
         return filters.all { (key, values) ->
             when (key) {
                 "status" -> state in values
                 "label" -> values.all { matchesLabel(summary.obj("Labels"), it) }
-                "health" -> health[summary.str("Id")]?.let { it in values } ?: true
+                "health" -> health[id] in values
+                // The daemon matches an `id` filter by prefix, which is how a backed-off container is
+                // asked about by id without listing the host.
+                "id" -> values.any { needle -> id?.startsWith(needle) == true }
                 // The daemon matches a `name` filter as an unanchored pattern over every name a
                 // container answers to, which is how the reconcile pass narrows `all=true` down to
                 // backup candidates instead of listing the whole host.
-                "name" -> values.any { needle -> summary.containerNames().any { it.contains(needle) } }
+                "name" -> values.any { needle -> names.any { it.contains(needle) } }
                 else -> true
             }
         }
@@ -166,6 +202,10 @@ class FakeDockerClient : DockerClient {
      * test registered is passed through.
      */
     override fun inspectContainer(id: String): JsonObject {
+        if (id in failInspect) throw DockerException(500, "fake: inspect failure for '$id'")
+        // A container the daemon has forgotten answers 404, which is an answer; an id no test ever
+        // registered is a broken fixture and must not be mistaken for one.
+        if (id in removed) throw DockerException(404, "fake: no such container: $id")
         val stored = containers[id] ?: error("fake: no container registered for id '$id'")
         val storedState = stored.obj("State") ?: EMPTY_OBJECT
         val alive = running[id] ?: storedState["Running"]?.jsonPrimitive?.booleanOrNull ?: true
@@ -190,6 +230,7 @@ class FakeDockerClient : DockerClient {
     override fun restart(id: String, timeout: Int?, expectedStopSeconds: Int?) {
         op("restart", id) {
             restartTimeouts += timeout
+            restartExpected += expectedStopSeconds
             if (id in failRestart) throw DockerException(500, "fake: restart failure for '$id'")
             running[id] = id !in startedThenExits
         }
@@ -198,6 +239,8 @@ class FakeDockerClient : DockerClient {
     override fun stop(id: String, timeout: Int?, expectedStopSeconds: Int?) {
         op("stop", id) {
             stopTimeouts += timeout
+            stopExpected += expectedStopSeconds
+            if (id in failStop) throw DockerException(500, "fake: stop failure for '$id'")
             running[id] = false
         }
     }
@@ -206,6 +249,10 @@ class FakeDockerClient : DockerClient {
         op("start", id) {
             if (id in failStart) throw DockerException(500, "fake: start failure for '$id'")
             running[id] = id !in startedThenExits
+            if (id in vanishesAfterStart) {
+                containers.remove(id)
+                removed += id
+            }
         }
     }
 
@@ -225,10 +272,19 @@ class FakeDockerClient : DockerClient {
         }
     }
 
+    /**
+     * A removed container is *gone*: out of every listing, out of [inspectContainer] (which answers 404
+     * from then on) and off the name index. The fake used to keep it, so a second cycle re-discovered
+     * and re-updated a container the daemon had destroyed — a state no real daemon can produce, and one
+     * that quietly propped up the multi-cycle tests.
+     */
     override fun remove(id: String, force: Boolean) {
         op("remove", id) {
             if (id in failRemove) throw DockerException(500, "fake: remove failure for '$id'")
             running.remove(id)
+            renamed.remove(id)
+            containers.remove(id)
+            listed.removeAll { it.str("Id") == id }
             removed += id
         }
     }
@@ -253,9 +309,46 @@ class FakeDockerClient : DockerClient {
             // The daemon knows the replacement from here on, so whatever inspects it next (the liveness
             // gate) gets an answer. A payload the test registered for this id up front wins, which is how
             // a test asks for a replacement that comes up `Restarting`.
-            containers.getOrPut(id) { obj("""{"Name":"/$name","Config":{},"HostConfig":{},"NetworkSettings":{"Networks":{}}}""") }
+            containers.getOrPut(id) { inspectOf(id, name, body) }
+            // And it appears in listings — as `created` until something starts it. Without this a later
+            // pass (a second cycle's discovery, the daemon-wide scan for create-time dependents) cannot
+            // see the container that was just made, so tests of "do not touch it twice" cannot fail.
+            listed += summaryOf(id, name, body)
             id
         }
+
+    /** The inspect payload of a container created from [body] — what the daemon would report back. */
+    private fun inspectOf(id: String, name: String, body: JsonObject): JsonObject = buildJsonObject {
+        put("Id", id)
+        put("Name", "/$name")
+        // The daemon resolves the ref to an image id; an unknown ref keeps the ref, as a digest would.
+        val ref = body.str("Image").orEmpty()
+        put("Image", images[ref]?.str("Id") ?: ref)
+        put(
+            "Config",
+            buildJsonObject {
+                body.forEach { (key, value) -> if (key !in NON_CONFIG_KEYS) put(key, value) }
+            },
+        )
+        put("HostConfig", body.obj("HostConfig") ?: EMPTY_OBJECT)
+        put(
+            "NetworkSettings",
+            buildJsonObject { put("Networks", body.obj("NetworkingConfig")?.obj("EndpointsConfig") ?: EMPTY_OBJECT) },
+        )
+    }
+
+    /** The `/containers/json` summary of that same container. */
+    private fun summaryOf(id: String, name: String, body: JsonObject): JsonObject = buildJsonObject {
+        put("Id", id)
+        put("Names", JsonArray(listOf(JsonPrimitive("/$name"))))
+        put("State", "created")
+        put("Labels", body.obj("Labels") ?: EMPTY_OBJECT)
+        put("HostConfig", body.obj("HostConfig") ?: EMPTY_OBJECT)
+        put(
+            "NetworkSettings",
+            buildJsonObject { put("Networks", body.obj("NetworkingConfig")?.obj("EndpointsConfig") ?: EMPTY_OBJECT) },
+        )
+    }
 
     override fun inspectImage(ref: String): JsonObject =
         images[ref] ?: error("fake: no image registered for ref '$ref'")
@@ -279,6 +372,9 @@ class FakeDockerClient : DockerClient {
     private companion object {
         /** States `docker ps` shows without `--all`. */
         val LISTED_WITHOUT_ALL = setOf("running", "restarting", "paused")
+
+        /** Create-body keys that are not part of the container's `Config`. */
+        val NON_CONFIG_KEYS = setOf("HostConfig", "NetworkingConfig")
 
         /** `State` fields this fake owns; anything else in a registered payload is passed through. */
         val COMPUTED_STATE_KEYS = setOf("Running", "ExitCode")

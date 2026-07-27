@@ -434,6 +434,8 @@ class UpdaterTest {
         docker.distribution["db:1"] = "sha256:db-remote"
         docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
         docker.distribution["web:1"] = "sha256:web-remote"
+        // The tag still names the image web is running, so the recreate really is faithful.
+        docker.images["web:1"] = json("""{"Id":"sha256:web-old","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -442,6 +444,39 @@ class UpdaterTest {
             "sha256:web-old", web.obj("Labels").label("com.docker.compose.image"),
             "web's own image did not change — the label must be copied verbatim",
         )
+    }
+
+    /**
+     * The other half: a dependency-driven recreate creates from the image *ref* too, so a tag that
+     * moved under the container (someone else's `docker pull`, a sibling service on the same tag)
+     * makes the replacement run a different image after all. Leaving `com.docker.compose.image` naming
+     * the old one is what makes the next `docker compose up` recreate the container all over again.
+     */
+    @Test
+    fun a_dependency_driven_recreate_onto_a_moved_tag_restamps_the_label_and_says_so() {
+        val docker = FakeDockerClient()
+        docker.container(id = "db", imageRef = "db:1", currentImageId = "sha256:db-old")
+        docker.container(
+            id = "web", imageRef = "web:1", currentImageId = "sha256:web-old",
+            currentRepoDigests = listOf("web@sha256:web-remote"),
+            labels = """{"com.docker.compose.image":"sha256:web-old"}""",
+            hostConfig = """{"Links":["/db:/web/db"]}""",
+        )
+        docker.distribution["db:1"] = "sha256:db-remote"
+        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
+        // web is up to date as far as the registry goes, but the local tag has moved on anyway.
+        docker.distribution["web:1"] = "sha256:web-remote"
+        docker.images["web:1"] = json("""{"Id":"sha256:web-moved","Config":{},"RepoDigests":[]}""")
+
+        val log = captureLog { updater(docker).runOnce() }
+
+        val web = docker.created.single { (name, _) -> name == "web" }.second
+        assertEquals(
+            "sha256:web-moved", web.obj("Labels").label("com.docker.compose.image"),
+            "the label has to name the image the replacement actually runs: $web",
+        )
+        assertEquals("web:1", web.str("Image"), "and the ref stays a ref — an id there has no tag to follow")
+        assertTrue(log.contains("has moved to"), "a recreate that silently changes the image must not be silent: $log")
     }
 
     @Test
@@ -684,6 +719,52 @@ class UpdaterTest {
         )
     }
 
+    /**
+     * The gate used to pass on zero evidence: an unreadable probe counted as "not settled yet", and the
+     * end of the window returned normally whether or not anything had ever answered — after which the
+     * old container is force-removed and its image pruned. "We could not look" is not "it is fine".
+     */
+    @Test
+    fun a_replacement_that_could_never_be_inspected_fails_the_gate() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.failInspect += "new-web-0" // the daemon answers nothing about the replacement, ever
+
+        val log = captureLog { updater(docker, config(verifySeconds = "2")).runOnce() }
+
+        assertOrder(docker.ops, "start:new-web-0", "remove:new-web-0", "rename:web->web", "start:web")
+        assertFalse(
+            docker.ops.contains("remove:web"),
+            "destroying the only way back on a window that never got an answer: ${docker.ops}",
+        )
+        assertTrue(docker.removedImages.isEmpty(), "and the old image goes with it: ${docker.removedImages}")
+        assertEquals(
+            1, log.lines().count { it.contains("could not probe the replacement") },
+            "one line per unreadable window, not one per probe: $log",
+        )
+    }
+
+    /**
+     * A `404` is the one probe error that is an answer — and the worst one. An `AutoRemove` inherited
+     * from the old container (or somebody's `docker rm`) makes the replacement disappear the moment it
+     * exits, which without this reads as "still starting" for the whole window and then as success.
+     */
+    @Test
+    fun a_replacement_the_daemon_has_forgotten_is_a_failed_update() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.vanishesAfterStart += "new-web-0"
+
+        updater(docker).runOnce()
+
+        assertOrder(docker.ops, "start:new-web-0", "rename:web->web", "start:web")
+        assertFalse(docker.ops.contains("remove:web"), "the old container is the only copy left: ${docker.ops}")
+        assertEquals(
+            emptyList<Long>(), clock.sleeps,
+            "a container the daemon does not know is not a container that needs more time: ${clock.sleeps}",
+        )
+    }
+
     @Test
     fun a_replacement_still_inside_its_start_period_is_accepted_at_the_end_of_the_window() {
         val docker = FakeDockerClient()
@@ -787,15 +868,57 @@ class UpdaterTest {
         clock.advance(cooldown)
         updater.runOnce() // the retry comes up this time and the update completes
         val afterSuccess = docker.ops.size
+        // A third image is published right away — well inside the window the failure had bought.
+        docker.images["nginx:1.27"] = json("""{"Id":"sha256:newer","Config":{},"RepoDigests":[]}""")
 
         updater.runOnce()
 
         assertTrue(docker.ops.contains("remove:web"), "the retry has to have actually gone through: ${docker.ops}")
         assertTrue(
             docker.ops.drop(afterSuccess).any { it.startsWith("create:") },
-            "the memory records failures, not attempts: a container whose update went through carries no " +
+            "the memory records failures, not attempts: a service whose update went through carries no " +
                 "cooldown into later cycles: ${docker.ops}",
         )
+    }
+
+    /**
+     * A recreate builds the replacement from the image **ref**, and by the time a container is being
+     * held back that ref resolves to exactly the image that failed on it. So a dependency of its being
+     * updated must not drag it through a recreate: that applies the very update the cooldown exists to
+     * prevent, and a rollback afterwards is an outage kodkod caused twice for the same reason.
+     */
+    @Test
+    fun a_container_held_back_by_a_cooldown_is_not_recreated_for_a_dependency_either() {
+        val docker = FakeDockerClient()
+        // web shares db's network namespace, so an update of db normally recreates web too.
+        docker.container(
+            id = "db", imageRef = "db:1", currentImageId = "sha256:db-old",
+            currentRepoDigests = listOf("db@sha256:db-1"),
+        )
+        docker.container(
+            id = "web", imageRef = "web:1", currentImageId = "sha256:web-old",
+            hostConfig = """{"NetworkMode":"container:db"}""",
+        )
+        docker.distribution["db:1"] = "sha256:db-1" // db is up to date in the first cycle
+        docker.images["web:1"] = json("""{"Id":"sha256:web-bad","Config":{},"RepoDigests":[]}""")
+        docker.startedThenExits += "new-web-0" // web's own update cannot come up
+        val updater = updater(docker)
+
+        updater.runOnce()
+        val afterFirstCycle = docker.ops.size
+        // Now db's image moves. web is still inside the cooldown its failed update bought.
+        docker.distribution["db:1"] = "sha256:db-2"
+        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-2"]}""")
+
+        val log = captureLog { updater.runOnce() }
+
+        val second = docker.ops.drop(afterFirstCycle)
+        assertTrue(second.contains("create:db"), "db itself still has to be updated: $second")
+        assertTrue(
+            second.none { it.endsWith(":web") },
+            "web must not be stopped, restarted or recreated against the image that already failed: $second",
+        )
+        assertTrue(log.contains("left out of this cycle's dependency restarts"), "and it has to say so: $log")
     }
 
     @Test
@@ -1138,6 +1261,11 @@ class UpdaterTest {
             "the dependency graph already recreates a monitored consumer; the daemon-wide scan must not " +
                 "recreate the replacement it just made: ${docker.ops}",
         )
+        assertTrue(
+            docker.ops.none { it.endsWith(":new-side-1") && it.startsWith("restart:") },
+            "and the replacement — which the scan does find, joined to the provider's namespace by name — " +
+                "must not be restarted on top of the recreate it just came out of: ${docker.ops}",
+        )
     }
 
     @Test
@@ -1213,7 +1341,7 @@ class UpdaterTest {
     fun an_orphaned_backup_is_removed_once_its_replacement_is_running() {
         val docker = FakeDockerClient()
         docker.orphanedBackup(id = "web-old", name = "web")
-        docker.holder(id = "new-web", name = "web", running = true)
+        docker.holder(id = "new-web", name = "web", state = "running")
 
         updater(docker).reconcileOrphanedBackups()
 
@@ -1225,10 +1353,10 @@ class UpdaterTest {
     }
 
     @Test
-    fun an_orphaned_backup_is_restored_over_a_replacement_that_is_not_running() {
+    fun an_orphaned_backup_is_restored_over_a_replacement_that_never_started() {
         val docker = FakeDockerClient()
         docker.orphanedBackup(id = "web-old", name = "web")
-        docker.holder(id = "new-web", name = "web", running = false)
+        docker.holder(id = "new-web", name = "web", state = "created")
 
         updater(docker).reconcileOrphanedBackups()
 
@@ -1236,12 +1364,31 @@ class UpdaterTest {
         assertTrue(running(docker, "web-old"), "the known-good container is the one that has to serve: ${docker.ops}")
     }
 
+    /**
+     * The one shape that must NOT be resolved by force. A recreate that got all the way through and
+     * only failed to delete the backup leaves the *replacement* holding the name; an operator who then
+     * runs `docker compose stop app` leaves it stopped. Destroying it and starting the pre-update
+     * container in its place would silently undo a completed update — and destroy a container kodkod
+     * did not create, on nothing but the guess that it was ours.
+     */
+    @Test
+    fun a_stopped_holder_that_has_run_is_not_destroyed_for_the_backup() {
+        val docker = FakeDockerClient()
+        docker.orphanedBackup(id = "web-old", name = "web")
+        docker.holder(id = "new-web", name = "web", state = "exited")
+
+        val log = captureLog { updater(docker).reconcileOrphanedBackups() }
+
+        assertTrue(docker.ops.isEmpty(), "neither container may be touched on a guess: ${docker.ops}")
+        assertTrue(log.contains("stopped on purpose"), "and the operator has to be told what was found: $log")
+    }
+
     @Test
     fun a_backup_suffix_carrying_someone_elses_id_is_left_alone() {
         val docker = FakeDockerClient()
         // Looks exactly like a backup of `web` — except the short id in the suffix is not its own.
-        docker.holder(id = "impostor", name = "web_kodkod_old_deadbeef1234", running = false)
-        docker.holder(id = "web", name = "web", running = true)
+        docker.holder(id = "impostor", name = "web_kodkod_old_deadbeef1234", state = "exited")
+        docker.holder(id = "web", name = "web", state = "running")
 
         updater(docker).reconcileOrphanedBackups()
 
@@ -1459,8 +1606,8 @@ private const val PROVIDER_ID = "app1234567890abcdef"
  * a bystander a reconcile pass has to reason about (who holds a name, and is it alive) rather than of
  * an update target.
  */
-private fun FakeDockerClient.holder(id: String, name: String, running: Boolean) {
-    val state = if (running) "running" else "exited"
+private fun FakeDockerClient.holder(id: String, name: String, state: String) {
+    val running = state == "running"
     listed += Json.parseToJsonElement("""{"Id":"$id","Names":["/$name"],"State":"$state","Labels":{}}""").jsonObject
     containers[id] = Json.parseToJsonElement(
         """{"Name":"/$name","Config":{},"HostConfig":{},"NetworkSettings":{"Networks":{}},"State":{"Running":$running}}""",
@@ -1472,7 +1619,7 @@ private fun FakeDockerClient.holder(id: String, name: String, running: Boolean) 
  * what a kodkod killed between `rename(old -> backup)` and the replacement's `start` leaves behind.
  */
 private fun FakeDockerClient.orphanedBackup(id: String, name: String) {
-    holder(id = id, name = "${name}_kodkod_old_${id.take(12)}", running = false)
+    holder(id = id, name = "${name}_kodkod_old_${id.take(12)}", state = "exited")
 }
 
 /**

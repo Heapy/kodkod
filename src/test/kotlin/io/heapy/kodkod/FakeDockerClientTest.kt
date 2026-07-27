@@ -88,7 +88,7 @@ class FakeDockerClientTest {
     }
 
     @Test
-    fun the_health_filter_selects_containers_whose_health_is_modelled() {
+    fun the_health_filter_selects_only_containers_whose_health_is_modelled() {
         summary("sick", state = "running")
         summary("well", state = "running")
         summary("unmodelled", state = "running")
@@ -96,9 +96,57 @@ class FakeDockerClientTest {
         docker.health["well"] = "healthy"
 
         assertEquals(
-            listOf("sick", "unmodelled"),
+            listOf("sick"),
             ids(all = false, filters = mapOf("health" to listOf("unhealthy"))),
-            "a container with no modelled health is taken as already filtered by the daemon",
+            "a container of unknown health belongs in no health-filtered listing — matching every one of " +
+                "them made 'still unhealthy' and 'healthy again' the same observation",
+        )
+        assertEquals(listOf("well"), ids(all = false, filters = mapOf("health" to listOf("healthy"))))
+    }
+
+    @Test
+    fun the_id_filter_matches_by_prefix() {
+        summary("abcdef123456", state = "running")
+        summary("999999999999", state = "running")
+
+        assertEquals(listOf("abcdef123456"), ids(all = true, filters = mapOf("id" to listOf("abcdef"))))
+    }
+
+    // --- lifecycle reflected in listings ----------------------------------------------------
+
+    @Test
+    fun a_removed_container_is_gone_from_every_listing_and_answers_404() {
+        summary("web", state = "running")
+        docker.containers["web"] = json("""{"Name":"/web"}""")
+
+        docker.remove("web", force = true)
+
+        assertEquals(emptyList<String>(), ids(all = true), "the daemon does not list what it destroyed")
+        val gone = assertThrows(DockerException::class.java) { docker.inspectContainer("web") }
+        assertEquals(404, gone.status, "and it answers 404, not a fixture error")
+    }
+
+    @Test
+    fun a_created_container_is_listed_as_created_and_becomes_running_when_started() {
+        val id = docker.create("web", json("""{"Image":"app:1","Labels":{"a":"b"}}"""), platform = null)
+
+        assertEquals(emptyList<String>(), ids(all = false), "a created container is not up yet")
+        assertEquals(listOf(id), ids(all = true, filters = mapOf("label" to listOf("a=b"))))
+
+        docker.start(id)
+
+        assertEquals(listOf(id), ids(all = false), "the daemon lists it as running once it is started")
+    }
+
+    @Test
+    fun a_renamed_container_answers_to_its_new_name_in_a_listing() {
+        summary("web", state = "running")
+
+        docker.rename("web", "web${BACKUP_MARKER}web")
+
+        assertEquals(
+            listOf("web"), ids(all = true, filters = mapOf("name" to listOf(BACKUP_MARKER))),
+            "the name index the reconcile pass queries is the daemon's, not the one the fixture was written with",
         )
     }
 
