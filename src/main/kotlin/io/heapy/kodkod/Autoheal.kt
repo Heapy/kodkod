@@ -8,11 +8,16 @@ import kotlinx.serialization.json.jsonObject
  *
  *  - `<ns>.autoheal.enable=true|false` — opt in/out (default follows [Config.autohealMonitorAll])
  *  - `<ns>.stop.timeout=<seconds>`     — per-container stop timeout override
+ *
+ * [clock] and [sleeper] default to the real ones and exist so waiting logic can be driven from tests
+ * without spending the wall-clock time it describes.
  */
 class Autoheal(
     private val api: DockerClient,
     private val config: Config,
     private val selfId: String?,
+    @Suppress("unused") private val clock: TimeSource = TimeSource.SYSTEM,
+    @Suppress("unused") private val sleeper: Sleeper = Sleeper.SYSTEM,
 ) {
     private val ns = config.labelNamespace
 

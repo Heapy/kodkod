@@ -3,7 +3,11 @@ package io.heapy.kodkod
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 
 /**
  * In-memory [DockerClient] for unit tests. It serves canned `list`/`inspect`/`distribution` data and
@@ -12,11 +16,17 @@ import kotlinx.serialization.json.jsonObject
  *
  * Reads ([inspectContainer], [inspectImage], [inspectDistribution]) are NOT recorded; only state
  * changes ([stop]/[start]/[rename]/[remove]/[create]/[connectNetwork]/[removeImage]/[restart]) and
- * [pull] land in [ops]. [create] returns deterministic ids of the form `new-<name>-<n>`, so tests can
- * predict and reference the replacement container.
+ * [pull] land in [ops]. As in [OpLoggingClient], an op is appended **after** the call succeeded and a
+ * call that threw is recorded with a `!` marker (`create!:web`), so "kodkod did this" and "kodkod
+ * tried this" never read the same. [create] returns deterministic ids of the form `new-<name>-<n>`,
+ * so tests can predict and reference the replacement container.
+ *
+ * [listContainers] applies `all` and the `status`/`label`/`health` filters to [listed] the way the
+ * daemon would, so code that deliberately looks beyond the monitored set (`all=true`, no label
+ * filter) can be told apart from code that only ever sees its own targets.
  */
 class FakeDockerClient : DockerClient {
-    /** Returned verbatim by [listContainers] — already represents the post-filter set Docker would return. */
+    /** Container summaries the daemon knows about; [listContainers] filters this list. */
     val listed = mutableListOf<JsonObject>()
 
     /** id -> inspect payload returned by [inspectContainer]. */
@@ -34,6 +44,15 @@ class FakeDockerClient : DockerClient {
     /** Bodies passed to [create], paired with the requested name, in call order. */
     val created = mutableListOf<Pair<String, JsonObject>>()
 
+    /** Timeouts passed to [stop], in call order. */
+    val stopTimeouts = mutableListOf<Int?>()
+
+    /** Timeouts passed to [restart], in call order. */
+    val restartTimeouts = mutableListOf<Int?>()
+
+    /** Refs passed to [removeImage], in call order. */
+    val removedImages = mutableListOf<String>()
+
     /** Invoked from [pull]; lets a test mutate [images] to simulate a freshly-pulled (moved) tag. */
     var onPull: (repo: String, tag: String) -> Unit = { _, _ -> }
 
@@ -43,53 +62,145 @@ class FakeDockerClient : DockerClient {
     /** Container ids for which [start] should throw — e.g. `new-web-0` to fail the replacement's start. */
     val failStart = mutableSetOf<String>()
 
+    /** Container ids for which [remove] should throw — used to strand a replacement during rollback. */
+    val failRemove = mutableSetOf<String>()
+
+    /** New names for which [rename] should throw 409 — models "a container already holds that name". */
+    val failRename = mutableSetOf<String>()
+
+    /**
+     * Container ids whose [start] succeeds but leaves the container dead: [inspectContainer] then
+     * reports `State.Running=false, ExitCode=1`, the shape a crash-looping replacement has.
+     */
+    val startedThenExits = mutableSetOf<String>()
+
+    /** id -> `State.Health.Status` reported by [inspectContainer] and matched by the `health` filter. */
+    val health = mutableMapOf<String, String>()
+
+    /** id -> running, as tracked through [start]/[stop]/[restart]; absent means "as registered". */
+    private val running = mutableMapOf<String, Boolean>()
+
     private var createSeq = 0
+
+    /** Record `<verb>:<arg>` once [call] returned, or `<verb>!:<arg>` if it threw. */
+    private fun <T> op(verb: String, arg: String, call: () -> T): T {
+        val result = try {
+            call()
+        } catch (e: Throwable) {
+            ops += "$verb!:$arg"
+            throw e
+        }
+        ops += "$verb:$arg"
+        return result
+    }
 
     override fun version(): JsonObject = obj("""{"Version":"0.0.0-fake","ApiVersion":"1.45"}""")
 
     override fun listContainers(all: Boolean, filters: Map<String, List<String>>): JsonArray =
-        JsonArray(listed)
+        JsonArray(listed.filter { matches(it, all, filters) })
 
-    override fun inspectContainer(id: String): JsonObject =
-        containers[id] ?: error("fake: no container registered for id '$id'")
+    /**
+     * The daemon's own filtering, modelled only as far as kodkod uses it: values within one filter are
+     * OR'd, filters are AND'd, and an unknown filter key is ignored. A summary without `State` counts
+     * as running, and a container whose health this fake does not model matches any `health` filter —
+     * both keep hand-written fixtures, which register containers the daemon already filtered, valid.
+     */
+    private fun matches(summary: JsonObject, all: Boolean, filters: Map<String, List<String>>): Boolean {
+        val state = summary.str("State") ?: "running"
+        if (!all && state !in LISTED_WITHOUT_ALL) return false
+        return filters.all { (key, values) ->
+            when (key) {
+                "status" -> state in values
+                "label" -> values.all { matchesLabel(summary.obj("Labels"), it) }
+                "health" -> health[summary.str("Id")]?.let { it in values } ?: true
+                else -> true
+            }
+        }
+    }
+
+    /** A `label` filter value is either `key` (present at all) or `key=value` (present and equal). */
+    private fun matchesLabel(labels: JsonObject?, filter: String): Boolean {
+        val key = filter.substringBefore('=')
+        val value = labels.label(key) ?: return false
+        return !filter.contains('=') || value == filter.substringAfter('=')
+    }
+
+    /**
+     * The registered payload with `State` reflecting this fake's lifecycle model: containers are
+     * running until [stop] (or a [startedThenExits] start) says otherwise, and `State.Health.Status`
+     * comes from [health]. Any other `State` field the test registered is passed through.
+     */
+    override fun inspectContainer(id: String): JsonObject {
+        val stored = containers[id] ?: error("fake: no container registered for id '$id'")
+        val storedState = stored.obj("State") ?: EMPTY_OBJECT
+        val alive = running[id] ?: storedState["Running"]?.jsonPrimitive?.booleanOrNull ?: true
+        val declaredHealth = health[id]
+        return buildJsonObject {
+            stored.forEach { (key, value) -> if (key != "State") put(key, value) }
+            put(
+                "State",
+                buildJsonObject {
+                    storedState.forEach { (key, value) ->
+                        if (key !in COMPUTED_STATE_KEYS && !(key == "Health" && declaredHealth != null)) put(key, value)
+                    }
+                    put("Running", alive)
+                    put("ExitCode", if (alive) 0 else 1)
+                    declaredHealth?.let { status -> put("Health", buildJsonObject { put("Status", status) }) }
+                },
+            )
+        }
+    }
 
     override fun restart(id: String, timeout: Int) {
-        ops += "restart:$id"
+        op("restart", id) {
+            restartTimeouts += timeout
+            running[id] = id !in startedThenExits
+        }
     }
 
     override fun stop(id: String, timeout: Int) {
-        ops += "stop:$id"
+        op("stop", id) {
+            stopTimeouts += timeout
+            running[id] = false
+        }
     }
 
     override fun start(id: String) {
-        ops += "start:$id"
-        if (id in failStart) throw DockerException(500, "fake: start failure for '$id'")
+        op("start", id) {
+            if (id in failStart) throw DockerException(500, "fake: start failure for '$id'")
+            running[id] = id !in startedThenExits
+        }
     }
 
     override fun rename(id: String, name: String) {
-        ops += "rename:$id->$name"
+        op("rename", "$id->$name") {
+            if (name in failRename) throw DockerException(409, "fake: name '$name' is already in use")
+        }
     }
 
     override fun remove(id: String, force: Boolean) {
-        ops += "remove:$id"
+        op("remove", id) {
+            if (id in failRemove) throw DockerException(500, "fake: remove failure for '$id'")
+            running.remove(id)
+        }
     }
 
     override fun connectNetwork(network: String, containerId: String, endpoint: JsonObject) {
-        ops += "connect:$network:$containerId"
+        op("connect", "$network:$containerId") {}
     }
 
-    override fun create(name: String, body: JsonObject): String {
-        ops += "create:$name"
-        if (name in failCreate) throw DockerException(500, "fake: create failure for '$name'")
-        created += name to body
-        return "new-$name-${createSeq++}"
-    }
+    override fun create(name: String, body: JsonObject): String =
+        op("create", name) {
+            if (name in failCreate) throw DockerException(500, "fake: create failure for '$name'")
+            created += name to body
+            "new-$name-${createSeq++}"
+        }
 
     override fun inspectImage(ref: String): JsonObject =
         images[ref] ?: error("fake: no image registered for ref '$ref'")
 
     override fun removeImage(ref: String) {
-        ops += "removeImage:$ref"
+        op("removeImage", ref) { removedImages += ref }
     }
 
     override fun inspectDistribution(ref: String, registryAuth: String?): JsonObject {
@@ -98,11 +209,16 @@ class FakeDockerClient : DockerClient {
     }
 
     override fun pull(fromImage: String, tag: String, registryAuth: String?) {
-        ops += "pull:$fromImage:$tag"
-        onPull(fromImage, tag)
+        op("pull", "$fromImage:$tag") { onPull(fromImage, tag) }
     }
 
     private companion object {
+        /** States `docker ps` shows without `--all`. */
+        val LISTED_WITHOUT_ALL = setOf("running", "restarting", "paused")
+
+        /** `State` fields this fake owns; anything else in a registered payload is passed through. */
+        val COMPUTED_STATE_KEYS = setOf("Running", "ExitCode")
+
         fun obj(json: String): JsonObject = Json.parseToJsonElement(json).jsonObject
     }
 }

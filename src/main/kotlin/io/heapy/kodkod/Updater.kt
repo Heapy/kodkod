@@ -22,11 +22,16 @@ import kotlinx.serialization.json.put
  * restarted; create-time dependents (`--link` / `network_mode: container:`) are recreated so Docker
  * refreshes their references. Containers pinned to a digest (`image@sha256:...`) are never stale but can
  * still be restarted or recreated as a dependent.
+ *
+ * [clock] and [sleeper] default to the real ones and exist so waiting logic can be driven from tests
+ * without spending the wall-clock time it describes.
  */
 class Updater(
     private val api: DockerClient,
     private val config: Config,
     private val selfId: String?,
+    @Suppress("unused") private val clock: TimeSource = TimeSource.SYSTEM,
+    @Suppress("unused") private val sleeper: Sleeper = Sleeper.SYSTEM,
 ) {
     private val ns = config.labelNamespace
 

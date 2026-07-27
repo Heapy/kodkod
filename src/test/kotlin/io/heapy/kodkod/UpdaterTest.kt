@@ -174,7 +174,9 @@ class UpdaterTest {
 
         Updater(docker, config(), selfId = null).runOnce() // runOnce logs and swallows the recreate failure
 
-        assertOrder(docker.ops, "rename:web->web_kodkod_old_web", "create:web", "rename:web->web", "start:web")
+        // `create!:` is an attempted create — the fake never lets a failed mutation read as a done one.
+        assertOrder(docker.ops, "rename:web->web_kodkod_old_web", "create!:web", "rename:web->web", "start:web")
+        assertFalse(docker.ops.contains("create:web"), "the create failed and must not read as done: ${docker.ops}")
         assertFalse(docker.ops.contains("remove:web"), "the original container must survive a failed create: ${docker.ops}")
         assertTrue(docker.created.isEmpty(), "no replacement should have been recorded: ${docker.created}")
     }
@@ -188,7 +190,8 @@ class UpdaterTest {
 
         Updater(docker, config(), selfId = null).runOnce()
 
-        assertOrder(docker.ops, "create:web", "start:new-web-0", "remove:new-web-0", "rename:web->web", "start:web")
+        assertOrder(docker.ops, "create:web", "start!:new-web-0", "remove:new-web-0", "rename:web->web", "start:web")
+        assertFalse(docker.ops.contains("start:new-web-0"), "the start failed and must not read as done: ${docker.ops}")
         assertFalse(docker.ops.contains("remove:web"), "the original container must survive a failed start: ${docker.ops}")
     }
 

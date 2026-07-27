@@ -247,22 +247,29 @@ max-adversarial ревью репозитория дало 15 подтвержд
 - Create: `src/main/kotlin/io/heapy/kodkod/Time.kt`
 - Modify: `src/main/kotlin/io/heapy/kodkod/Updater.kt`
 - Modify: `src/main/kotlin/io/heapy/kodkod/Autoheal.kt`
+- Create: `src/test/kotlin/io/heapy/kodkod/FakeClock.kt` (➕ фейковые часы живут в test source set — в main
+  их место заняли бы test-only классы, ровно та проблема, что уже отмечена у record/replay)
+- Create: `src/test/kotlin/io/heapy/kodkod/FakeDockerClientTest.kt` (➕ тесты на сам фейк)
+- Create: `src/test/kotlin/io/heapy/kodkod/TimeTest.kt` (➕ тесты на `FakeClock` и на реальные дефолты)
+- Modify: `src/test/kotlin/io/heapy/kodkod/UpdaterTest.kt` (ассерты на ops упавших вызовов)
 
-- [ ] `FakeDockerClient.listContainers` должен уважать `all` и фильтры `status`/`label`/`health` (сейчас возвращает
+- [x] `FakeDockerClient.listContainers` должен уважать `all` и фильтры `status`/`label`/`health` (сейчас возвращает
       `listed` целиком) — без этого задачи 13/15/18 не могут доказать «ищем по всему демону, а не по мониторимому
       набору»
-- [ ] добавить `failRemove`/`failRename` (ветки rollback не покрыты вообще) и запись аргументов:
+- [x] добавить `failRemove`/`failRename` (ветки rollback не покрыты вообще) и запись аргументов:
       `stopTimeouts`/`restartTimeouts` (включая `null`), `removedImages`, `platforms`
-- [ ] добавить модель состояния: `startedThenExits` (после `start` inspect показывает `Running=false, ExitCode!=0`)
+      (`platforms` отложен в задачу 8: у `pull`/`create` ещё нет параметра `platform`, записывать нечего;
+      `stopTimeouts`/`restartTimeouts` уже типизированы как `MutableList<Int?>` под задачу 9)
+- [x] добавить модель состояния: `startedThenExits` (после `start` inspect показывает `Running=false, ExitCode!=0`)
       и `health` — нужно для liveness-гейта и autoheal-тестов
-- [ ] писать `ops` после успешного вызова и добавлять маркер `create!:`/`start!:` при исключении — единый формат с
+- [x] писать `ops` после успешного вызова и добавлять маркер `create!:`/`start!:` при исключении — единый формат с
       `OpLoggingClient`; **обновить** `UpdaterTest.a_failed_create_rolls_back…` и `a_failed_start_removes…`,
       которые сейчас ассертят на ops от упавших вызовов
-- [ ] ввести `TimeSource`/`Sleeper` в `Time.kt` с реальным дефолтом; `Updater` и `Autoheal` принимают их
+- [x] ввести `TimeSource`/`Sleeper` в `Time.kt` с реальным дефолтом; `Updater` и `Autoheal` принимают их
       параметрами конструктора со значением по умолчанию (env-конфиг остаётся в `Config.fromEnv`)
-- [ ] тесты на сам фейк: фильтр `status=running` отсекает остановленные, `all=true` возвращает всё, фейковые часы
+- [x] тесты на сам фейк: фильтр `status=running` отсекает остановленные, `all=true` возвращает всё, фейковые часы
       двигаются только вручную
-- [ ] прогнать тесты — вся существующая сюита зелёная
+- [x] прогнать тесты — вся существующая сюита зелёная
 
 ### Task 4: Перештамповывать `com.docker.compose.image` (исходный баг)
 
