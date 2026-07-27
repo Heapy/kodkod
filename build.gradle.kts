@@ -13,7 +13,7 @@ plugins {
 }
 
 group = "io.heapy"
-version = "1.0.0"
+version = "0.4.0"
 
 val junitVersion = "6.1.2"
 val serializationVersion = "1.11.0"

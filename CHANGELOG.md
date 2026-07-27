@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-28
+
 ### Added
 - Liveness gate before anything irreversible: a replacement container is probed for
   `KODKOD_UPDATE_VERIFY_SECONDS` (default 15) after `start`, and the old container and image are only
@@ -53,6 +55,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   daemon, before the dind suite. It cannot run against dind — `DockerApi` speaks only to a unix socket
   — so without it the half that catches the fake inventing behaviour runs nowhere automatically, which
   is how both inventions it has found so far were found by hand.
+- One `DockerClientContract` that both implementations have to answer to: `FakeDockerClient` runs it on
+  every `./gradlew test`, and `DockerApi` runs the same class against a real daemon under
+  `-Pkodkod.e2e.useCurrentDocker=true`. The fake can no longer be more forgiving than the daemon it
+  stands in for, which is what the unit suite has been trusting it to be — the first run of the pair
+  caught it reporting a just-created container as `running`, where Docker (and the fake's own listing)
+  call that state `created`.
+- Randomized round-trip properties over the hand-rolled HTTP/1.1 parsing, seeded so that a red run
+  names the one seed needed to reproduce it. The parser reads undertrusted bytes off a socket and every
+  caller treats what comes back as the daemon's word, so it is held to two outcomes only — a whole
+  answer or an error, never a short answer that looks whole. These found the chunk-header defects below.
+- Model-based testing of the update cycle (`UpdateCycleModelTest`): stacks are generated rather than
+  written down — random monitored containers, random staleness, random shared network namespaces,
+  unmanaged bystanders and unmanaged sidecars, and injected create/start/remove failures — and each
+  generated world is checked against what the daemon may never look like once a cycle has finished,
+  whatever that cycle did. Four properties: no two live containers hold one name, no running container
+  is left joined to a namespace that is gone (a provider that was destroyed is always kodkod's fault; a
+  provider the daemon refuses to start is only its fault if it says nothing), a container kodkod does
+  not manage is never touched, and whatever a cycle leaves stopped the next cycle reaches for again.
+  Every defect this project has had to unship was three or four events deep, which is the depth a
+  generator reaches and a story-teller does not. Each property is mutation-proven rather than assumed:
+  disabling the create-time dependent refresh, the enable-label filter, or the tracking of stopped
+  containers turns exactly one of them red. Failures print the seed and the world, so a red run is a
+  fixture that can be pasted into `UpdaterTest` as a story somebody has now thought of.
+- `DockerClientContract` gained the other half of the name index: `create` under a name another
+  container already holds is refused, exactly as `rename` is. The fake had been allowing it, so a
+  recreate could put a second container on the service name — which no daemon permits, and which the
+  ordering of the recreate path (rename the original away *first*) exists precisely to avoid.
+  Confirmed against Docker 29.6.2. A payload a test registers under the id `create` is about to assign
+  stays legal: that is the container being described before it exists, not a second holder of its name.
 
 ### Changed
 - The update cycle is split into a read-only `plan()` (list, inspect, registry probe, pull) and a
@@ -154,6 +185,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   its own name, which was refused and reported as two ERRORs about a container that never moved.
 - Chunked responses that were cut off mid-body are reported as transport errors instead of being
   returned as short-but-complete answers (an empty container list, an image with no tags).
+- Three chunk headers that got past that guard. `toIntOrNull(16)` accepts a sign RFC 9112 does not
+  allow: `-1` reached a byte-range copy as a negative length — an `IndexOutOfBoundsException` no caller
+  is written against — and `-0` read as the terminating chunk, so the prefix that had arrived was
+  returned as the whole answer, which is precisely the silent truncation the guard exists to prevent. A
+  size near `Int.MAX_VALUE` overflowed `pos + size` to a negative number, turning the bounds check into
+  its own opposite and handing the range straight to the copy. The size token is now required to be
+  `1*HEXDIG`, and the bounds check subtracts instead of adding.
 - Image references are escaped into request paths, an empty environment variable no longer reads as
   `false`, and the compose service key no longer embeds a literal NUL byte in the source.
 

@@ -16,24 +16,22 @@
 5. `--link` заявлен как поддерживаемая create-time зависимость, и зависимые теперь пересоздаются вместе с
    провайдером, но сам `HostConfig.Links` при recreate передаётся как есть — watchtower нормализует его в
    отдельном `GetCreateHostConfig`.
-6. Версии разъехались: `build.gradle.kts` = 1.0.0, а теги — v0.2.0/v0.3.0. Решить: резать 1.0.0 или вернуть
-   версию к реальности.
 
 ## Надёжность и корректность
 
-7. `subtractImageDefaultsByKey` теряет пользовательские `Cmd`/`Entrypoint`/`User`/`WorkingDir`.
-8. `pull` буферизует весь прогресс-стрим в памяти.
-9. `DockerApi.create` бросает NPE без сообщения, когда в ответе нет `Id`.
-10. `isSelf` использует `id.startsWith(selfId)` — префиксное сравнение id.
+6. `subtractImageDefaultsByKey` теряет пользовательские `Cmd`/`Entrypoint`/`User`/`WorkingDir`.
+7. `pull` буферизует весь прогресс-стрим в памяти.
+8. `DockerApi.create` бросает NPE без сообщения, когда в ответе нет `Id`.
+9. `isSelf` использует `id.startsWith(selfId)` — префиксное сравнение id.
 
 ## Тесты и покрытие
 
-11. Multi-arch digest не проверен: `UpdaterTest` гоняет одиночные digest'ы, e2e — single-arch busybox. Сравнение
+10. Multi-arch digest не проверен: `UpdaterTest` гоняет одиночные digest'ы, e2e — single-arch busybox. Сравнение
     index-digest, скорее всего, корректно, но это классический watchtower-footgun без теста.
-12. Health-ветка liveness-гейта (`unhealthy` / `starting`) покрыта только юнит-тестами: и рекордер, и e2e идут с
+11. Health-ветка liveness-гейта (`unhealthy` / `starting`) покрыта только юнит-тестами: и рекордер, и e2e идут с
     `KODKOD_UPDATE_VERIFY_HEALTH=false`, потому что иначе число проб — гонка между интервалом проб и
     healthcheck'ом замены. Нужен детерминированный e2e (образ с предсказуемым healthcheck'ом).
-13. Grace-хук шатдауна в `Main.kt` (`awaitTermination` → `shutdownNow`) не покрыт тестом: `main()` не
+12. Grace-хук шатдауна в `Main.kt` (`awaitTermination` → `shutdownNow`) не покрыт тестом: `main()` не
     разбирается на тестируемые части. Из него проверен только `ConfigTest.reads_the_shutdown_grace_period`.
     Чтобы покрыть — выделить планировщик и хук в отдельную тестируемую функцию.
 14. Дублирование в тестах: хелперы `updateConfig`/`autohealConfig` рекордера и `config(...)` юнит-тестов.

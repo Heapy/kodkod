@@ -336,6 +336,9 @@ src/e2eTest/kotlin/io/heapy/kodkod/e2e/KodkodE2eTest.kt      # the suite + E2eHa
 src/e2eTest/kotlin/io/heapy/kodkod/e2e/DockerFixtureRecorder.kt
 src/e2eTest/kotlin/io/heapy/kodkod/e2e/FixtureWriter.kt
 src/e2eTest/kotlin/io/heapy/kodkod/e2e/FixtureWriterTest.kt
+src/e2eTest/kotlin/io/heapy/kodkod/e2e/DockerApiContractTest.kt  # the contract, against a real daemon
+src/testFixtures/kotlin/io/heapy/kodkod/DockerClientContract.kt  # shared by both contract tests
+src/test/kotlin/io/heapy/kodkod/FakeDockerClientContractTest.kt  # the contract, against the fake
 src/main/kotlin/io/heapy/kodkod/DockerTransport.kt           # the seam both sides plug into
 src/main/kotlin/io/heapy/kodkod/UnixSocketTransport.kt       # production transport, what the recorder wraps
 src/testFixtures/kotlin/io/heapy/kodkod/DockerRecording.kt   # recording/replay transports + the corpus types

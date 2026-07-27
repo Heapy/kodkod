@@ -43,6 +43,13 @@ recreate containers whose image tag moved (update). Kotlin, one runtime dependen
   that runs more than one cycle. Keep it honest: a fake that keeps a removed container, or that
   matches every `health` filter regardless of the modelled health, makes the code that tells those
   cases apart untestable.
+- **That honesty is now enforced, not just asked for.** `DockerClientContract` (`src/testFixtures`)
+  is one suite both implementations answer to: `FakeDockerClientContractTest` runs it against the fake
+  on every `./gradlew test`, `DockerApiContractTest` runs the same class against a real daemon under
+  `-Pkodkod.e2e.useCurrentDocker=true`. A behaviour the unit suite is allowed to assume therefore has
+  to be one Docker was made to demonstrate. New behaviour the fake grows belongs in the contract, not
+  in the fake alone — that is the only thing standing between a green unit suite and a fake that
+  invented the daemon it stands in for.
 
 ## Fixture corpus (record/replay)
 
