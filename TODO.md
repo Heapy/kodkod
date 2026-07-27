@@ -1,9 +1,48 @@
-1. Multi-arch digest не проверен. UpdaterTest гоняет одиночные digest'ы, e2e — single-arch busybox. Сравнение index-digest, скорее всего, корректно, но это классический watchtower-footgun без теста. — дёшево добавить кейс в    
-   UpdaterTest.
-2. Нотификации / метрики / lifecycle-хуки (моя рек. #4) — по-прежнему нет; единственная ось, где kodkod уступает всем трём эталонам.
-3. URL-encoding ref в inspectImage/removeImage/inspectDistribution всё ещё raw (/images/$ref/json), хотя pull кодирует через enc() (моя рек. #5a).
-4. Один глобальный KODKOD_REGISTRY_AUTH vs per-registry auth у watchtower.
-5. Версии разъехались: build.gradle.kts = 1.0.0, а теги v0.2.0/v0.3.0 и CHANGELOG сверху [Unreleased]. Решить: резать 1.0.0 или вернуть версию к реальности.
-6. CHANGELOG отстал: decoupling за DockerClient, JUnit-миграция e2e, CI-job, NUL-fix — не записаны в [Unreleased].
-7. --link все еще заявлен как supported create-time dependency, но при recreate HostConfig.Links не переписывается. resolveLinks видит legacy links, но recreate передает HostConfig почти как есть, только меняет NetworkMode. У watchtower есть отдельный GetCreateHostConfig, который нормализует links перед create. См. Updater.kt (line 217), Updater.kt (line 407), reference container.go (line 350).
-8. pinned image by image id sha256:... не пропускается. Сейчас skip только для image@sha256:...; если Config.Image будет sha256:<id>, код пойдет в splitImageRef, затем в registry/pull path как будто это repo:tag. Watchtower явно отсекает strings.HasPrefix(imageName, "sha256:"). См. Updater.kt (line 124), Updater.kt (line 471), reference client.go (line 361).
+# TODO
+
+Открытые пункты. Всё, что закрыто планом `docs/plans/…-recreate-fidelity-and-safety.md`, снято.
+
+## Функциональность
+
+1. Нотификации / метрики / lifecycle-хуки — единственная ось, где kodkod уступает watchtower и обоим autoheal'ам.
+2. Один глобальный `KODKOD_REGISTRY_AUTH` вместо per-registry auth (у watchtower — per-registry).
+3. Явно заданный MAC (`--mac-address` / compose `mac_address:`) не переносится на Docker ≥ 27: движок больше не
+   отдаёт `Config.MacAddress` в inspect'е, а `NetworkSettings.Networks[*].MacAddress` заполнен всегда, поэтому
+   отличить пользовательский MAC от сгенерированного нечем и kodkod осознанно не пинует ни один. Нужен другой
+   дискриминатор (в inspect'е его нет) — возможно, сравнение с OUI Docker'а или отдельный kodkod-лейбл.
+4. Образ, пиннутый по image id (`Config.Image = sha256:<id>`), не пропускается: skip есть только для
+   `image@sha256:...`. Такой ref уходит в `splitImageRef` и дальше в registry/pull как `repo=sha256, tag=<id>`.
+   Watchtower отсекает `strings.HasPrefix(imageName, "sha256:")` явно.
+5. `--link` заявлен как поддерживаемая create-time зависимость, и зависимые теперь пересоздаются вместе с
+   провайдером, но сам `HostConfig.Links` при recreate передаётся как есть — watchtower нормализует его в
+   отдельном `GetCreateHostConfig`.
+6. Версии разъехались: `build.gradle.kts` = 1.0.0, а теги — v0.2.0/v0.3.0. Решить: резать 1.0.0 или вернуть
+   версию к реальности.
+
+## Надёжность и корректность
+
+7. Raw-ref без URL-кодирования в `inspectImage`/`removeImage`/`inspectDistribution` (`/images/$ref/json`), хотя
+   `pull` кодирует через `enc()`. Prune старого образа добавил ещё один вызов на тот же незакодированный путь.
+8. `Config.bool()` трактует пустую переменную как `false` вместо дефолта.
+9. `subtractImageDefaultsByKey` теряет пользовательские `Cmd`/`Entrypoint`/`User`/`WorkingDir`.
+10. `pull` буферизует весь прогресс-стрим в памяти; `dechunk` молча обрезает хвост.
+11. `DockerApi.create` бросает NPE без сообщения, когда в ответе нет `Id`.
+12. `isSelf` использует `id.startsWith(selfId)` — префиксное сравнение id.
+
+## Тесты и покрытие
+
+13. Multi-arch digest не проверен: `UpdaterTest` гоняет одиночные digest'ы, e2e — single-arch busybox. Сравнение
+    index-digest, скорее всего, корректно, но это классический watchtower-footgun без теста.
+14. Health-ветка liveness-гейта (`unhealthy` / `starting`) покрыта только юнит-тестами: и рекордер, и e2e идут с
+    `KODKOD_UPDATE_VERIFY_HEALTH=false`, потому что иначе число проб — гонка между интервалом проб и
+    healthcheck'ом замены. Нужен детерминированный e2e (образ с предсказуемым healthcheck'ом).
+15. Grace-хук шатдауна в `Main.kt` (`awaitTermination` → `shutdownNow`) не покрыт тестом: `main()` не
+    разбирается на тестируемые части. Из него проверен только `ConfigTest.reads_the_shutdown_grace_period`.
+    Чтобы покрыть — выделить планировщик и хук в отдельную тестируемую функцию.
+16. Дублирование в тестах: версия `kotlinx-serialization-json` и хелперы `updateConfig`/`autohealConfig`.
+
+## Упаковка
+
+17. Test-only классы record/replay (`DockerRecording.kt`, `DockerTransport.kt`) — `public` в main source set и
+    попадают в production-jar.
+18. `.dockerignore` тащит корпус фикстур в build context.

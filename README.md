@@ -6,7 +6,7 @@
 
 A tiny **docker-compose companion** that does two things and nothing else:
 
-1. **Restarts unhealthy containers** — like [`docker-autoheal`](https://github.com/tmknight/docker-autoheal), it watches container health and restarts containers that go `unhealthy`.
+1. **Restarts unhealthy containers** — like [`docker-autoheal`](https://github.com/tmknight/docker-autoheal), it watches container health and restarts containers that go `unhealthy`. Containers sharing the restarted container's network namespace (or linked to it) are restarted with it, and a container that stays unhealthy is retried with a growing backoff instead of every cycle.
 2. **Auto-updates containers** — like Watchtower, it pulls the image tag a container runs and recreates the container (preserving its config, env, labels and networks) when a newer image is published.
 
 Both jobs talk **directly to the Docker Engine API over the unix socket** — no `docker` CLI, no compose CLI, no extra tooling in the image. It is written in Kotlin with a single runtime dependency (a JSON library) and ships as a small Liberica JRE Alpine image.
@@ -61,16 +61,23 @@ All configuration is via environment variables:
 |--------------------------------|--------------------------|------------------------------------------------------------------------|
 | `KODKOD_DOCKER_SOCKET`         | `/var/run/docker.sock`   | Path to the Docker Engine unix socket.                                 |
 | `KODKOD_LABEL_NAMESPACE`       | `kodkod`                 | Prefix for all labels (e.g. `kodkod.autoheal.enable`).                 |
-| `KODKOD_STOP_TIMEOUT`          | —                        | Default stop timeout (seconds) for restart/recreate. Unset: each container's own stop timeout (`stop_grace_period`) applies. |
+| `KODKOD_STOP_TIMEOUT`          | —                        | Default stop timeout (seconds) for restart/recreate. Unset: no `t` is sent at all, so each container's own stop timeout (`stop_grace_period`) applies. |
+| `KODKOD_SHUTDOWN_GRACE`        | `30`                     | Seconds a stopping kodkod gives the cycle in flight to finish before interrupting it. The outer deadline is still yours: Docker sends `SIGKILL` 10s after `SIGTERM` unless kodkod's own `stop_grace_period` says otherwise. |
 | `KODKOD_AUTOHEAL_ENABLED`      | `true`                   | Enable the autoheal loop.                                              |
 | `KODKOD_AUTOHEAL_INTERVAL`     | `30`                     | Seconds between unhealthy-container checks.                            |
+| `KODKOD_AUTOHEAL_MAX_INTERVAL` | `3600`                   | Ceiling of the per-container backoff between restarts of a container that stays unhealthy. The wait doubles from `KODKOD_AUTOHEAL_INTERVAL` up to this value; setting it *to* the interval restores retry-every-cycle. Never below the interval. |
 | `KODKOD_AUTOHEAL_START_PERIOD` | `0`                      | Seconds to wait before the first autoheal check.                      |
 | `KODKOD_AUTOHEAL_MONITOR_ALL`  | `false`                  | Heal **all** containers with a healthcheck (label becomes opt-out).    |
-| `KODKOD_UPDATE_ENABLED`        | `true`                   | Enable the auto-update loop.                                           |
+| `KODKOD_UPDATE_ENABLED`        | `true`                   | Enable the auto-update loop. Orphaned `_kodkod_old_` backups are still reconciled at startup even when this is off. |
 | `KODKOD_UPDATE_INTERVAL`       | `3600`                   | Seconds between image-update checks.                                   |
 | `KODKOD_UPDATE_START_PERIOD`   | `0`                      | Seconds to wait before the first update check.                        |
 | `KODKOD_UPDATE_MONITOR_ALL`    | `false`                  | Update **all** running containers (label becomes opt-out).            |
-| `KODKOD_UPDATE_CLEANUP`        | `true`                   | Remove the previous image after a successful update (best-effort).     |
+| `KODKOD_UPDATE_CLEANUP`        | `true`                   | Remove the previous image after a successful update. Skipped when that image still carries a tag other than the one just updated, so a pinned rollback tag (`app:1.26`) is never untagged. |
+| `KODKOD_UPDATE_VERIFY_SECONDS` | `15`                     | How long a replacement container is watched after `start` before the container and image it replaced are destroyed. Three consecutive good probes end the wait early; `0` means one probe and move on. |
+| `KODKOD_UPDATE_VERIFY_HEALTH`  | `true`                   | Treat a replacement that has already *failed* its healthcheck as a failed update. A container still inside its `start_period` (`Health=starting`) is always accepted. |
+| `KODKOD_UPDATE_FAILURE_COOLDOWN` | `21600`                | Seconds an image that failed to come up on a container is left alone before that exact update is tried again — otherwise an unstartable `:latest` costs one self-inflicted outage per cycle, forever. `0` disables the memory. |
+| `KODKOD_DEPENDENCY_HEALTH_TIMEOUT` | `120`                | Seconds a container waits for a dependency marked `condition: service_healthy` to become healthy before starting anyway. `0` means check once and carry on. |
+| `KODKOD_RESPECT_DEPENDS_ON_RESTART` | `false`             | Obey compose's `depends_on[*].restart: false` when deciding whether to restart a dependent (see below).  |
 | `KODKOD_REGISTRY_AUTH`         | —                        | Base64 `X-Registry-Auth` value for pulling from private registries.    |
 
 ## How updates work
@@ -83,14 +90,53 @@ For each container marked for updates, kodkod:
 3. pulls that repo/tag only when the digest is new or unavailable, then compares the local image id
    with the container's current image id;
 4. if they differ, **recreates** the container against the new image:
-   stop → rename old → create new → reconnect networks → start → remove old.
+   stop → rename old → create new → reconnect networks → start → verify it stayed up → remove old.
 
 When rebuilding the new container, kodkod starts from the running container's configuration but
 **subtracts the old image's defaults** (env, entrypoint, cmd, healthcheck, …), keeping only the
 settings you actually overrode. This way a new image that changes its own defaults is genuinely
-adopted instead of being masked by the old image's baked-in values. The full `HostConfig`, volumes,
-labels and every attached network are preserved. If anything fails after the container is stopped,
-kodkod rolls back to the original, running container.
+adopted instead of being masked by the old image's baked-in values.
+
+What carries over to the replacement:
+
+- the container's `HostConfig` — ports, restart policy, resource limits, binds, capabilities, and
+  the rest — verbatim, with two deliberate edits: `network_mode: container:<id>` is rewritten to the
+  target's **name**, and the volumes the container is actually using are re-attached explicitly;
+- **anonymous volumes**, by name. They are only named in the container's top-level `Mounts[]`, so
+  they are resolved from there and mounted explicitly — without that the replacement would get a
+  fresh, empty volume and the old data would be orphaned;
+- **labels**, minus the ones the old image itself declared with the same value (those come back from
+  the new image), and with `com.docker.compose.image` restamped to the id kodkod just resolved the
+  tag to — otherwise the next `docker compose up` would consider the container stale and recreate it;
+- **every attached network**, with each endpoint's aliases, static `IPAMConfig`, links, driver
+  options and gateway priority. Host, `none` and `container:` network modes attach no endpoint;
+- the image **platform** (`os/arch`, without the manifest variant) on both the pull and the create.
+
+Nothing irreversible happens on the strength of a `204` from `POST /start`: the replacement is
+probed for up to `KODKOD_UPDATE_VERIFY_SECONDS` and only then are the old container and image
+released. A replacement that exits, crash-loops or (with `KODKOD_UPDATE_VERIFY_HEALTH`) reports
+`unhealthy` is discarded and the previous container is put back.
+
+If anything fails after the container is stopped, kodkod rolls the service back: it removes the
+failed replacement, frees the service name if a corpse is still holding it, renames the original
+back, starts it, and then **inspects it to confirm** it is running under its own name again. Every
+step that fails is logged, and a rollback that did not land says `ROLLBACK INCOMPLETE` at `ERROR`
+rather than reporting success. If kodkod is killed mid-recreate, the next start reconciles the
+`_kodkod_old_` backup it left behind — restoring it when nothing is serving the name, removing it
+when the replacement is running.
+
+### Limitations
+
+- An explicitly requested MAC address (`docker run --mac-address`, compose `mac_address:`) is **not**
+  carried over on Docker >= 27. The engine no longer returns `Config.MacAddress` in container
+  inspect, and `NetworkSettings.Networks[*].MacAddress` is populated for every container whether or
+  not the address was asked for — so kodkod cannot tell a user-set MAC from a daemon-generated one
+  and deliberately pins neither. The replacement gets a fresh generated MAC. On engines that still
+  report `Config.MacAddress`, an explicit MAC is preserved.
+- The health branch of the liveness gate (`Health=unhealthy` / `Health=starting`) is covered by unit
+  tests only. The recorded-fixture and end-to-end runs go with `KODKOD_UPDATE_VERIFY_HEALTH=false`,
+  because the number of probes is otherwise a race between the probe interval and the replacement's
+  own healthcheck.
 
 ### Ordering & dependencies
 
@@ -99,13 +145,35 @@ kodkod updates the whole monitored set together so it can respect dependencies:
 - containers are **stopped in reverse dependency order** and brought back in **forward order**;
 - a container that **depends on an updated one is restarted too**, even if its own image didn't change;
 - create-time dependents (`--link` and `network_mode: container:`) are **recreated** instead of only
-  restarted, so Docker refreshes those references against the new dependency container;
+  restarted, so Docker refreshes those references against the new dependency container. This also
+  applies to dependents kodkod does not monitor itself — a sidecar sharing a recreated container's
+  network namespace would otherwise be left on a namespace that no longer exists;
 - `network_mode: container:<id>` is rewritten to the target's **name** so it survives that container
-  being recreated.
+  being recreated;
+- a dependency compose marked `condition: service_healthy` is **waited for** before its dependent is
+  started, bounded by `KODKOD_DEPENDENCY_HEALTH_TIMEOUT`. Only dependencies this cycle brought back
+  are waited for, and the timeout starts the dependent anyway: the condition may delay a container,
+  never keep it down.
 
 Dependencies are detected automatically from Docker Compose's own `com.docker.compose.depends_on`
 labels. Outside compose, declare them with the `kodkod.depends-on` label, classic `--link`, or
 `network_mode: container:`.
+
+#### `depends_on.restart` is opt-in
+
+Compose's `depends_on` entries carry three fields (`<service>:<condition>:<restart>`). kodkod always
+honours `condition`; it obeys `restart` only when `KODKOD_RESPECT_DEPENDS_ON_RESTART=true`.
+
+The reason is that the two mean different things. Compose's `restart` field governs whether
+`docker compose restart` **propagates** to a dependent. kodkod does something else: it replaces the
+dependency with a **new container**, holding a new IP and a new DNS record — precisely the case where
+a dependent usually does need to be restarted. And since `restart: false` is compose's own default,
+obeying it by default would turn kodkod's documented dependent-restart into a no-op for essentially
+every stack.
+
+Even with the flag on, `restart: false` can only suppress a plain **restart**. A create-time
+dependent (`--link`, `network_mode: container:`) is always recreated, because leaving it alone would
+leave it pointing at a dead network namespace.
 
 The kodkod container never updates or restarts **itself** — it recognises its own container by the
 `io.heapy.kodkod.self` label baked into the image (independent of `HOSTNAME`, so a custom `hostname:`

@@ -109,8 +109,17 @@ resolved config.
 | `multiNetworkContainerIsReconnectedToEveryNetwork` | Multi-network reconnect on recreate | `compose.multinet.yml` | yes |
 | `containerNetworkModeDependentIsRecreatedAfterProviderUpdate` | `network_mode: container:` rewrite | `compose.container-mode.yml` | yes |
 | `failedRecreateRollsBackToRunningOriginal` | Failed recreate rolls back to original | `compose.rollback.yml` | yes |
+| `aReplacementThatStartsAndThenDiesIsRolledBack` | The liveness gate rolls back a container that starts and then exits | `compose.rollback.yml` | yes |
+| `aBackupOrphanedByAKilledKodkodIsRecoveredOnRestart` | A `_kodkod_old_` backup left by a killed process is reconciled on the next start | `compose.rollback.yml` | yes |
 | `digestPinnedContainerIsSkipped` | Digest-pinned containers are skipped | `compose.digest.yml` | yes |
 | `monitorAllDoesNotActOnKodkodItself` | Self-protection under monitor-all | `compose.self.yml` | no |
+
+`FixtureWriterTest` also lives in this source set but needs no Docker: the `test` source set cannot
+see `e2eTest` sources, and that is the only reason it is here.
+
+```bash
+./gradlew e2eTest --tests '*FixtureWriterTest*'
+```
 
 ## What the JUnit suite does
 
@@ -127,6 +136,59 @@ resolved config.
 Each scenario calls Docker through `ProcessBuilder` and uses polling rather than
 fixed sleeps where possible. Failed Docker commands include their captured output
 in the JUnit failure message.
+
+## Recording Docker fixtures
+
+`DockerFixtureRecorder` (in this source set) captures the **real** responses a Docker daemon gives
+kodkod, so that `DockerReplayTest` in the `test` source set can replay them through the real
+`DockerApi` + `Updater`/`Autoheal` with no Docker at all. Unit tests otherwise only ever see JSON we
+invented ourselves; the corpus is what catches engine and compose format drift.
+
+Each scenario sets up real containers through the harness CLI, then drives `Updater`/`Autoheal`
+in-process against a `DockerApi` wrapped in a `RecordingDockerTransport`. Only the in-process API
+calls are recorded — the CLI setup is not.
+
+It is opt-in and never runs in normal CI:
+
+```bash
+./gradlew e2eTest \
+  -Pkodkod.e2e.useCurrentDocker=true \
+  -Pkodkod.e2e.record=true \
+  --tests '*DockerFixtureRecorder*'
+```
+
+Both flags are required, and `-Pkodkod.e2e.useCurrentDocker=true` is not decorative. Without it the
+harness starts Docker-in-Docker and points the CLI at it through `DOCKER_HOST`, while kodkod speaks
+**only** the unix socket — so the scenario's containers would be created on the inner daemon while
+the recording was taken from the host daemon. The result would be a plausible-looking corpus of a
+cycle that saw nothing. The recorder therefore refuses to run when the CLI and the recorder do not
+share a daemon (`recorderDaemonMismatch`), rather than silently recording the wrong one.
+
+Recording is additive and versioned. Fixtures are written to:
+
+```text
+src/test/resources/docker-fixtures/<engine-version>_<compose-version>/<scenario>/
+src/test/resources/docker-fixtures/<engine-version>_<compose-version>/meta.json
+src/test/resources/docker-fixtures/index.json
+```
+
+Re-running rewrites the label of the engine/compose versions on the machine doing the recording and
+leaves any other label alone, so a corpus recorded on a different engine keeps being exercised. Each
+scenario is written to a temporary directory and swapped in only after it is complete, and
+`index.json` is updated last — a failed run cannot leave a stub behind an index entry.
+
+**Any change to a request's method, path or query obliges a re-record.** The replay key is
+`"<method> <path>"`, so removing a `?t=`, adding an inspect, or adding a `?platform=` makes the
+committed corpus miss and `DockerReplayTest` fail. Request *bodies* are not part of the key, so a
+change to a create body needs no re-record (and is asserted on directly, not against fixtures —
+recording our own output as a golden file would just self-heal on every re-record).
+
+Review the fixture diff before committing it: only the paths and bodies you meant to change should
+move. Container and image ids differ on every run, so compare manifests with the ids normalized.
+
+The recorder runs with `KODKOD_UPDATE_MONITOR_ALL=false`, so it only ever acts on containers labelled
+for kodkod, and with `KODKOD_UPDATE_VERIFY_HEALTH=false` (as does `DockerReplayTest`), which keeps the
+liveness gate's probe count deterministic instead of a race with the replacement's healthcheck.
 
 ## Manual debugging
 
@@ -177,9 +239,15 @@ docker rmi 127.0.0.1:5000/testapp:latest 127.0.0.1:5000/testapp:v1 127.0.0.1:500
 ```text
 E2E_TESTING.md
 src/e2eTest/kotlin/io/heapy/kodkod/e2e/KodkodE2eTest.kt
+src/e2eTest/kotlin/io/heapy/kodkod/e2e/DockerFixtureRecorder.kt
+src/e2eTest/kotlin/io/heapy/kodkod/e2e/FixtureWriter.kt
+src/e2eTest/kotlin/io/heapy/kodkod/e2e/FixtureWriterTest.kt
+src/test/kotlin/io/heapy/kodkod/DockerReplayTest.kt
+src/test/resources/docker-fixtures/
 e2e/
   testapp/Dockerfile
   testapp/Dockerfile.broken
+  testapp/Dockerfile.crasher
   compose.registry.yml
   compose.autoheal.yml
   compose.update.yml
