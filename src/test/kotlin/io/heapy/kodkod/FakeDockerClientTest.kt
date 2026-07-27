@@ -138,6 +138,33 @@ class FakeDockerClientTest {
         assertEquals(listOf(id), ids(all = false), "the daemon lists it as running once it is started")
     }
 
+    /**
+     * Filtering a listing by the lifecycle while handing back the state the fixture was *registered*
+     * with is a combination no daemon can produce, and it is the more dangerous half: a container the
+     * fake had started was listed as up and described as `created`, so every caller that reads a state
+     * out of a listing — the dependent scan, the reconcile pass — saw a container that had never run,
+     * and the branches keyed on that could not be reached from a test at all.
+     */
+    @Test
+    fun a_listing_describes_containers_the_way_it_filtered_them() {
+        val id = docker.create("web", json("""{"Image":"app:1"}"""), platform = null)
+        docker.start(id)
+        summary("db", state = "running")
+        docker.stop("db", timeout = null, expectedStopSeconds = null)
+        docker.rename(id, "web${BACKUP_MARKER}abc")
+
+        val listed = docker.listContainers(all = true, filters = emptyMap()).map { it.jsonObject }
+
+        assertEquals(
+            listOf("running", "exited"), listed.map { it.str("State") },
+            "the replacement is up and the container that was stopped is not: $listed",
+        )
+        assertEquals(
+            listOf(listOf("web${BACKUP_MARKER}abc"), listOf("db")), listed.map { it.containerNames() },
+            "and the name index a listing carries is the one rename left behind: $listed",
+        )
+    }
+
     @Test
     fun a_renamed_container_answers_to_its_new_name_in_a_listing() {
         summary("web", state = "running")
