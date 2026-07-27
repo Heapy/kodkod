@@ -39,6 +39,14 @@ internal data class Dependent(
 ) {
     val running: Boolean get() = state == "running"
     val short: String get() = id.take(12)
+
+    /**
+     * How every log line about this container is prefixed: `[name (short id)]`. Both halves are needed —
+     * the name is what an operator recognises, the short id is what survives the container being renamed
+     * out from under them mid-cycle — and both cycles have to spell it the same way, or a grep for one
+     * container's trouble comes back with half of it.
+     */
+    val where: String get() = "[$name ($short)]"
 }
 
 /** The container others may be pointing at, in the shape `/containers/json` reports it. */
@@ -111,17 +119,16 @@ internal fun restartDependent(
     what: String,
     timeout: Int?,
 ): Boolean {
-    val where = "[${dependent.name} (${dependent.short})]"
     Log.warn(
-        "$where ${dependent.kind.relationTo(providerName)}, which this cycle $what, and would be left with a " +
-            "dead one — restarting it too",
+        "${dependent.where} ${dependent.kind.relationTo(providerName)}, which this cycle $what, and would be " +
+            "left with a dead one — restarting it too",
     )
     return try {
         api.restart(dependent.id, timeout)
-        Log.info("$where restart successful")
+        Log.info("${dependent.where} restart successful")
         true
     } catch (e: Exception) {
-        Log.error("$where restart failed — it may be left without a working network: ${e.message}")
+        Log.error("${dependent.where} restart failed — it may be left without a working network: ${e.message}")
         false
     }
 }
@@ -187,6 +194,17 @@ private fun JsonObject.linkSources(): List<String> =
 internal fun stopTimeout(labels: JsonObject?, config: Config, ns: String): Int? =
     labels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
 
-const val NETNS_PREFIX = "container:"
+/**
+ * How `HostConfig.NetworkMode` spells "share this other container's network namespace":
+ * `container:<id|name>`. Compose writes it for `network_mode: service:x` (with the id), `docker run
+ * --network container:x` writes whatever was typed. It is a *prefix*, not a mode of its own, which is
+ * why every check for it is a `startsWith` rather than an equality.
+ */
+internal const val NETNS_PREFIX = "container:"
 
-const val COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+/**
+ * Compose stamps the project name on every container it creates. It is kodkod's only handle on "the
+ * rest of this stack" — there is no compose file to read — and is what narrows the dependent scan
+ * before it widens (see [findDependents]) and what relates a `depends_on` service name to a container.
+ */
+internal const val COMPOSE_PROJECT_LABEL = "com.docker.compose.project"

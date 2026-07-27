@@ -56,9 +56,6 @@ fun JsonObject.containerNames(): List<String> =
         ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trimStart('/')?.takeIf(String::isNotEmpty) }
         ?: emptyList()
 
-/** First entry of a JSON string array, or null. */
-fun JsonArray?.firstString(): String? = this?.firstOrNull()?.jsonPrimitive?.contentOrNull
-
 /** Interpret a boolean label, falling back to [default] when the label is absent. */
 fun labelTruthy(labels: JsonObject?, key: String, default: Boolean): Boolean {
     val value = labels.label(key) ?: return default

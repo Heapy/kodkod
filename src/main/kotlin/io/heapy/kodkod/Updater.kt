@@ -71,7 +71,10 @@ class Updater(
      * measured with (elapsed time, immune to the wall clock being corrected under us) and
      * [attemptedAtMillis] is what the log line naming the next attempt is printed from.
      */
-    private class FailedUpdate(val imageId: String, val attemptedAtNanos: Long, val attemptedAtMillis: Long)
+    private class FailedUpdate(val imageId: String, val attemptedAtNanos: Long, val attemptedAtMillis: Long) {
+        /** Whether this memory has outlived its window, [nowNanos] and [window] both being elapsed nanos. */
+        fun expired(nowNanos: Long, window: Long): Boolean = nowNanos - attemptedAtNanos >= window
+    }
 
     /**
      * Create-time dependents kodkod stopped for a recreate and could not put back, by the id of the
@@ -370,10 +373,7 @@ class Updater(
             "[${stranded.name}] was left stopped by a recreate that could not be rolled back, and its " +
                 "network namespace is gone — rebuilding it against ${stranded.providerName}",
         )
-        val target = toTarget(id, inspect).also {
-            it.linkedToRecreate = true
-            it.networkModeContainerName = stranded.providerName
-        }
+        val target = netnsRecreateTarget(id, inspect, stranded.providerName)
         try {
             recreate(target)
             strandedDependents.remove(id)
@@ -400,7 +400,8 @@ class Updater(
         // A memory whose window has run out no longer decides anything, and a container that was
         // removed never comes back to have its entry dropped at check time — so the map is swept here
         // rather than growing by one entry per container that ever failed an update.
-        failedUpdates.values.removeIf { clock.nanos() - it.attemptedAtNanos >= cooldownNanos }
+        val now = clock.nanos()
+        failedUpdates.values.removeIf { it.expired(now, cooldownNanos) }
         val targets = collectTargets()
         if (targets.isEmpty()) return UpdatePlan.NOTHING
 
@@ -442,20 +443,20 @@ class Updater(
      */
     private fun holdBackUnsafeProviders(targets: List<Target>) {
         val byId = targets.associateBy { it.id }
-        // provider to hold back -> what a log line should say it is being held back for.
-        val queue = ArrayDeque<Pair<Target, String>>()
+        val queue = ArrayDeque<HeldBack>()
         for (dependent in targets) {
             if (!dependent.stale && !dependent.updateSuppressed) continue
             val moving = dependent.createTimeDeps.mapNotNull(byId::get).filter { it.toRestart }
             if (moving.isEmpty()) continue
             for (provider in moving) {
-                queue += provider to (
+                queue += HeldBack(
+                    provider,
                     "${dependent.name} ${dependent.createTimeRelationTo(provider.name)} and its own image has " +
                         "moved on, so the recreate this restart forces would build ${dependent.name} from " +
                         "${dependent.imageRef} — and once ${provider.name}'s old container is gone that recreate " +
                         "cannot be undone. ${dependent.name}'s own update goes ahead alone this cycle; " +
-                        "${provider.name} follows once it has settled"
-                    )
+                        "${provider.name} follows once it has settled",
+                )
             }
         }
         if (queue.isEmpty()) return
@@ -465,7 +466,7 @@ class Updater(
             provider.restartHeldBack = true
             Log.warn("[${provider.name}] not restarting it this cycle — $why")
             provider.createTimeDeps.mapNotNull(byId::get).mapTo(queue) {
-                it to "restarting it would restart ${provider.name}, which is being held back"
+                HeldBack(it, "restarting it would restart ${provider.name}, which is being held back")
             }
         }
         // What propagated through a container that is no longer moving has to be recomputed from scratch:
@@ -476,6 +477,9 @@ class Updater(
         }
         propagateLinkedRestart(targets, config.respectDependsOnRestart)
     }
+
+    /** A container [holdBackUnsafeProviders] is taking out of the cycle, and what the log line says why. */
+    private data class HeldBack(val provider: Target, val why: String)
 
     /**
      * Carry out [plan] — the half that stops, renames, creates, starts and removes, and therefore the
@@ -637,7 +641,7 @@ class Updater(
 
     /** The id serving [dependent] once it was refreshed, or `null` when nothing was (or could be) done. */
     private fun refreshDependent(dependent: Dependent, provider: RefreshedProvider): String? {
-        val where = "[${dependent.name} (${dependent.short})]"
+        val where = dependent.where
         val replaced = provider.replaced
         val relation = dependent.kind.relationTo(provider.name)
         val what = if (replaced) "replaced" else "restarted"
@@ -664,9 +668,8 @@ class Updater(
             )
             return recreateForeignDependent(dependent, provider)
         }
-        return dependent.id.takeIf {
-            restartDependent(api, dependent, provider.name, what, stopTimeout(dependent.labels, config, ns))
-        }
+        val restarted = restartDependent(api, dependent, provider.name, what, stopTimeout(dependent.labels, config, ns))
+        return if (restarted) dependent.id else null
     }
 
     /**
@@ -693,7 +696,7 @@ class Updater(
      * in-set netns consumer takes: same create body, same liveness gate, same rollback.
      */
     private fun recreateForeignDependent(dependent: Dependent, provider: RefreshedProvider): String? {
-        val where = "[${dependent.name} (${dependent.short})]"
+        val where = dependent.where
         val inspect = try {
             api.inspectContainer(dependent.id)
         } catch (e: Exception) {
@@ -703,10 +706,7 @@ class Updater(
             )
             return null
         }
-        val target = toTarget(dependent.id, inspect).also {
-            it.linkedToRecreate = true
-            it.networkModeContainerName = provider.name
-        }
+        val target = netnsRecreateTarget(dependent.id, inspect, provider.name)
         return try {
             recreate(target)
             target.liveId
@@ -858,6 +858,29 @@ class Updater(
         )
     }
 
+    /**
+     * A [Target] for a container that is being **rebuilt onto [providerName]'s network namespace**
+     * rather than updated — the one shape [recreate] can be handed from outside the graph, by
+     * [rebuildStranded] and [recreateForeignDependent].
+     *
+     * Both flags have to be set, and neither is obvious from the call site, which is why this is a
+     * function rather than two lines repeated:
+     *
+     *  - [Target.networkModeContainerName] is what makes [resolveHostConfig] rewrite
+     *    `NetworkMode: container:<id>` to the provider's **name**. Without it the container is rebuilt
+     *    against the id it already carries — which, in every situation that gets here, names a container
+     *    that no longer exists. The daemon then refuses the `start`, and the rebuild that was supposed
+     *    to rescue the container has destroyed it instead;
+     *  - [Target.linkedToRecreate] is what says this is a dependency-driven recreate and not an image
+     *    update. It keeps [Target.stale] false, so nothing prunes the image the container is running and
+     *    the log line names the real reason the container moved.
+     */
+    private fun netnsRecreateTarget(id: String, inspect: JsonObject, providerName: String): Target =
+        toTarget(id, inspect).also {
+            it.linkedToRecreate = true
+            it.networkModeContainerName = providerName
+        }
+
     private fun markStale(targets: List<Target>) {
         for (target in targets) {
             val imageRef = target.imageRef
@@ -931,7 +954,7 @@ class Updater(
     private fun suppressedByCooldown(target: Target, newImageId: String): Boolean {
         val failure = failedUpdates[target.id] ?: return false
         val nextAttempt = failure.attemptedAtMillis + cooldownMs
-        if (failure.imageId != newImageId || clock.nanos() - failure.attemptedAtNanos >= cooldownNanos) {
+        if (failure.imageId != newImageId || failure.expired(clock.nanos(), cooldownNanos)) {
             failedUpdates.remove(target.id)
             return false
         }
@@ -1039,7 +1062,10 @@ class Updater(
         )
         val backupName = backupName(name, target.id)
         // A replacement we failed to delete still owns [name], which is what the rollback needs back.
-        var stranded: String? = null
+        // Deliberately not called "stranded": in this class that word means the ORIGINAL container, left
+        // stopped by a rollback that did not land (see [strandedDependents]). This is the opposite end —
+        // the replacement — and `rollback` already has the right name for it.
+        var blockingId: String? = null
         // Whether the name was actually taken away from the old container yet.
         var parked = false
 
@@ -1066,7 +1092,7 @@ class Updater(
                 // the replacement may well have been running the whole time, and remembering it would
                 // hold a good update back for `KODKOD_UPDATE_FAILURE_COOLDOWN` over a blip on the socket.
                 if (e is UnverifiableReplacement) imageBlamed = false
-                stranded = discardReplacement(name, newId)
+                blockingId = discardReplacement(name, newId)
                 throw e
             }
             // The replacement is what serves this target from here on: a dependent waiting for it to
@@ -1094,7 +1120,7 @@ class Updater(
             // Any failure after we stopped the container must restore the original, running container.
             Log.error("[$name] recreate failed — rolling back: ${e.message}")
             if (imageBlamed) rememberFailedUpdate(target)
-            if (!rollback(target.id, name, stranded, parked)) rememberStranded(target)
+            if (!rollback(target.id, name, blockingId, parked)) rememberStranded(target)
             throw e
         }
     }
@@ -1403,7 +1429,7 @@ class Updater(
     private fun networkEndpoints(inspect: JsonObject, hostConfig: JsonObject?, oldId: String): List<Pair<String, JsonObject>> {
         val networks = inspect.obj("NetworkSettings")?.obj("Networks") ?: return emptyList()
         val mode = hostConfig?.str("NetworkMode").orEmpty()
-        if (networks.isEmpty() || mode == "host" || mode == "none" || mode.startsWith("container:")) return emptyList()
+        if (networks.isEmpty() || mode == "host" || mode == "none" || mode.startsWith(NETNS_PREFIX)) return emptyList()
         // `--mac-address` / compose `mac_address:` is what fills `Config.MacAddress`, and only such an
         // explicitly requested MAC may be carried over. `NetworkSettings.Networks[*].MacAddress` is always
         // populated — in Docker >= 26 with a randomly generated address — so it cannot tell the two apart on
@@ -1549,7 +1575,6 @@ internal fun canonicalNameOfBackup(backup: String, id: String): String? =
 
 /** `State.Health.Status` — absent for a container whose image declares no healthcheck. */
 private fun JsonObject.healthStatus(): String? = obj("Health")?.str("Status")
-
 
 /**
  * What one update cycle intends to do, as decided by [Updater.plan] from reads alone and carried out by
@@ -1822,7 +1847,7 @@ internal fun topoSort(targets: List<Target>): List<Target> {
 }
 
 /** `repo:tag`, with the implicit `:latest` spelled out so a ref compares equal to a `RepoTags` entry. */
-internal fun normalizeImageRef(ref: String): String = splitImageRef(ref).let { (repo, tag) -> "$repo:$tag" }
+private fun normalizeImageRef(ref: String): String = splitImageRef(ref).let { (repo, tag) -> "$repo:$tag" }
 
 /**
  * [normalizeImageRef] plus the implicit Docker Hub prefixes spelled *out*: `docker.io/library/nginx`,

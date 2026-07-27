@@ -20,9 +20,9 @@ class DockerException(val status: Int, message: String) : RuntimeException("dock
 /**
  * A tiny Docker Engine API client. It builds the request, hands the bytes to a [DockerTransport],
  * and parses the raw HTTP/1.1 response (`Transfer-Encoding: chunked` decoded here, or simply
- * delimited by the socket close). Production wires a [UnixSocketTransport] over
- * `/var/run/docker.sock` via the [secondary][DockerApi] socket-path constructor; tests inject a
- * recording or replay transport.
+ * delimited by the socket close). Production wires a [UnixSocketTransport] over `/var/run/docker.sock`
+ * through the secondary `DockerApi(socketPath)` constructor; tests inject a recording or replay
+ * transport.
  */
 class DockerApi(private val transport: DockerTransport) : DockerClient {
 

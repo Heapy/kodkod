@@ -70,13 +70,16 @@ class Autoheal(
             if (isSelf(id, labels, selfId)) continue
 
             val short = id.take(12)
-            val name = container.arr("Names").firstString()?.trimStart('/') ?: short
+            val name = container.containerNames().firstOrNull() ?: short
+            val where = "[$name ($short)]"
             if (!labelTruthy(labels, "$ns.autoheal.enable", config.autohealMonitorAll)) continue
 
             if (container.str("State") == "restarting") {
-                Log.info("[$name ($short)] already restarting — skipping")
+                Log.info("$where already restarting — skipping")
                 continue
             }
+
+            if (backoffHolds(id, where)) continue
 
             // No override means no `?t=`: the daemon then applies the container's own Config.StopTimeout.
             // Autoheal works off the container list alone — deliberately no inspect per unhealthy
@@ -86,9 +89,6 @@ class Autoheal(
             // believed (see [restartLanded]), which is cheaper than an inspect per unhealthy container.
             // The read-back is where the value is finally learned — from the inspect it was going to
             // make anyway — and it is what sizes its own budget, so the saving costs no fidelity.
-            val where = "[$name ($short)]"
-            if (backoffHolds(id, where)) continue
-
             val timeout = stopTimeout(labels)
             val window = timeout?.let { "${it}s timeout" } ?: "its own stop timeout"
             val attempt = (restarts[id]?.count ?: 0) + 1
@@ -285,10 +285,7 @@ class Autoheal(
         for (dependent in findDependents(api, provider)) {
             if (isSelf(dependent.id, dependent.labels, selfId)) continue
             if (!dependent.running) {
-                Log.info(
-                    "[${dependent.name} (${dependent.short})] depends on $providerName but is " +
-                        "${dependent.state} — leaving it alone",
-                )
+                Log.info("${dependent.where} depends on $providerName but is ${dependent.state} — leaving it alone")
                 continue
             }
             restartDependent(api, dependent, providerName, "restarted", stopTimeout(dependent.labels))

@@ -91,6 +91,8 @@ data class Config(
         fun fromEnv(get: (String) -> String? = System::getenv): Config {
             fun str(key: String, default: String) = get(key)?.takeIf { it.isNotBlank() } ?: default
             fun long(key: String, default: Long) = get(key)?.trim()?.toLongOrNull() ?: default
+            /** No default: `null` is the answer "the operator set nothing", not a stand-in for one. */
+            fun intOrNull(key: String) = get(key)?.trim()?.toIntOrNull()
             // An empty value is an *unset* variable, not `false`: `KODKOD_UPDATE_VERIFY_HEALTH=` in a
             // compose file (or an unresolved `${...}`) must not silently switch a safety check off.
             fun bool(key: String, default: Boolean) =
@@ -102,7 +104,7 @@ data class Config(
             return Config(
                 dockerSocket = str("KODKOD_DOCKER_SOCKET", "/var/run/docker.sock"),
                 labelNamespace = str("KODKOD_LABEL_NAMESPACE", "kodkod"),
-                defaultStopTimeout = get("KODKOD_STOP_TIMEOUT")?.trim()?.toIntOrNull(),
+                defaultStopTimeout = intOrNull("KODKOD_STOP_TIMEOUT"),
                 autohealEnabled = bool("KODKOD_AUTOHEAL_ENABLED", true),
                 autohealInterval = autohealInterval,
                 autohealMaxInterval = long("KODKOD_AUTOHEAL_MAX_INTERVAL", 3600).coerceAtLeast(autohealInterval),

@@ -18,8 +18,8 @@ class JsonTest {
         assertEquals("abc", o.str("Id"))
         assertNull(o.str("missing"))
         assertEquals(1, o.obj("Config")!!.size)
-        assertEquals("/a", o.arr("Names").firstString())
-        assertNull(o.arr("missing").firstString())
+        assertEquals(listOf("a", "b"), o.containerNames(), "every name, without the leading slash")
+        assertEquals(emptyList<String>(), jsonObj("{}").containerNames(), "a summary without Names is not an error")
     }
 
     @Test

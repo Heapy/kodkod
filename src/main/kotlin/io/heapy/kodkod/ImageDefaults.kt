@@ -211,7 +211,7 @@ internal fun buildContainerConfig(
     newComposeImageId: String? = null,
 ): JsonObject {
     val networkMode = hostConfig?.str("NetworkMode").orEmpty()
-    val isContainerMode = networkMode.startsWith("container:")
+    val isContainerMode = networkMode.startsWith(NETNS_PREFIX)
     // Docker auto-assigns Config.Hostname to the container's own short id when none was set; carrying
     // that over would give the replacement a stale hostname. Container-mode shares another netns, so it
     // must not carry a hostname at all.
