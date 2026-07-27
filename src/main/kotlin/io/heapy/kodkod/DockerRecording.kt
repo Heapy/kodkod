@@ -120,6 +120,13 @@ class RecordedExchangesExhaustedException(key: String) :
  * return successive recordings in order. Request bodies are outputs of the code under test and are
  * never matched. Each served response is synthesized into a minimal HTTP/1.1 message and fed back
  * through [DockerApi]'s parser, so the production parsing path still runs on replay.
+ *
+ * **What replay does not check.** Ordering is FIFO *per key*, so the relative order of calls to two
+ * different keys is invisible here: moving `GET /containers/json?...` from the start of a cycle to the
+ * end replays identically. That is deliberate — the alternative is a corpus that fails on every
+ * harmless reordering — but it means "the recorded corpus replays" is not a statement about call
+ * order. Order that matters (stop before its dependency, create before start) is asserted explicitly
+ * by `DockerReplayTest` from the op log, and the fixtures are re-recorded when a call moves.
  */
 class ReplayDockerTransport(
     exchanges: List<RecordedExchange>,

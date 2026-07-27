@@ -6,6 +6,7 @@ import io.heapy.kodkod.Config
 import io.heapy.kodkod.DockerApi
 import io.heapy.kodkod.FixtureMeta
 import io.heapy.kodkod.RecordingDockerTransport
+import io.heapy.kodkod.TRUTHY
 import io.heapy.kodkod.UnixSocketTransport
 import io.heapy.kodkod.Updater
 import io.heapy.kodkod.str
@@ -51,7 +52,7 @@ class DockerFixtureRecorder {
     fun setupSuite() {
         recorderDaemonMismatch(
             useCurrentDocker = System.getProperty("kodkod.e2e.useCurrentDocker")?.trim()?.lowercase()
-                in setOf("true", "1", "yes", "on"),
+                in TRUTHY,
             dockerHost = System.getenv("DOCKER_HOST"),
             socket = socket,
         )?.let { error(it) }

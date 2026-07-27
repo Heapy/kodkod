@@ -7,3 +7,6 @@
 !gradle.properties
 !gradle
 !src
+
+# ...but not the recorded Docker fixtures: 276K of test-only corpus in every production build context.
+src/test/resources/docker-fixtures

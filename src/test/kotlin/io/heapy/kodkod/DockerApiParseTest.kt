@@ -2,6 +2,8 @@ package io.heapy.kodkod
 
 import kotlinx.serialization.json.JsonObject
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.nio.charset.StandardCharsets
 
@@ -40,6 +42,22 @@ class DockerApiParseTest {
     @Test
     fun dechunk_decodes_multiple_chunks() {
         assertEquals("abcde", String(DockerApi.dechunk(bytes("3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n")), StandardCharsets.UTF_8))
+    }
+
+    /**
+     * A response cut off mid-answer must not read as a short but complete one: `[]` from a truncated
+     * container listing is "the daemon says there are no containers", and `RepoTags: []` from a
+     * truncated image inspect is "nobody else references this image — delete it".
+     */
+    @Test
+    fun dechunk_refuses_a_truncated_body_instead_of_returning_half_of_it() {
+        val missingTerminator = assertThrows(DockerException::class.java) {
+            DockerApi.dechunk(bytes("3\r\nabc\r\n"))
+        }
+        assertTrue(missingTerminator.message!!.contains("truncated"), missingTerminator.message)
+
+        assertThrows(DockerException::class.java) { DockerApi.dechunk(bytes("9\r\nabc\r\n0\r\n\r\n")) }
+        assertThrows(DockerException::class.java) { DockerApi.dechunk(bytes("zz\r\nabc\r\n0\r\n\r\n")) }
     }
 
     // --- request targets ------------------------------------------------------------------

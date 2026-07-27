@@ -46,7 +46,7 @@ class Updater(
     private val api: DockerClient,
     private val config: Config,
     private val selfId: String?,
-    private val clock: TimeSource = TimeSource.SYSTEM,
+    private val clock: WallClock = WallClock.SYSTEM,
     private val sleeper: Sleeper = Sleeper.SYSTEM,
 ) {
     private val ns = config.labelNamespace
@@ -353,10 +353,7 @@ class Updater(
     private fun refreshDependent(dependent: Dependent, provider: RefreshedProvider): String? {
         val where = "[${dependent.name} (${dependent.short})]"
         val replaced = provider.replaced
-        val relation = when (dependent.kind) {
-            DependencyKind.NETNS -> "shares the network namespace of ${provider.name}"
-            DependencyKind.LINK -> "is --link'ed to ${provider.name}"
-        }
+        val relation = dependent.kind.relationTo(provider.name)
         val what = if (replaced) "replaced" else "restarted"
         if (!dependent.running) {
             // Starting a container somebody else stopped is not this cycle's call, but staying quiet
@@ -377,14 +374,8 @@ class Updater(
             )
             return recreateForeignDependent(dependent, provider)
         }
-        Log.warn("$where $relation, which this cycle $what, and would be left with a dead one — restarting it too")
-        return try {
-            api.restart(dependent.id, stopTimeout(dependent.labels))
-            Log.info("$where restart successful")
-            dependent.id
-        } catch (e: Exception) {
-            Log.warn("$where restart failed — it may be left without a working network: ${e.message}")
-            null
+        return dependent.id.takeIf {
+            restartDependent(api, dependent, provider.name, what, stopTimeout(dependent.labels, config, ns))
         }
     }
 
@@ -1092,11 +1083,7 @@ class Updater(
         api.stop(target.id, stopTimeout(target), expectedStopSeconds = effectiveStopTimeout(target))
 
     /** The explicit override: per-container label first, then `KODKOD_STOP_TIMEOUT`; `null` = none. */
-    private fun stopTimeout(target: Target): Int? = stopTimeout(target.composeLabels)
-
-    /** Same, for a container the cycle only knows from a listing (a dependent outside the target set). */
-    private fun stopTimeout(labels: JsonObject?): Int? =
-        labels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
+    private fun stopTimeout(target: Target): Int? = stopTimeout(target.composeLabels, config, ns)
 
     /** How long the graceful stop will really take: the override, else the container's own timeout. */
     private fun effectiveStopTimeout(target: Target): Int? =

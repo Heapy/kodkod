@@ -1257,6 +1257,27 @@ class UpdaterTest {
 
     // --- opt-out and failure branches -------------------------------------------------------
 
+    /**
+     * `KODKOD_LABEL_NAMESPACE` is read once into a field and then interpolated into half a dozen label
+     * lookups; nothing but a cycle run proves that the *same* namespace reaches all of them.
+     */
+    @Test
+    fun a_custom_label_namespace_drives_every_label_kodkod_reads() {
+        val docker = FakeDockerClient()
+        staleWeb(docker, labels = """{"acme.update.enable":"true","acme.stop.timeout":"45"}""")
+        val renamed = Config.fromEnv(
+            mapOf("KODKOD_LABEL_NAMESPACE" to "acme", "KODKOD_UPDATE_MONITOR_ALL" to "false")::get,
+        )
+
+        updater(docker, renamed).runOnce()
+
+        assertTrue(docker.ops.contains("create:web"), "the opt-in label under the custom namespace has to count: ${docker.ops}")
+        assertEquals(
+            listOf<Int?>(45, 45), docker.stopTimeouts,
+            "and so does the stop-timeout label next to it: ${docker.stopTimeouts}",
+        )
+    }
+
     @Test
     fun an_explicit_enable_false_opts_out_even_when_monitoring_everything() {
         val docker = FakeDockerClient()

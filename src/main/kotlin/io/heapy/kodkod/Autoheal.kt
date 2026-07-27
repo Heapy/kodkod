@@ -25,7 +25,7 @@ class Autoheal(
     private val api: DockerClient,
     private val config: Config,
     private val selfId: String?,
-    private val clock: TimeSource = TimeSource.SYSTEM,
+    private val clock: WallClock = WallClock.SYSTEM,
     private val sleeper: Sleeper = Sleeper.SYSTEM,
 ) {
     private val ns = config.labelNamespace
@@ -202,22 +202,14 @@ class Autoheal(
         val provider = providerOf(summary) ?: return
         for (dependent in findDependents(api, provider)) {
             if (isSelf(dependent.id, dependent.labels, selfId)) continue
-            val where = "[${dependent.name} (${dependent.short})]"
             if (!dependent.running) {
-                Log.info("$where depends on $providerName but is ${dependent.state} — leaving it alone")
+                Log.info(
+                    "[${dependent.name} (${dependent.short})] depends on $providerName but is " +
+                        "${dependent.state} — leaving it alone",
+                )
                 continue
             }
-            val reason = when (dependent.kind) {
-                DependencyKind.NETNS -> "shares the network namespace of $providerName"
-                DependencyKind.LINK -> "is --link'ed to $providerName"
-            }
-            Log.warn("$where $reason and would be left with a dead one — restarting it too")
-            try {
-                api.restart(dependent.id, stopTimeout(dependent.labels))
-                Log.info("$where restart successful")
-            } catch (e: Exception) {
-                Log.error("$where restart failed — it may have no working network: ${e.message}")
-            }
+            restartDependent(api, dependent, providerName, "restarted", stopTimeout(dependent.labels))
         }
     }
 
@@ -253,8 +245,7 @@ class Autoheal(
         return seconds
     }
 
-    private fun stopTimeout(labels: JsonObject?): Int? =
-        labels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
+    private fun stopTimeout(labels: JsonObject?): Int? = stopTimeout(labels, config, ns)
 
     private companion object {
         /** Gap between state reads while waiting out a restart whose outcome the socket did not carry. */

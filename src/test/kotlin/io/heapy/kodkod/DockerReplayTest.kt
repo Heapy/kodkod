@@ -30,9 +30,10 @@ class DockerReplayTest {
     /**
      * Fake time, so replaying a recreate does not really sleep through the liveness gate's probe
      * interval. The gate exits on three good probes, which the recording contains, so the clock never
-     * reaches the verification window.
+     * reaches the verification window. One per scenario: a shared clock accumulates the virtual time
+     * of every scenario before it, which would make each one's waiting budget depend on test order.
      */
-    private val clock = FakeClock()
+    private fun clock() = FakeClock()
 
     private fun resourceText(path: String): String? =
         javaClass.classLoader.getResourceAsStream(path)?.use { it.readBytes().toString(StandardCharsets.UTF_8) }
@@ -69,6 +70,7 @@ class DockerReplayTest {
         if (scenario.startsWith("autoheal")) {
             Autoheal(client, autohealConfig(), selfId = null).runOnce()
         } else {
+            val clock = clock()
             Updater(client, updateConfig(), selfId = null, clock, clock).runOnce()
         }
 
@@ -183,6 +185,7 @@ class DockerReplayTest {
         val replay = ReplayDockerTransport(exchanges) { file ->
             SYNTHETIC_BODIES.getValue(file).toByteArray(StandardCharsets.UTF_8)
         }
+        val clock = clock()
         Updater(OpLoggingClient(DockerApi(replay)), updateConfig(), selfId = null, clock, clock).runOnce()
         assertExhaustive("synthetic", replay)
     }

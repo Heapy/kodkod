@@ -117,8 +117,9 @@ class FixtureWriterTest {
                 "update-recreate",
                 listOf(exchange("GET", "/version", "{}"), exchange("GET", "/info", "{}")),
             )
-            writer.upsertIndex(label, "update-recreate")
         }
+        // The recorder never gets here, which is the point: the index only ever names a scenario that
+        // is already complete on disk.
 
         assertEquals(before, snapshot(committed), "the committed recording must survive a failed re-record")
         assertEquals(emptyList<Path>(), leftovers(label), "no staging or backup directories may be left behind")
@@ -147,8 +148,8 @@ class FixtureWriterTest {
 
         assertThrows(IOException::class.java) {
             writer.writeScenario(label, "deps-ordered", listOf(exchange("GET", "/version", "{}")))
-            writer.upsertIndex(label, "deps-ordered")
         }
+        // ...and again: `upsertIndex` is unreachable after the throw, which is what keeps the index honest.
 
         assertEquals(listOf("update-recreate"), index().labels.single().scenarios)
         assertTrue(Files.notExists(root.resolve(label).resolve("deps-ordered")))

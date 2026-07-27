@@ -1,11 +1,11 @@
 package io.heapy.kodkod
 
 /**
- * A [TimeSource] and [Sleeper] whose clock moves only when the test moves it — by hand via [advance],
+ * A [WallClock] and [Sleeper] whose clock moves only when the test moves it — by hand via [advance],
  * or because the code under test slept. Every sleep is recorded in [sleeps], so a test can assert
  * *how long* the code waited (and that it waited at all) without spending that time.
  */
-class FakeClock(private var now: Long = 0L) : TimeSource, Sleeper {
+class FakeClock(private var now: Long = 0L) : WallClock, Sleeper {
     /** Durations passed to [sleep], in call order. */
     val sleeps = mutableListOf<Long>()
 

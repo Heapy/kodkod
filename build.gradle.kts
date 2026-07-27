@@ -12,13 +12,14 @@ group = "io.heapy"
 version = "1.0.0"
 
 val junitVersion = "6.1.0"
+val serializationVersion = "1.11.0"
 
 repositories {
     mavenCentral()
 }
 
 dependencies {
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationVersion")
 }
 
 testing {
@@ -34,7 +35,7 @@ testing {
                 implementation(project())
                 // The recorder calls DockerApi (which returns kotlinx JsonObject) and writes fixture
                 // JSON; main exposes these only as `implementation`, so re-declare for this suite.
-                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serializationVersion")
             }
 
             targets.all {

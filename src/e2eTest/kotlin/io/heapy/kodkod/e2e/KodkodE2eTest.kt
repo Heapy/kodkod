@@ -1,10 +1,12 @@
 package io.heapy.kodkod.e2e
 
+import io.heapy.kodkod.TRUTHY
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assertions.fail
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.MethodOrderer
@@ -137,10 +139,8 @@ class KodkodE2eTest {
         waitUntil(90, "cache restarted after db (compose depends_on label only)") {
             startedAt("e2e-deps-cache-1") > dbStart
         }
-        val webStart = startedAt("e2e-deps-web-1")
-        val cacheStart = startedAt("e2e-deps-cache-1")
-        assertTrue(webStart > dbStart, "web should restart after db; db=$dbStart web=$webStart")
-        assertTrue(cacheStart > dbStart, "cache should restart after db; db=$dbStart cache=$cacheStart")
+        // No assertion follows: `waitUntil` fails the test on timeout, so re-asserting the condition it
+        // just proved would only be an assertion that can never fire.
     }
 
     @Test
@@ -567,7 +567,7 @@ internal class E2eHarness {
             if (predicate()) return
             sleep(2)
         }
-        assertTrue(false, "Timed out after ${timeoutSeconds}s waiting for: $description")
+        fail<Unit>("Timed out after ${timeoutSeconds}s waiting for: $description")
     }
 
     fun sleep(seconds: Long) {
@@ -663,7 +663,7 @@ internal class E2eHarness {
     }
 
     private fun boolProperty(name: String): Boolean {
-        return System.getProperty(name)?.trim()?.lowercase() in setOf("true", "1", "yes", "on")
+        return System.getProperty(name)?.trim()?.lowercase() in TRUTHY
     }
 
     private companion object {

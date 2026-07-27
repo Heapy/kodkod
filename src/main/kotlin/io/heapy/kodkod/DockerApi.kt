@@ -206,7 +206,7 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
         /** Split raw HTTP/1.1 response bytes into a status + body, decoding a chunked body. */
         internal fun parse(raw: ByteArray): HttpResponse {
             val separator = indexOf(raw, CRLF_CRLF, 0)
-            if (separator < 0) throw DockerException(-1, "malformed http response (no header terminator)")
+                ?: throw DockerException(-1, "malformed http response (no header terminator)")
 
             val headerText = String(raw, 0, separator, StandardCharsets.US_ASCII)
             val lines = headerText.split("\r\n")
@@ -225,31 +225,41 @@ class DockerApi(private val transport: DockerTransport) : DockerClient {
             return HttpResponse(status, if (chunked) dechunk(body) else body)
         }
 
-        /** Decode a `Transfer-Encoding: chunked` body into the concatenated chunk payloads. */
+        /**
+         * Decode a `Transfer-Encoding: chunked` body into the concatenated chunk payloads.
+         *
+         * A body that ends without its terminating `0` chunk, or whose chunk size cannot be read, is a
+         * **truncated response** — the connection was cut mid-answer. Returning what arrived so far
+         * makes that look like a short but complete answer, which downstream reads as "the daemon says
+         * there are no containers" or "this image has no tags". So it is an error instead.
+         */
         internal fun dechunk(data: ByteArray): ByteArray {
             val out = ByteArrayOutputStream()
             var pos = 0
             while (pos < data.size) {
                 val lineEnd = indexOf(data, CRLF, pos)
-                if (lineEnd < 0) break
+                    ?: throw DockerException(-1, "truncated chunked body: no chunk header at byte $pos")
                 val sizeToken = String(data, pos, lineEnd - pos, StandardCharsets.US_ASCII)
                     .substringBefore(';').trim()
-                val size = sizeToken.toIntOrNull(16) ?: break
+                val size = sizeToken.toIntOrNull(16)
+                    ?: throw DockerException(-1, "malformed chunked body: unreadable chunk size '$sizeToken'")
                 pos = lineEnd + CRLF.size
-                if (size == 0) break
-                if (pos + size > data.size) break
+                if (size == 0) return out.toByteArray()
+                if (pos + size > data.size) {
+                    throw DockerException(-1, "truncated chunked body: chunk of $size bytes cut short")
+                }
                 out.write(data, pos, size)
                 pos += size + CRLF.size // skip the chunk data plus its trailing CRLF
             }
-            return out.toByteArray()
+            throw DockerException(-1, "truncated chunked body: the terminating zero-length chunk never arrived")
         }
 
-        private fun indexOf(haystack: ByteArray, needle: ByteArray, from: Int): Int {
+        private fun indexOf(haystack: ByteArray, needle: ByteArray, from: Int): Int? {
             outer@ for (i in from..haystack.size - needle.size) {
                 for (j in needle.indices) if (haystack[i + j] != needle[j]) continue@outer
                 return i
             }
-            return -1
+            return null
         }
     }
 }

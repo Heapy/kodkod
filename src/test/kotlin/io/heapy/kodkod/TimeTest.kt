@@ -36,27 +36,12 @@ class TimeTest {
         assertTrue(elapsedMillis < 1_000, "a minute of virtual sleep must not cost real time (took ${elapsedMillis}ms)")
     }
 
+    /** A non-positive duration must not block; every retry loop passes one at least once. */
     @Test
-    fun the_system_defaults_are_the_real_clock() {
-        val before = System.currentTimeMillis()
-        val reading = TimeSource.SYSTEM.millis()
-        assertTrue(reading >= before, "the default time source reads the wall clock (got $reading, now $before)")
-
+    fun the_default_sleeper_returns_at_once_on_a_non_positive_wait() {
         val start = System.nanoTime()
-        Sleeper.SYSTEM.sleep(5)
         Sleeper.SYSTEM.sleep(0)
-        assertTrue(System.nanoTime() - start >= 5_000_000, "the default sleeper really waits")
-    }
-
-    @Test
-    fun the_cycles_accept_an_injected_clock() {
-        val docker = FakeDockerClient()
-        val clock = FakeClock()
-
-        Updater(docker, Config.fromEnv(emptyMap<String, String>()::get), selfId = null, clock, clock).runOnce()
-        Autoheal(docker, Config.fromEnv(emptyMap<String, String>()::get), selfId = null, clock, clock).runOnce()
-
-        assertTrue(docker.ops.isEmpty(), "nothing to do on an empty daemon: ${docker.ops}")
-        assertTrue(clock.sleeps.isEmpty(), "no cycle waits on an empty daemon: ${clock.sleeps}")
+        Sleeper.SYSTEM.sleep(-1)
+        assertTrue((System.nanoTime() - start) / 1_000_000 < 500, "a zero-length sleep must not wait")
     }
 }

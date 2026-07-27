@@ -7,12 +7,16 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 /** How a dependent is wired to the container it depends on — both are baked in at create time. */
-internal enum class DependencyKind {
+internal enum class DependencyKind(private val relation: String) {
     /** `--network container:<id|name>`, i.e. compose `network_mode: service:x` — a shared network namespace. */
-    NETNS,
+    NETNS("shares the network namespace of"),
 
     /** Legacy `--link`: the daemon writes the target's address into the dependent's `/etc/hosts`. */
-    LINK,
+    LINK("is --link'ed to"),
+    ;
+
+    /** How a log line says a dependent is wired to [provider]. Both cycles phrase it the same way. */
+    fun relationTo(provider: String): String = "$relation $provider"
 }
 
 /** A container pointing at another container's create-time configuration. */
@@ -81,11 +85,45 @@ internal fun providerOf(summary: JsonObject): DependencyProvider? {
  */
 internal fun findDependents(api: DockerClient, provider: DependencyProvider): List<Dependent> {
     val project = provider.composeProject
+    var known = emptyList<Dependent>()
     if (project != null) {
         val withinProject = list(api, mapOf("label" to listOf("$COMPOSE_PROJECT_LABEL=$project"))) ?: return emptyList()
-        if (dependentsIn(withinProject, provider).isEmpty()) return emptyList()
+        known = dependentsIn(withinProject, provider)
+        if (known.isEmpty()) return emptyList()
     }
-    return dependentsIn(list(api, emptyMap()) ?: return emptyList(), provider)
+    // A wide listing that fails must not lose the dependents the narrow one already found.
+    return dependentsIn(list(api, emptyMap()) ?: return known, provider)
+}
+
+/**
+ * Restart [dependent], which was wired to [providerName] at create time and would otherwise be left
+ * pointing at a namespace (or an address) that no longer exists. Shared by the update and autoheal
+ * cycles — the container does not care which of the two took its provider down — with [what] naming
+ * what happened to the provider ("restarted", "replaced").
+ *
+ * @return whether the restart went through; a dependent that did not come back has no dependents of
+ * its own worth chasing.
+ */
+internal fun restartDependent(
+    api: DockerClient,
+    dependent: Dependent,
+    providerName: String,
+    what: String,
+    timeout: Int?,
+): Boolean {
+    val where = "[${dependent.name} (${dependent.short})]"
+    Log.warn(
+        "$where ${dependent.kind.relationTo(providerName)}, which this cycle $what, and would be left with a " +
+            "dead one — restarting it too",
+    )
+    return try {
+        api.restart(dependent.id, timeout)
+        Log.info("$where restart successful")
+        true
+    } catch (e: Exception) {
+        Log.error("$where restart failed — it may be left without a working network: ${e.message}")
+        false
+    }
 }
 
 /** Stopped containers included: a dependent that is down still has to be told the reference moved. */
@@ -140,6 +178,14 @@ private fun JsonObject.linkSources(): List<String> =
     obj("NetworkSettings")?.obj("Networks")?.values.orEmpty()
         .flatMap { network -> (network as? JsonObject)?.arr("Links").orEmpty() }
         .mapNotNull { it.jsonPrimitive.contentOrNull?.let(::linkSource)?.takeIf(String::isNotEmpty) }
+
+/**
+ * The graceful-stop override for a container both cycles may have to stop: its own `<ns>.stop.timeout`
+ * label, else `KODKOD_STOP_TIMEOUT`. `null` means kodkod has no opinion and the daemon applies the
+ * container's own `Config.StopTimeout`.
+ */
+internal fun stopTimeout(labels: JsonObject?, config: Config, ns: String): Int? =
+    labels.label("$ns.stop.timeout")?.toIntOrNull() ?: config.defaultStopTimeout
 
 const val NETNS_PREFIX = "container:"
 
