@@ -163,8 +163,37 @@ class FakeDockerClient : DockerClient {
     override fun listContainers(all: Boolean, filters: Map<String, List<String>>): JsonArray {
         listFilters += filters
         if (failList) throw DockerException(500, "fake: list failure")
-        return JsonArray(listed.filter { matches(it, all, filters) })
+        return JsonArray(listed.filter { matches(it, all, filters) }.map(::asListedNow))
     }
+
+    /**
+     * The summary as a listing taken **now** would carry it: `State` and `Names` are this fake's
+     * lifecycle model, the very values [matches] filters on.
+     *
+     * Without this the two halves disagreed: a replacement [create] appended was filtered as running
+     * once something started it, but the payload handed back still said `"State":"created"` — a
+     * combination no daemon can produce. Everything that reads a container's state out of a *listing*
+     * (`dependentsIn`, the reconcile pass) was therefore told the container had never run, which made
+     * the branches keyed on that state unreachable and the tests covering them unable to fail.
+     */
+    private fun asListedNow(summary: JsonObject): JsonObject {
+        val id = summary.str("Id")
+        val state = stateOf(id, summary)
+        val name = id?.let(renamed::get)
+        if (state == summary.str("State") && name == null) return summary
+        return buildJsonObject {
+            summary.forEach { (key, value) -> if (key != "State" && key != "Names") put(key, value) }
+            put("State", state)
+            put("Names", name?.let { JsonArray(listOf(JsonPrimitive("/$it"))) } ?: summary["Names"] ?: EMPTY_ARRAY)
+        }
+    }
+
+    /**
+     * The lifecycle wins over the registered summary: a container this fake started or stopped reports
+     * the state it is actually in, exactly as a listing taken afterwards would.
+     */
+    private fun stateOf(id: String?, summary: JsonObject): String =
+        id?.let(running::get)?.let { if (it) "running" else "exited" } ?: summary.str("State") ?: "running"
 
     /**
      * The daemon's own filtering, modelled only as far as kodkod uses it: values within one filter are
@@ -177,9 +206,7 @@ class FakeDockerClient : DockerClient {
      */
     private fun matches(summary: JsonObject, all: Boolean, filters: Map<String, List<String>>): Boolean {
         val id = summary.str("Id")
-        // The lifecycle wins over the registered summary: a container this fake started or stopped
-        // reports the state it is actually in, exactly as a listing taken afterwards would.
-        val state = running[id]?.let { if (it) "running" else "exited" } ?: summary.str("State") ?: "running"
+        val state = stateOf(id, summary)
         if (!all && state !in LISTED_WITHOUT_ALL) return false
         // Same for the name: after a rename the daemon's index knows only the new one.
         val names = renamed[id]?.let(::listOf) ?: summary.containerNames()
