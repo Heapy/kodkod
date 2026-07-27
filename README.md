@@ -158,9 +158,10 @@ window a replacement has to survive to be accepted:
   and deliberately pins neither. The replacement gets a fresh generated MAC. On engines that still
   report `Config.MacAddress`, an explicit MAC is preserved.
 - The health branch of the liveness gate (`Health=unhealthy` / `Health=starting`) is covered by unit
-  tests only. The recorded-fixture and end-to-end runs go with `KODKOD_UPDATE_VERIFY_HEALTH=false`,
-  because the number of probes is otherwise a race between the probe interval and the replacement's
-  own healthcheck.
+  tests only. The recorded-fixture runs pin `KODKOD_UPDATE_VERIFY_SECONDS=1` (three probes, at the
+  gate's own interval) and `KODKOD_UPDATE_VERIFY_HEALTH=false`, so that a recording is a fixed number
+  of requests rather than a race between the probe interval, the replacement's healthcheck and the
+  moment it passes.
 - Every recreate of an image **without a passing healthcheck** pays the full
   `KODKOD_UPDATE_VERIFY_SECONDS` — under the cycle lock, which holds off autoheal for that long, once
   per container. That covers images with no healthcheck at all as well as any replacement still inside

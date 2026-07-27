@@ -218,13 +218,17 @@ recording our own output as a golden file would just self-heal on every re-recor
 Review the fixture diff before committing it: only the paths and bodies you meant to change should
 move. Container and image ids differ on every run, so compare manifests with the ids normalized.
 
-The recorder's update scenarios run with three settings pinned, and the replay side has to match all
-three or the corpus misses:
+The recorder's update scenarios run with four settings pinned, and the replay side has to match all
+four or the corpus misses:
 
 - `KODKOD_UPDATE_MONITOR_ALL=false`, so the recorder only ever acts on containers labelled for kodkod —
   never the developer's own running containers on the daemon it is recording from;
-- `KODKOD_UPDATE_VERIFY_HEALTH=false` (as in `DockerReplayTest`), which keeps the liveness gate's probe
-  count deterministic instead of a race between the probe interval and the replacement's healthcheck;
+- `KODKOD_UPDATE_VERIFY_SECONDS=1` (as in `DockerReplayTest`), which fixes the liveness gate's probe
+  count: the gate watches the whole window unless the replacement reports `healthy`, and a window of
+  one second is exactly three inspects at the gate's own 500ms interval — on the recording daemon and
+  on the replay alike;
+- `KODKOD_UPDATE_VERIFY_HEALTH=false` (likewise), so a healthcheck that fails a beat inside that window
+  cannot turn a recorded update into a recorded rollback;
 - `KODKOD_UPDATE_CLEANUP=true`, which is what puts the old image's `DELETE /images/<id>` — and the
   `GET /images/<id>/json` that decides whether it may be deleted — into the recording at all.
 
