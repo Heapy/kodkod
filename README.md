@@ -255,7 +255,7 @@ won't fool it).
 
 ## Build from source
 
-Requires JDK 25+ (the Gradle 9.5.1 wrapper and Kotlin 2.4.0 are pinned):
+Requires JDK 25+ (the Gradle 9.6.1 wrapper and Kotlin 2.4.10 are pinned):
 
 ```bash
 ./gradlew installDist          # build/install/kodkod/bin/kodkod

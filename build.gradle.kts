@@ -2,8 +2,8 @@ import org.gradle.api.plugins.jvm.JvmTestSuite
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
-    kotlin("jvm").version("2.4.0")
-    kotlin("plugin.serialization").version("2.4.0")
+    kotlin("jvm").version("2.4.10")
+    kotlin("plugin.serialization").version("2.4.10")
     application
     `jvm-test-suite`
 }
@@ -11,7 +11,7 @@ plugins {
 group = "io.heapy"
 version = "1.0.0"
 
-val junitVersion = "6.1.0"
+val junitVersion = "6.1.2"
 val serializationVersion = "1.11.0"
 
 repositories {

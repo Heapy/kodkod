@@ -67,6 +67,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   compared canonically, so `docker.io/library/nginx:1.27` matches the `nginx:1.27` the daemon records.
 - The e2e suite is a JUnit suite (`src/e2eTest`) instead of shell scripts, running against a
   disposable Docker-in-Docker daemon by default.
+- Toolchain and dependencies moved to their current releases: Kotlin 2.4.10, Gradle 9.6.1, JUnit 6.1.2
+  (kotlinx-serialization-json stays at 1.11.0, already current). Patch-level updates only — no
+  behaviour change, and the published image is built from the same JDK 25 base.
 
 ### Fixed
 - A create-time dependent is no longer forced through a recreate that could not be undone. Its
