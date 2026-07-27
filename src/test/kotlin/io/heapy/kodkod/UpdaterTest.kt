@@ -8,8 +8,9 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
-import java.io.ByteArrayOutputStream
-import java.io.PrintStream
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.NullSource
+import org.junit.jupiter.params.provider.ValueSource
 
 /**
  * Exercises whole [Updater] cycles against a [FakeDockerClient] — an in-memory daemon rather than
@@ -31,27 +32,8 @@ class UpdaterTest {
      */
     private val clock = FakeClock()
 
-    private fun json(s: String): JsonObject = Json.parseToJsonElement(s).jsonObject
-
     private fun updater(docker: DockerClient, config: Config = config()): Updater =
         Updater(docker, config, selfId = null, clock, clock)
-
-    /**
-     * [Log] writes to stdout, and a couple of behaviours here have no other output than the line they
-     * log — "the rollback did not restore the service" is exactly the state an operator only learns
-     * about from the log, so the log is what those tests assert on.
-     */
-    private fun captureLog(block: () -> Unit): String {
-        val buffer = ByteArrayOutputStream()
-        val original = System.out
-        System.setOut(PrintStream(buffer, true))
-        try {
-            block()
-        } finally {
-            System.setOut(original)
-        }
-        return buffer.toString()
-    }
 
     private fun config(
         monitorAll: Boolean = true,
@@ -95,6 +77,19 @@ class UpdaterTest {
         }
     }
 
+    /**
+     * One container, `web`, whose `nginx:1.27` has moved to a new image — the smallest fixture that
+     * drives a whole cycle (stop, rename, create, start, verify, remove). Used from the rollback tests
+     * onwards, hence its place up here rather than under the first banner that happens to need it.
+     */
+    private fun staleWeb(docker: FakeDockerClient, labels: String = "{}", configStopTimeout: Int? = null) {
+        docker.container(
+            id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
+            labels = labels, configStopTimeout = configStopTimeout,
+        )
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+    }
+
     // --- markStale: when NOT to act -------------------------------------------------------
 
     @Test
@@ -111,7 +106,7 @@ class UpdaterTest {
     fun unlabelled_containers_are_ignored_when_not_monitoring_all() {
         val docker = FakeDockerClient()
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old") // no enable label
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker, config(monitorAll = false)).runOnce()
 
@@ -137,7 +132,7 @@ class UpdaterTest {
         val docker = FakeDockerClient()
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
         // No distribution entry -> fall back to a pull; the pulled image id matches the running one.
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:old","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:old","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -152,7 +147,7 @@ class UpdaterTest {
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
         docker.distribution["nginx:1.27"] = "sha256:remote"
         // The local repo:tag already resolves to a newer image than the running container.
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":["nginx@sha256:remote"]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":["nginx@sha256:remote"]}""")
 
         updater(docker).runOnce()
 
@@ -164,7 +159,7 @@ class UpdaterTest {
     fun pulls_and_recreates_when_pulled_image_differs() {
         val docker = FakeDockerClient()
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -177,7 +172,7 @@ class UpdaterTest {
     fun recreate_replaces_the_container_and_prunes_the_old_image() {
         val docker = FakeDockerClient()
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker, config(cleanup = true)).runOnce()
 
@@ -198,7 +193,7 @@ class UpdaterTest {
     fun recreate_keeps_the_old_image_when_cleanup_is_disabled() {
         val docker = FakeDockerClient()
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker, config(cleanup = false)).runOnce()
 
@@ -211,8 +206,8 @@ class UpdaterTest {
     /** A stale `app:latest` whose old image id still answers inspect with [repoTags]. */
     private fun staleApp(docker: FakeDockerClient, repoTags: String) {
         docker.container(id = "web", imageRef = "app:latest", currentImageId = "sha256:old")
-        docker.images["sha256:old"] = json("""{"Id":"sha256:old","Config":{},"RepoDigests":[],"RepoTags":$repoTags}""")
-        docker.images["app:latest"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[],"RepoTags":["app:latest"]}""")
+        docker.images["sha256:old"] = jsonObj("""{"Id":"sha256:old","Config":{},"RepoDigests":[],"RepoTags":$repoTags}""")
+        docker.images["app:latest"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[],"RepoTags":["app:latest"]}""")
     }
 
     @Test
@@ -262,9 +257,9 @@ class UpdaterTest {
         val docker = FakeDockerClient()
         docker.container(id = "web", imageRef = "docker.io/library/nginx:1.27", currentImageId = "sha256:old")
         docker.images["sha256:old"] =
-            json("""{"Id":"sha256:old","Config":{},"RepoDigests":[],"RepoTags":["nginx:1.27"]}""")
+            jsonObj("""{"Id":"sha256:old","Config":{},"RepoDigests":[],"RepoTags":["nginx:1.27"]}""")
         docker.images["docker.io/library/nginx:1.27"] =
-            json("""{"Id":"sha256:new","Config":{},"RepoDigests":[],"RepoTags":["nginx:1.27"]}""")
+            jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[],"RepoTags":["nginx:1.27"]}""")
 
         updater(docker, config(cleanup = true)).runOnce()
 
@@ -301,7 +296,7 @@ class UpdaterTest {
             id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
             mounts = """[{"Type":"volume","Name":"vol0123456789","Destination":"/data","RW":true}]""",
         )
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -317,7 +312,7 @@ class UpdaterTest {
             id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
             networks = """{"frontend":{},"backend":{}}""",
         )
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -337,7 +332,7 @@ class UpdaterTest {
             configMacAddress = "02:42:ac:11:00:99", // what `--mac-address` / compose `mac_address:` sets
             networks = """{"frontend":{"MacAddress":"02:42:ac:11:00:99","GwPriority":100}}""",
         )
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -360,7 +355,7 @@ class UpdaterTest {
             // No `Config.MacAddress`, so the endpoint MAC below was generated by the daemon.
             networks = """{"frontend":{"MacAddress":"82:b1:9a:7b:ef:36","GwPriority":0}}""",
         )
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -380,7 +375,7 @@ class UpdaterTest {
             configMacAddress = "", // how a container without `--mac-address` reports it
             networks = """{"frontend":{"MacAddress":"82:b1:9a:7b:ef:36"}}""",
         )
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -402,7 +397,7 @@ class UpdaterTest {
             hostConfig = """{"NetworkMode":"host"}""",
             networks = """{"host":{"GwPriority":0,"EndpointID":"dc17b7805866"}}""",
         )
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -423,7 +418,7 @@ class UpdaterTest {
             hostConfig = """{"NetworkMode":"none"}""",
             networks = """{"none":{"GwPriority":0,"EndpointID":"859033cefdd1"}}""",
         )
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -442,7 +437,7 @@ class UpdaterTest {
             id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
             labels = """{"com.docker.compose.image":"sha256:old","com.docker.compose.config-hash":"h1"}""",
         )
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -463,7 +458,7 @@ class UpdaterTest {
         )
         docker.distribution["nginx:1.27"] = "sha256:remote"
         // The local repo:tag already resolves to a newer image, so this path never pulls.
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":["nginx@sha256:remote"]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":["nginx@sha256:remote"]}""")
 
         updater(docker).runOnce()
 
@@ -483,10 +478,10 @@ class UpdaterTest {
             hostConfig = """{"Links":["/db:/web/db"]}""",
         )
         docker.distribution["db:1"] = "sha256:db-remote"
-        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
+        docker.images["db:1"] = jsonObj("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
         docker.distribution["web:1"] = "sha256:web-remote"
         // The tag still names the image web is running, so the recreate really is faithful.
-        docker.images["web:1"] = json("""{"Id":"sha256:web-old","Config":{},"RepoDigests":[]}""")
+        docker.images["web:1"] = jsonObj("""{"Id":"sha256:web-old","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -514,10 +509,10 @@ class UpdaterTest {
             hostConfig = """{"Links":["/db:/web/db"]}""",
         )
         docker.distribution["db:1"] = "sha256:db-remote"
-        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
+        docker.images["db:1"] = jsonObj("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
         // web is up to date as far as the registry goes, but the local tag has moved on anyway.
         docker.distribution["web:1"] = "sha256:web-remote"
-        docker.images["web:1"] = json("""{"Id":"sha256:web-moved","Config":{},"RepoDigests":[]}""")
+        docker.images["web:1"] = jsonObj("""{"Id":"sha256:web-moved","Config":{},"RepoDigests":[]}""")
 
         val log = captureLog { updater(docker).runOnce() }
 
@@ -534,7 +529,7 @@ class UpdaterTest {
     fun a_container_without_compose_labels_does_not_get_one_invented() {
         val docker = FakeDockerClient()
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -551,7 +546,7 @@ class UpdaterTest {
             id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
             imageManifestPlatform = """{"architecture":"amd64","os":"linux"}""",
         )
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -566,7 +561,7 @@ class UpdaterTest {
     fun a_container_without_an_image_manifest_descriptor_sends_no_platform() {
         val docker = FakeDockerClient()
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old") // pre-descriptor engine
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -584,7 +579,7 @@ class UpdaterTest {
             // The OLD image resolved to the v8 variant; the new one may not publish that variant at all.
             imageManifestPlatform = """{"architecture":"arm64","os":"linux","variant":"v8"}""",
         )
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
 
         updater(docker).runOnce()
 
@@ -601,7 +596,7 @@ class UpdaterTest {
     fun a_failed_create_rolls_back_to_the_original_container() {
         val docker = FakeDockerClient()
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
         docker.failCreate += "web"
 
         updater(docker).runOnce() // runOnce logs and swallows the recreate failure
@@ -617,7 +612,7 @@ class UpdaterTest {
     fun a_failed_start_removes_the_replacement_and_rolls_back() {
         val docker = FakeDockerClient()
         docker.container(id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old")
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
         docker.failStart += "new-web-0" // the freshly-created container fails to start
 
         updater(docker).runOnce()
@@ -740,7 +735,7 @@ class UpdaterTest {
         val docker = FakeDockerClient()
         staleWeb(docker)
         // A container with a restart policy that keeps crashing: the daemon reports it as restarting.
-        docker.containers["new-web-0"] = json("""{"Name":"/web","State":{"Restarting":true}}""")
+        docker.containers["new-web-0"] = jsonObj("""{"Name":"/web","State":{"Restarting":true}}""")
 
         updater(docker).runOnce()
 
@@ -986,7 +981,7 @@ class UpdaterTest {
         updater.runOnce()
         val afterFirstCycle = docker.ops.size
         // The operator pushed a fix: the tag no longer resolves to the image that failed.
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:fixed","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:fixed","Config":{},"RepoDigests":[]}""")
 
         updater.runOnce()
 
@@ -1008,7 +1003,7 @@ class UpdaterTest {
         updater.runOnce() // the retry comes up this time and the update completes
         val afterSuccess = docker.ops.size
         // A third image is published right away — well inside the window the failure had bought.
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:newer","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:newer","Config":{},"RepoDigests":[]}""")
 
         updater.runOnce()
 
@@ -1044,7 +1039,7 @@ class UpdaterTest {
             hostConfig = """{"NetworkMode":"container:db1234567890abc"}""",
         )
         docker.distribution["db:1"] = "sha256:db-1" // db is up to date in the first cycle
-        docker.images["web:1"] = json("""{"Id":"sha256:web-bad","Config":{},"RepoDigests":[]}""")
+        docker.images["web:1"] = jsonObj("""{"Id":"sha256:web-bad","Config":{},"RepoDigests":[]}""")
         docker.startedThenExits += "new-web-0" // web's own update cannot come up
         val updater = updater(docker)
 
@@ -1052,7 +1047,7 @@ class UpdaterTest {
         val afterFirstCycle = docker.ops.size
         // Now db's image moves. web is still inside the cooldown its failed update bought.
         docker.distribution["db:1"] = "sha256:db-2"
-        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-2"]}""")
+        docker.images["db:1"] = jsonObj("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-2"]}""")
 
         val log = captureLog { updater.runOnce() }
 
@@ -1087,14 +1082,14 @@ class UpdaterTest {
                 """"com.docker.compose.depends_on":"db:service_started:true"}""",
         )
         docker.distribution["db:1"] = "sha256:db-1"
-        docker.images["web:1"] = json("""{"Id":"sha256:web-bad","Config":{},"RepoDigests":[]}""")
+        docker.images["web:1"] = jsonObj("""{"Id":"sha256:web-bad","Config":{},"RepoDigests":[]}""")
         docker.startedThenExits += "new-web-0"
         val updater = updater(docker)
 
         updater.runOnce()
         val afterFirstCycle = docker.ops.size
         docker.distribution["db:1"] = "sha256:db-2"
-        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-2"]}""")
+        docker.images["db:1"] = jsonObj("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-2"]}""")
 
         updater.runOnce()
 
@@ -1123,8 +1118,8 @@ class UpdaterTest {
             id = "web", imageRef = "web:1", currentImageId = "sha256:web-old",
             hostConfig = """{"NetworkMode":"container:db1234567890abc"}""",
         )
-        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":[]}""")
-        docker.images["web:1"] = json("""{"Id":"sha256:web-new","Config":{},"RepoDigests":[]}""")
+        docker.images["db:1"] = jsonObj("""{"Id":"sha256:db-new","Config":{},"RepoDigests":[]}""")
+        docker.images["web:1"] = jsonObj("""{"Id":"sha256:web-new","Config":{},"RepoDigests":[]}""")
         val updater = updater(docker)
 
         val log = captureLog { updater.runOnce() }
@@ -1169,20 +1164,20 @@ class UpdaterTest {
             id = A_ID, name = "a", imageRef = "a:1", currentImageId = "sha256:a-old",
             labels = """{"kodkod.update.enable":"true"}""",
         )
-        docker.images["a:1"] = json("""{"Id":"sha256:a-new","Config":{},"RepoDigests":[]}""")
+        docker.images["a:1"] = jsonObj("""{"Id":"sha256:a-new","Config":{},"RepoDigests":[]}""")
         // Up to date, and joined to a's namespace: nothing but a's update can put it in motion.
         docker.container(
             id = B_ID, name = "b", imageRef = "b:1", currentImageId = "sha256:b-cur",
             labels = """{"kodkod.update.enable":"true"}""",
             hostConfig = """{"NetworkMode":"container:$A_ID"}""",
         )
-        docker.images["b:1"] = json("""{"Id":"sha256:b-cur","Config":{},"RepoDigests":[]}""")
+        docker.images["b:1"] = jsonObj("""{"Id":"sha256:b-cur","Config":{},"RepoDigests":[]}""")
         docker.container(
             id = C_ID, name = "c", imageRef = "c:1", currentImageId = "sha256:c-old",
             labels = """{"kodkod.update.enable":"true"}""",
             hostConfig = """{"NetworkMode":"container:$B_ID"}""",
         )
-        docker.images["c:1"] = json("""{"Id":"sha256:c-new","Config":{},"RepoDigests":[]}""")
+        docker.images["c:1"] = jsonObj("""{"Id":"sha256:c-new","Config":{},"RepoDigests":[]}""")
 
         updater(docker, config(monitorAll = false)).runOnce()
 
@@ -1252,10 +1247,10 @@ class UpdaterTest {
         )
         // db: registry digest resolves to a newer local image (stale, no pull).
         docker.distribution["db:1"] = "sha256:db-remote"
-        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
+        docker.images["db:1"] = jsonObj("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
         // web: running image already carries the registry digest (up to date).
         docker.distribution["web:1"] = "sha256:web-remote"
-        docker.images["sha256:web-old"] = json("""{"Id":"sha256:web-old","Config":{},"RepoDigests":["web@sha256:web-remote"]}""")
+        docker.images["sha256:web-old"] = jsonObj("""{"Id":"sha256:web-old","Config":{},"RepoDigests":["web@sha256:web-remote"]}""")
 
         updater(docker).runOnce()
 
@@ -1266,32 +1261,46 @@ class UpdaterTest {
     // --- compose depends_on: condition and restart ----------------------------------------
 
     /**
-     * db + web wired the way a compose stack is wired: **no** `kodkod.depends-on` fallback label, so the
-     * only thing that can produce the edge is the `<service>:<condition>:<restart>` entry compose stamps
-     * into `com.docker.compose.depends_on`. db's image moves, web's does not.
+     * `db` and `web`, where db's image has moved and web's has not — so whatever happens to web happens
+     * because of the edge between them, and nothing else.
+     *
+     * [dependsOn], when given, is the `<service>:<condition>:<restart>` triple compose stamps into
+     * `com.docker.compose.depends_on`, and the containers then carry compose's project/service labels
+     * and **no** `kodkod.depends-on`: the edge exists only if kodkod parsed compose's own metadata.
+     * Left out, the edge comes from the `kodkod.depends-on` label instead — the non-compose spelling.
+     * One helper for both so the two label sources cannot drift apart on everything else.
      */
-    private fun composeDependentWeb(docker: FakeDockerClient, dependsOn: String, webHostConfig: String = "{}") {
+    private fun dependentWeb(
+        docker: FakeDockerClient,
+        dependsOn: String? = null,
+        webHostConfig: String = "{}",
+    ) {
+        val compose = dependsOn != null
+        val project = if (compose) """"com.docker.compose.project":"proj",""" else ""
         docker.container(
             id = "db", imageRef = "db:1", currentImageId = "sha256:db-old",
-            labels = """{"com.docker.compose.project":"proj","com.docker.compose.service":"db"}""",
+            labels = if (compose) """{$project"com.docker.compose.service":"db"}""" else "{}",
         )
         docker.container(
             id = "web", imageRef = "web:1", currentImageId = "sha256:web-old",
-            labels = """{"com.docker.compose.project":"proj","com.docker.compose.service":"web",""" +
-                """"com.docker.compose.depends_on":"$dependsOn"}""",
+            labels = if (compose) {
+                """{$project"com.docker.compose.service":"web","com.docker.compose.depends_on":"$dependsOn"}"""
+            } else {
+                """{"kodkod.depends-on":"db"}"""
+            },
             hostConfig = webHostConfig,
         )
         docker.distribution["db:1"] = "sha256:db-remote"
-        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
+        docker.images["db:1"] = jsonObj("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
         docker.distribution["web:1"] = "sha256:web-remote"
         docker.images["sha256:web-old"] =
-            json("""{"Id":"sha256:web-old","Config":{},"RepoDigests":["web@sha256:web-remote"]}""")
+            jsonObj("""{"Id":"sha256:web-old","Config":{},"RepoDigests":["web@sha256:web-remote"]}""")
     }
 
     @Test
     fun a_dependency_with_condition_service_healthy_is_awaited_before_its_dependent_starts() {
         val docker = FakeDockerClient()
-        composeDependentWeb(docker, dependsOn = "db:service_healthy:true")
+        dependentWeb(docker, dependsOn = "db:service_healthy:true")
         // The replacement's healthcheck only passes after a while — `starting` until then.
         val daemon = HealthFlip(docker, target = "new-db-0", startingProbes = 6)
 
@@ -1307,7 +1316,7 @@ class UpdaterTest {
     @Test
     fun condition_service_started_is_satisfied_by_the_dependency_being_started() {
         val docker = FakeDockerClient()
-        composeDependentWeb(docker, dependsOn = "db:service_started:false")
+        dependentWeb(docker, dependsOn = "db:service_started:false")
         docker.health["new-db-0"] = "starting" // never becomes healthy, and nothing may wait for it
 
         val log = captureLog { updater(docker, config(verifyHealth = false)).runOnce() }
@@ -1322,7 +1331,7 @@ class UpdaterTest {
     @Test
     fun a_dependency_that_never_becomes_healthy_only_delays_its_dependent() {
         val docker = FakeDockerClient()
-        composeDependentWeb(docker, dependsOn = "db:service_healthy:false")
+        dependentWeb(docker, dependsOn = "db:service_healthy:false")
         docker.health["new-db-0"] = "starting" // the healthcheck never passes
 
         val log = captureLog {
@@ -1343,7 +1352,7 @@ class UpdaterTest {
     @Test
     fun a_health_gated_dependency_without_a_healthcheck_is_not_waited_for() {
         val docker = FakeDockerClient()
-        composeDependentWeb(docker, dependsOn = "db:service_healthy:false")
+        dependentWeb(docker, dependsOn = "db:service_healthy:false")
         // No `health` entry at all: the shape of a container whose image declares no healthcheck.
 
         val log = captureLog { updater(docker, config(verifyHealth = false)).runOnce() }
@@ -1355,7 +1364,7 @@ class UpdaterTest {
     @Test
     fun by_default_a_restart_false_edge_still_restarts_the_dependent() {
         val docker = FakeDockerClient()
-        composeDependentWeb(docker, dependsOn = "db:service_started:false")
+        dependentWeb(docker, dependsOn = "db:service_started:false")
 
         updater(docker).runOnce()
 
@@ -1365,7 +1374,7 @@ class UpdaterTest {
     @Test
     fun with_the_restart_flag_respected_a_restart_false_edge_leaves_the_dependent_alone() {
         val docker = FakeDockerClient()
-        composeDependentWeb(docker, dependsOn = "db:service_started:false")
+        dependentWeb(docker, dependsOn = "db:service_started:false")
 
         updater(docker, config(respectDependsOnRestart = true)).runOnce()
 
@@ -1381,7 +1390,7 @@ class UpdaterTest {
         val docker = FakeDockerClient()
         // web shares db's network namespace: a restart is not enough, it has to be recreated against
         // the replacement — leaving it alone would leave it on a dead namespace.
-        composeDependentWeb(
+        dependentWeb(
             docker, dependsOn = "db:service_started:false",
             webHostConfig = """{"NetworkMode":"container:db"}""",
         )
@@ -1395,19 +1404,6 @@ class UpdaterTest {
     }
 
     // --- bringing dependents back ---------------------------------------------------------
-
-    /** db's image moved; web is up to date but depends on db, so web is stopped and started again. */
-    private fun dependentWeb(docker: FakeDockerClient) {
-        docker.container(id = "db", imageRef = "db:1", currentImageId = "sha256:db-old")
-        docker.container(
-            id = "web", imageRef = "web:1", currentImageId = "sha256:web-old",
-            labels = """{"kodkod.depends-on":"db"}""",
-        )
-        docker.distribution["db:1"] = "sha256:db-remote"
-        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
-        docker.distribution["web:1"] = "sha256:web-remote"
-        docker.images["sha256:web-old"] = json("""{"Id":"sha256:web-old","Config":{},"RepoDigests":["web@sha256:web-remote"]}""")
-    }
 
     @Test
     fun a_dependent_whose_start_is_refused_is_retried_until_it_comes_up() {
@@ -1446,15 +1442,6 @@ class UpdaterTest {
     }
 
     // --- stop timeout ---------------------------------------------------------------------
-
-    /** Make `web` stale so a full stop -> recreate -> stop cycle runs and records its timeouts. */
-    private fun staleWeb(docker: FakeDockerClient, labels: String = "{}", configStopTimeout: Int? = null) {
-        docker.container(
-            id = "web", imageRef = "nginx:1.27", currentImageId = "sha256:old",
-            labels = labels, configStopTimeout = configStopTimeout,
-        )
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
-    }
 
     @Test
     fun without_an_override_the_container_decides_its_own_stop_timeout() {
@@ -1599,7 +1586,7 @@ class UpdaterTest {
                 """"com.docker.compose.service":"app"}""",
         )
         docker.distribution["app:1"] = "sha256:app-remote"
-        docker.images["app:1"] = json("""{"Id":"sha256:app-new","Config":{},"RepoDigests":["app@sha256:app-remote"]}""")
+        docker.images["app:1"] = jsonObj("""{"Id":"sha256:app-new","Config":{},"RepoDigests":["app@sha256:app-remote"]}""")
         docker.container(
             id = "side", imageRef = "busybox:1", currentImageId = "sha256:side",
             currentRepoDigests = listOf("busybox@sha256:side-remote"),
@@ -1668,7 +1655,7 @@ class UpdaterTest {
                 labels = """{"kodkod.update.enable":"true"}""",
             )
         }
-        docker.images["app:1"] = json("""{"Id":"sha256:app-new","Config":{},"RepoDigests":[]}""")
+        docker.images["app:1"] = jsonObj("""{"Id":"sha256:app-new","Config":{},"RepoDigests":[]}""")
         // Joined to the *last* of them, and unlabelled: only the daemon-wide scan can find it.
         docker.container(
             id = "side", imageRef = "busybox:1", currentImageId = "sha256:side",
@@ -1867,7 +1854,7 @@ class UpdaterTest {
             id = PROVIDER_ID, name = "app", imageRef = "app:1", currentImageId = "sha256:app-old",
             labels = """{"kodkod.update.enable":"true"}""",
         )
-        docker.images["app:1"] = json("""{"Id":"sha256:app-new","Config":{},"RepoDigests":[]}""")
+        docker.images["app:1"] = jsonObj("""{"Id":"sha256:app-new","Config":{},"RepoDigests":[]}""")
         // Stale as well, which is what keeps the provider out of this cycle: the recreate the provider
         // would force on it would be built from an image ref that has moved on.
         docker.container(
@@ -1875,7 +1862,7 @@ class UpdaterTest {
             labels = """{"kodkod.update.enable":"true"}""",
             hostConfig = """{"NetworkMode":"container:$PROVIDER_ID"}""",
         )
-        docker.images["busybox:1"] = json("""{"Id":"sha256:side-new","Config":{},"RepoDigests":[]}""")
+        docker.images["busybox:1"] = jsonObj("""{"Id":"sha256:side-new","Config":{},"RepoDigests":[]}""")
         docker.failCreate += "side" // the solo recreate fails...
         docker.failStart += "side" // ...and the rollback's start does not land either
     }
@@ -2131,25 +2118,24 @@ class UpdaterTest {
      * seconds and took the service down with it. So the comparison has its own floor, which is what
      * decides everything between a second and a minute of uptime.
      */
-    @Test
-    fun a_holder_that_ran_seconds_proves_nothing_however_short_the_verify_window_is() {
-        for (verifySeconds in listOf(null, "0")) {
-            val docker = FakeDockerClient()
-            docker.orphanedBackup(id = "web-old", name = "web")
-            docker.holder(
-                id = "new-web", name = "web", state = "exited",
-                startedAt = "2026-07-01T10:00:00.000000000Z", finishedAt = "2026-07-01T10:00:20.000000000Z",
-            )
+    @ParameterizedTest(name = "KODKOD_UPDATE_VERIFY_SECONDS={0}")
+    @NullSource
+    @ValueSource(strings = ["0"])
+    fun a_holder_that_ran_seconds_proves_nothing_however_short_the_verify_window_is(verifySeconds: String?) {
+        val docker = FakeDockerClient()
+        docker.orphanedBackup(id = "web-old", name = "web")
+        docker.holder(
+            id = "new-web", name = "web", state = "exited",
+            startedAt = "2026-07-01T10:00:00.000000000Z", finishedAt = "2026-07-01T10:00:20.000000000Z",
+        )
 
-            updater(docker, config(verifySeconds = verifySeconds)).reconcileOrphanedBackups()
+        updater(docker, config(verifySeconds = verifySeconds)).reconcileOrphanedBackups()
 
-            assertOrder(docker.ops, "remove:new-web", "rename:web-old->web", "start:web-old")
-            assertTrue(
-                running(docker, "web-old"),
-                "20s of uptime is a crash loop, not an update somebody stopped on purpose " +
-                    "(KODKOD_UPDATE_VERIFY_SECONDS=${verifySeconds ?: "default"}): ${docker.ops}",
-            )
-        }
+        assertOrder(docker.ops, "remove:new-web", "rename:web-old->web", "start:web-old")
+        assertTrue(
+            running(docker, "web-old"),
+            "20s of uptime is a crash loop, not an update somebody stopped on purpose: ${docker.ops}",
+        )
     }
 
     /**
@@ -2332,7 +2318,7 @@ class UpdaterTest {
         val plan = kodkod.plan()
 
         // An operator raises the memory limit while the new image downloads.
-        docker.containers["web"] = json(
+        docker.containers["web"] = jsonObj(
             """{"Name":"/web","Image":"sha256:old","Config":{"Image":"nginx:1.27","Labels":{}},
                "HostConfig":{"Memory":536870912},"NetworkSettings":{"Networks":{}}}""",
         )
@@ -2532,7 +2518,7 @@ private fun FakeDockerClient.orphanedBackup(id: String, name: String) {
 
 /**
  * Register a running, update-eligible container plus its current image. Test bodies then layer on
- * `distribution`/`images`/`onPull` entries to drive the specific staleness path under test.
+ * `distribution`/`images` entries to drive the specific staleness path under test.
  */
 private fun FakeDockerClient.container(
     id: String,

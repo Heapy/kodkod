@@ -1,7 +1,5 @@
 package io.heapy.kodkod
 
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonObject
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
@@ -9,7 +7,6 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class UpdaterGraphTest {
-    private fun jsonObj(s: String) = Json.parseToJsonElement(s).jsonObject
 
     private fun target(
         id: String,
@@ -33,8 +30,11 @@ class UpdaterGraphTest {
     @Test
     fun splitImageRef_cases() {
         assertEquals("nginx" to "1.27", splitImageRef("nginx:1.27"))
-        assertEquals("nginx" to "latest", splitImageRef("nginx"))
-        assertEquals("registry:5000/repo" to "latest", splitImageRef("registry:5000/repo"))
+        assertEquals("nginx" to "latest", splitImageRef("nginx"), "an omitted tag is `latest`")
+        assertEquals(
+            "registry:5000/repo" to "latest", splitImageRef("registry:5000/repo"),
+            "the colon of a registry port is not a tag separator",
+        )
         assertEquals("registry:5000/repo" to "tag", splitImageRef("registry:5000/repo:tag"))
     }
 
@@ -43,7 +43,7 @@ class UpdaterGraphTest {
         val digest = jsonObj(
             """{"Descriptor":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:abc123","size":123}}""",
         ).distributionDigest()
-        assertEquals("sha256:abc123", digest)
+        assertEquals("sha256:abc123", digest, "the manifest digest is what a tag is compared against")
     }
 
     @Test
@@ -51,7 +51,10 @@ class UpdaterGraphTest {
         val inspect = jsonObj(
             """{"ImageManifestDescriptor":{"digest":"sha256:abc","platform":{"architecture":"arm64","os":"linux","variant":"v8"}}}""",
         )
-        assertEquals("linux/arm64", inspect.imagePlatform())
+        assertEquals(
+            "linux/arm64", inspect.imagePlatform(),
+            "the variant describes the OLD image's manifest and pinning it risks `no matching manifest`",
+        )
     }
 
     @Test
@@ -72,7 +75,7 @@ class UpdaterGraphTest {
         val digests = jsonObj(
             """{"RepoDigests":["registry:5000/repo@sha256:abc123","docker.io/library/nginx@sha256:def456"]}""",
         ).repoDigests()
-        assertEquals(setOf("sha256:abc123", "sha256:def456"), digests)
+        assertEquals(setOf("sha256:abc123", "sha256:def456"), digests, "the ref before the @ is not part of it")
     }
 
     @Test
@@ -84,8 +87,8 @@ class UpdaterGraphTest {
         )
         resolveLinks(listOf(web, db), "kodkod")
         assertEquals(setOf("db"), web.deps)
-        assertTrue(web.createTimeDeps.isEmpty())
-        assertTrue(db.deps.isEmpty())
+        assertTrue(web.createTimeDeps.isEmpty(), "a depends_on edge is not baked into the container")
+        assertTrue(db.deps.isEmpty(), "the edge is one-way")
     }
 
     @Test
@@ -93,7 +96,7 @@ class UpdaterGraphTest {
         val edges = parseDependsOn("db:service_healthy:true,cache:service_started:false")
         assertEquals(listOf("db", "cache"), edges.map { it.service })
         assertEquals(listOf("service_healthy", "service_started"), edges.map { it.condition })
-        assertEquals(listOf(true, false), edges.map { it.restart })
+        assertEquals(listOf(true, false), edges.map { it.restart }, "the third field is compose's restart flag")
     }
 
     @Test
@@ -170,10 +173,10 @@ class UpdaterGraphTest {
         val b = target("b", "b", labels = """{"kodkod.depends-on":"a"}""")
         val c = target("c", "c", inspect = """{"HostConfig":{"Links":["/a:/c/a"]}}""")
         resolveLinks(listOf(a, b, c), "kodkod")
-        assertEquals(setOf("a"), b.deps)
-        assertEquals(setOf("a"), c.deps)
-        assertTrue(b.createTimeDeps.isEmpty())
-        assertEquals(setOf("a"), c.createTimeDeps)
+        assertEquals(setOf("a"), b.deps, "the kodkod.depends-on label is the non-compose fallback")
+        assertEquals(setOf("a"), c.deps, "and a legacy --link is an edge in its own right")
+        assertTrue(b.createTimeDeps.isEmpty(), "a label is not baked into the container")
+        assertEquals(setOf("a"), c.createTimeDeps, "but a --link address is resolved once, at create time")
     }
 
     @Test
@@ -182,8 +185,11 @@ class UpdaterGraphTest {
         val b = target("b", "b", inspect = """{"HostConfig":{"NetworkMode":"container:a1b2c3d4e5f6"}}""")
         resolveLinks(listOf(a, b), "kodkod")
         assertEquals(setOf("a1b2c3d4e5f6"), b.deps)
-        assertEquals(setOf("a1b2c3d4e5f6"), b.createTimeDeps)
-        assertEquals("a", b.networkModeContainerName)
+        assertEquals(setOf("a1b2c3d4e5f6"), b.createTimeDeps, "a shared namespace is baked in at create time")
+        assertEquals(
+            "a", b.networkModeContainerName,
+            "captured as the NAME, the one reference that survives the provider being replaced",
+        )
     }
 
     @Test
@@ -193,52 +199,66 @@ class UpdaterGraphTest {
             assertEquals("abc123", ref)
             "provider"
         }
-        assertTrue(b.deps.isEmpty())
+        assertTrue(b.deps.isEmpty(), "the provider is outside the monitored set, so it is not an edge")
         assertTrue(b.createTimeDeps.isEmpty())
-        assertEquals("provider", b.networkModeContainerName)
+        assertEquals("provider", b.networkModeContainerName, "its name is still needed to rebuild against")
     }
 
     @Test
     fun topoSort_orders_dependencies_first() {
-        val a = target("a", "a"); val b = target("b", "b"); val c = target("c", "c")
-        b.deps = setOf("a"); c.deps = setOf("b")
+        val a = target("a", "a")
+        val b = target("b", "b")
+        val c = target("c", "c")
+        b.deps = setOf("a")
+        c.deps = setOf("b")
+
         val ordered = topoSort(listOf(c, b, a)).map { it.id }
-        assertTrue(ordered.indexOf("a") < ordered.indexOf("b"))
-        assertTrue(ordered.indexOf("b") < ordered.indexOf("c"))
+        assertTrue(ordered.indexOf("a") < ordered.indexOf("b"), "dependencies come back first: $ordered")
+        assertTrue(ordered.indexOf("b") < ordered.indexOf("c"), "and transitively so: $ordered")
     }
 
     @Test
     fun topoSort_tolerates_a_cycle() {
-        val a = target("a", "a"); val b = target("b", "b")
-        a.deps = setOf("b"); b.deps = setOf("a")
+        val a = target("a", "a")
+        val b = target("b", "b")
+        a.deps = setOf("b")
+        b.deps = setOf("a")
+
         val ordered = topoSort(listOf(a, b)).map { it.id }
-        assertEquals(setOf("a", "b"), ordered.toSet())
-        assertEquals(2, ordered.size) // every node appears exactly once
+        assertEquals(setOf("a", "b"), ordered.toSet(), "a cycle may not cost a container its update")
+        assertEquals(2, ordered.size, "and every node appears exactly once: $ordered")
     }
 
     @Test
     fun propagateLinkedRestart_is_transitive() {
-        val a = target("a", "a"); val b = target("b", "b"); val c = target("c", "c")
-        b.deps = setOf("a"); c.deps = setOf("b")
+        val a = target("a", "a")
+        val b = target("b", "b")
+        val c = target("c", "c")
+        b.deps = setOf("a")
+        c.deps = setOf("b")
         a.stale = true
+
         propagateLinkedRestart(listOf(a, b, c))
-        assertTrue(b.toRestart)
-        assertTrue(c.toRestart)
-        assertFalse(b.toRecreate)
+        assertTrue(b.toRestart, "b depends on the stale a")
+        assertTrue(c.toRestart, "and c on b — a single pass would miss this one")
+        assertFalse(b.toRecreate, "neither edge is a create-time one, so a restart is enough")
         assertFalse(c.toRecreate)
     }
 
     @Test
     fun propagateLinkedRestart_leaves_unrelated_alone() {
-        val a = target("a", "a"); val b = target("b", "b")
+        val a = target("a", "a")
+        val b = target("b", "b")
         a.stale = true
+
         propagateLinkedRestart(listOf(a, b))
-        assertFalse(b.toRestart)
+        assertFalse(b.toRestart, "nothing relates b to a")
     }
 
     @Test
     fun propagateLinkedRestart_recreates_create_time_dependents() {
-        val a = target("a", "a"); val b = target("b", "b")
+        val a = target("a", "a")
+        val b = target("b", "b")
         b.deps = setOf("a")
         b.createTimeDeps = setOf("a")
         a.stale = true
@@ -246,13 +266,15 @@ class UpdaterGraphTest {
         propagateLinkedRestart(listOf(a, b))
 
         assertTrue(b.toRestart)
-        assertTrue(b.toRecreate)
+        assertTrue(b.toRecreate, "a restart would leave b on a namespace that no longer exists")
         assertTrue(b.linkedToRecreate)
     }
 
     @Test
     fun propagateLinkedRestart_recreate_is_transitive_for_create_time_dependencies() {
-        val a = target("a", "a"); val b = target("b", "b"); val c = target("c", "c")
+        val a = target("a", "a")
+        val b = target("b", "b")
+        val c = target("c", "c")
         b.deps = setOf("a")
         b.createTimeDeps = setOf("a")
         c.deps = setOf("b")
@@ -262,6 +284,6 @@ class UpdaterGraphTest {
         propagateLinkedRestart(listOf(a, b, c))
 
         assertTrue(b.toRecreate)
-        assertTrue(c.toRecreate)
+        assertTrue(c.toRecreate, "recreating b tears down ITS namespace, so c has to follow")
     }
 }

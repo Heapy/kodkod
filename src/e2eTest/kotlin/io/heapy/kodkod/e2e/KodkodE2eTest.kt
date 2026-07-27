@@ -46,10 +46,11 @@ class KodkodE2eTest {
 
         docker("exec", "e2e-autoheal-app-1", "rm", "-f", "/tmp/healthy")
 
+        // `waitUntil` fails the test on timeout, so it *is* the assertion — see the note in
+        // `dependencyUpdateRestartsDependentAfterProvider`. Restating the condition afterwards would
+        // only add an assertion that cannot fire.
         waitUntil(60, "app restarted by kodkod") { startedAt("e2e-autoheal-app-1") != before }
-        assertNotEquals(before, startedAt("e2e-autoheal-app-1"), "StartedAt should advance after going unhealthy")
         waitUntil(30, "health recovered") { health("e2e-autoheal-app-1") == "healthy" }
-        assertEquals("healthy", health("e2e-autoheal-app-1"))
     }
 
     @Test
@@ -63,7 +64,6 @@ class KodkodE2eTest {
         publishVariant("v2")
 
         waitUntil(90, "app updated to v2") { variant("e2e-update-app-1") == "v2" }
-        assertEquals("v2", variant("e2e-update-app-1"))
         assertNotEquals(oldImage, inspect("{{.Image}}", "e2e-update-app-1"), "image id should change")
         assertTrue(
             inspect("{{range .Config.Healthcheck.Test}}{{.}} {{end}}", "e2e-update-app-1").contains("/tmp/healthy-v2"),
@@ -155,7 +155,6 @@ class KodkodE2eTest {
         publishVariant("v2")
 
         waitUntil(90, "app updated to v2") { variant("e2e-multinet-app-1") == "v2" }
-        assertEquals("v2", variant("e2e-multinet-app-1"))
         assertNotEquals(oldImage, inspect("{{.Image}}", "e2e-multinet-app-1"), "image id should change")
         val networks = inspect($$"{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}", "e2e-multinet-app-1")
         assertTrue(networks.contains("e2e-multinet_neta"), "missing neta; got: $networks")
@@ -203,7 +202,6 @@ class KodkodE2eTest {
             inspect("{{.Id}}", "e2e-cmode-sidecar-1") != oldSidecarId
         }
         val providerId = inspect("{{.Id}}", "e2e-cmode-provider-1")
-        assertEquals("v2", variant("e2e-cmode-provider-1"))
         assertNotEquals(oldProviderId, providerId, "provider id should change")
         assertNotEquals(oldConsumerId, inspect("{{.Id}}", "e2e-cmode-consumer-1"), "consumer id should change")
         assertEquals("container:$providerId", inspect("{{.HostConfig.NetworkMode}}", "e2e-cmode-consumer-1"))
@@ -231,35 +229,34 @@ class KodkodE2eTest {
         publishVariant("broken")
 
         waitUntil(90, "kodkod logged a rollback") { logHas("e2e-rollback-kodkod-1", "rolling back") }
-        assertTrue(logHas("e2e-rollback-kodkod-1", "rolling back"), "kodkod should report rollback")
 
         publishVariant("v1")
 
         waitUntil(60, "app back to running v1") { running("e2e-rollback-app-1") && variant("e2e-rollback-app-1") == "v1" }
-        assertEquals("v1", variant("e2e-rollback-app-1"))
-        assertTrue(running("e2e-rollback-app-1"))
         assertEquals(0, containerIdsByName("_kodkod_old_").size, "backup containers should be removed")
     }
 
     @Test
     @Order(8)
-    fun digestPinnedContainerIsSkipped() = e2e.scenario("digest") {
+    fun digestPinnedContainerIsSkipped() = with(e2e) {
+        // The digest has to be read before the stack comes up — `compose.digest.yml` interpolates it
+        // into the image ref — and the teardown needs it too, so it is resolved outside the scenario.
         publishVariant("v1")
-        val repoDigest = inspect("{{index .RepoDigests 0}}", "${registry}/testapp:latest")
+        val repoDigest = inspect("{{index .RepoDigests 0}}", "$registry/testapp:latest")
         val digest = repoDigest.substringAfter("@", missingDelimiterValue = "")
         assertTrue(digest.isNotBlank(), "could not read v1 RepoDigest")
         val digestEnv = mapOf("TESTAPP_DIGEST" to digest)
 
-        compose("digest", "up", "-d", env = digestEnv)
-        waitUntil(30, "pinned app up") { running("e2e-digest-app-1") }
-        val oldImage = inspect("{{.Image}}", "e2e-digest-app-1")
+        scenario("digest", env = digestEnv) {
+            compose("digest", "up", "-d", env = digestEnv)
+            waitUntil(30, "pinned app up") { running("e2e-digest-app-1") }
+            val oldImage = inspect("{{.Image}}", "e2e-digest-app-1")
 
-        publishVariant("v2")
+            publishVariant("v2")
 
-        waitUntil(50, "kodkod logged digest-pinned skip") { logHas("e2e-digest-kodkod-1", "digest-pinned") }
-        assertTrue(logHas("e2e-digest-kodkod-1", "digest-pinned"), "kodkod should skip digest-pinned container")
-        assertEquals(oldImage, inspect("{{.Image}}", "e2e-digest-app-1"))
-        compose("digest", "down", "-v", env = digestEnv)
+            waitUntil(50, "kodkod logged digest-pinned skip") { logHas("e2e-digest-kodkod-1", "digest-pinned") }
+            assertEquals(oldImage, inspect("{{.Image}}", "e2e-digest-app-1"), "the pinned container must not move")
+        }
     }
 
     @Test
@@ -278,9 +275,10 @@ class KodkodE2eTest {
             sleep(35)
 
             assertEquals(before, startedAt("e2e-self-kodkod-1"), "kodkod should not act on itself")
+            // The dummy restarting is what proves cycles ran at all — without it the assertion above
+            // would pass just as well against a kodkod that never woke up.
             waitUntil(30, "dummy restarted by monitor-all") { startedAt("e2e-self-dummy-1") != dummyBefore }
-            assertNotEquals(dummyBefore, startedAt("e2e-self-dummy-1"), "dummy should restart so cycles are proven")
-            assertTrue(running("e2e-self-dummy-1"))
+            assertTrue(running("e2e-self-dummy-1"), "and it has to be up again, not merely restarted")
         } finally {
             compose("registry", "start", check = false)
         }
@@ -388,7 +386,17 @@ class KodkodE2eTest {
 
 internal class E2eHarness {
     val root: Path = Path.of(System.getProperty("user.dir")).absolute()
-    val registry: String = System.getenv("KODKOD_E2E_REGISTRY") ?: "127.0.0.1:5000"
+
+    /**
+     * Where the throwaway registry answers — deliberately **not** configurable.
+     *
+     * All nine `e2e/compose.*.yml` files spell `127.0.0.1:5000/testapp` into their `image:` lines, and
+     * compose is what starts every stack. An override here would therefore publish the variants to one
+     * registry while every stack kept pulling from another: the containers would come up on whatever
+     * image was already local, and the suite would pass without testing an update at all. Moving the
+     * registry means moving it in the compose files in the same change.
+     */
+    val registry: String = "127.0.0.1:5000"
 
     private val useCurrentDocker = boolProperty("kodkod.e2e.useCurrentDocker")
     private val keepDind = boolProperty("kodkod.e2e.keepDind") || System.getenv("KEEP") == "1"
@@ -432,9 +440,7 @@ internal class E2eHarness {
         println("==> building kodkod:e2e (Gradle runs inside the build stage; first run is slow)")
         docker("build", "-t", "kodkod:e2e", ".")
 
-        println("==> starting local registry on $registry")
-        compose("registry", "up", "-d")
-
+        startRegistry()
         publishVariant("v1")
         println(
             """
@@ -444,6 +450,16 @@ internal class E2eHarness {
               image    : kodkod:e2e
             """.trimIndent(),
         )
+    }
+
+    /**
+     * The registry half of [setup], on its own because `DockerFixtureRecorder` needs exactly this and
+     * nothing else: it drives `Updater`/`Autoheal` in-process, so the `kodkod:e2e` image [setup] builds
+     * would be a several-minute build of something it never runs.
+     */
+    fun startRegistry() {
+        println("==> starting local registry on $registry")
+        compose("registry", "up", "-d")
     }
 
     fun close() {
@@ -515,12 +531,20 @@ internal class E2eHarness {
         error("push to $registry failed after retries")
     }
 
-    fun scenario(composeProject: String, block: E2eHarness.() -> Unit) {
+    /**
+     * Run one scenario and tear its stack down afterwards, whatever happened.
+     *
+     * [env] is handed to that teardown because a compose file may *require* a variable to be resolvable
+     * at all — `compose.digest.yml` interpolates `${TESTAPP_DIGEST:?...}` — and compose refuses to parse
+     * the file without it. A `down` that cannot parse the file leaves the whole stack running for the
+     * next scenario to trip over, and with `check = false` it does so in silence.
+     */
+    fun scenario(composeProject: String, env: Map<String, String> = emptyMap(), block: E2eHarness.() -> Unit) {
         println("[$composeProject] starting")
         try {
             block()
         } finally {
-            compose(composeProject, "down", "-v", check = false)
+            compose(composeProject, "down", "-v", check = false, env = env)
         }
     }
 
@@ -538,9 +562,6 @@ internal class E2eHarness {
 
     /** The `docker compose` plugin version (e.g. "2.29.7"), used to label recorded fixtures. */
     fun composeVersion(): String = docker("compose", "version", "--short", check = false).output.trim()
-
-    /** The Docker engine server version (e.g. "27.3.1"), used to label recorded fixtures. */
-    fun engineVersion(): String = docker("version", "--format", "{{.Server.Version}}", check = false).output.trim()
 
     fun inspect(format: String, target: String): String {
         val result = docker("inspect", "-f", format, target, check = false)
@@ -695,10 +716,6 @@ internal class E2eHarness {
         return result
     }
 
-    private fun boolProperty(name: String): Boolean {
-        return System.getProperty(name)?.trim()?.lowercase() in TRUTHY
-    }
-
     private companion object {
         val DEFAULT_COMMAND_TIMEOUT: Duration = Duration.ofMinutes(10)
         const val MAX_CAPTURE_CHARS = 128_000
@@ -709,3 +726,10 @@ internal data class CommandResult(
     val exitCode: Int,
     val output: String,
 )
+
+/**
+ * A `-Pkodkod.e2e.*` flag as Gradle hands it to the test JVM (`systemProperty`), read with the same
+ * truthiness kodkod's own labels and env use. Shared with `DockerFixtureRecorder`, which gates on
+ * `kodkod.e2e.useCurrentDocker` too and must not disagree about what "true" means.
+ */
+internal fun boolProperty(name: String): Boolean = System.getProperty(name)?.trim()?.lowercase() in TRUTHY

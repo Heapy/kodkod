@@ -6,7 +6,6 @@ import io.heapy.kodkod.Config
 import io.heapy.kodkod.DockerApi
 import io.heapy.kodkod.FixtureMeta
 import io.heapy.kodkod.RecordingDockerTransport
-import io.heapy.kodkod.TRUTHY
 import io.heapy.kodkod.UnixSocketTransport
 import io.heapy.kodkod.Updater
 import io.heapy.kodkod.str
@@ -51,17 +50,16 @@ class DockerFixtureRecorder {
     @BeforeAll
     fun setupSuite() {
         recorderDaemonMismatch(
-            useCurrentDocker = System.getProperty("kodkod.e2e.useCurrentDocker")?.trim()?.lowercase()
-                in TRUTHY,
+            useCurrentDocker = boolProperty("kodkod.e2e.useCurrentDocker"),
             dockerHost = System.getenv("DOCKER_HOST"),
             socket = socket,
         )?.let { error(it) }
 
         e2e.startDocker()
         // The recorder drives Updater/Autoheal in-process, so it does NOT need the kodkod:e2e image
-        // that E2eHarness.setup() builds — only the local registry and a published testapp:v1 baseline.
-        e2e.compose("registry", "up", "-d")
-        e2e.publishVariant("v1")
+        // E2eHarness.setup() builds — only the registry half of it. Nor a baseline testapp: every
+        // scenario that wants one publishes the variant it needs as its own first step.
+        e2e.startRegistry()
     }
 
     @AfterAll
@@ -114,10 +112,11 @@ class DockerFixtureRecorder {
         } finally {
             e2e.compose(composeFile, "down", "-v", check = false)
         }
-        writeScenario(scenario, transport.exchanges)
+        commitRecording(scenario, transport.exchanges)
     }
 
-    private fun writeScenario(scenario: String, exchanges: List<CapturedExchange>) {
+    /** Hand one scenario's captured exchanges to [FixtureWriter.commitScenario] and say where they went. */
+    private fun commitRecording(scenario: String, exchanges: List<CapturedExchange>) {
         // The order the corpus depends on lives in the writer, where a test can hold it to it.
         val dir = writer.commitScenario(
             label,

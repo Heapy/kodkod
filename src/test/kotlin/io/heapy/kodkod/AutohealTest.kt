@@ -1,58 +1,16 @@
 package io.heapy.kodkod
 
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
-import java.io.ByteArrayOutputStream
-import java.io.PrintStream
 import java.time.Instant
 
 /** Exercises [Autoheal.runOnce] against a [FakeDockerClient] — no Docker daemon required. */
 class AutohealTest {
-    private fun json(s: String): JsonObject = Json.parseToJsonElement(s).jsonObject
-
-    /**
-     * [Log] writes to stdout, and a decision autoheal takes about a *budget* has no other output than
-     * the line it logs — the operator's only evidence that a wait was truncated is that line.
-     */
-    private fun captureLog(block: () -> Unit): String {
-        val buffer = ByteArrayOutputStream()
-        val original = System.out
-        System.setOut(PrintStream(buffer, true))
-        try {
-            block()
-        } finally {
-            System.setOut(original)
-        }
-        return buffer.toString()
-    }
-
-    /**
-     * A `/containers/json` summary as the daemon returns it: compose stamps its project on every
-     * service, and `HostConfig.NetworkMode` is `container:<id>` for a shared network namespace.
-     */
-    private fun summary(
-        id: String,
-        name: String,
-        netnsOf: String? = null,
-        project: String? = "stack",
-        labels: String = "",
-        state: String = "running",
-    ): JsonObject {
-        val projectLabel = project?.let { """"com.docker.compose.project":"$it"""" }
-        val allLabels = listOfNotNull(projectLabel, labels.takeIf { it.isNotEmpty() }).joinToString(",")
-        val mode = netnsOf?.let { "container:$it" } ?: "stack_default"
-        return json(
-            """{"Id":"$id","Names":["/$name"],"State":"$state","Labels":{$allLabels},
-               "HostConfig":{"NetworkMode":"$mode"}}""",
-        )
-    }
 
     /**
      * Register a container the daemon reports as unhealthy: the listing entry *and* the health the
@@ -65,7 +23,7 @@ class AutohealTest {
         state: String = "running",
         labels: String = "{}",
     ) {
-        listed += json("""{"Id":"$id","Names":["/$name"],"State":"$state","Labels":$labels}""")
+        listed += jsonObj("""{"Id":"$id","Names":["/$name"],"State":"$state","Labels":$labels}""")
         health[id] = "unhealthy"
     }
 
@@ -82,31 +40,52 @@ class AutohealTest {
             }::get,
         )
 
-    private fun autoheal(docker: FakeDockerClient, config: Config, clock: FakeClock) =
+    /**
+     * The [Autoheal] under test. The clock is **always** a [FakeClock], even where a test never moves
+     * it: `Autoheal`'s own default is the production clock, and a cycle built on it sleeps through
+     * every probe interval for real and measures its backoff against a wall clock the test cannot see.
+     */
+    private fun autoheal(docker: FakeDockerClient, config: Config, clock: FakeClock = FakeClock()) =
         Autoheal(docker, config, selfId = null, clock = clock, sleeper = clock)
 
     /**
      * Runs [cycles] autoheal cycles [everyMs] apart on a fake clock and returns the clock time of every
-     * restart of [id] — the shape the "30s, then 60s, then 120s" of the backoff is stated in. The
+     * restart of `app` — the shape the "30s, then 60s, then 120s" of the backoff is stated in. The
      * container stays unhealthy the whole time, which is exactly the case a restart cannot fix.
      */
-    private fun restartTimes(
-        docker: FakeDockerClient,
-        config: Config,
-        cycles: Int,
-        everyMs: Long,
-        id: String = "app",
-    ): List<Long> {
+    private fun restartTimes(docker: FakeDockerClient, config: Config, cycles: Int, everyMs: Long): List<Long> {
         val clock = FakeClock()
         val autoheal = autoheal(docker, config, clock)
         val times = mutableListOf<Long>()
         repeat(cycles) {
-            val before = docker.ops.count { it == "restart:$id" }
+            val before = docker.ops.count { it == "restart:app" }
             autoheal.runOnce()
-            if (docker.ops.count { it == "restart:$id" } > before) times += clock.millis()
+            if (docker.ops.count { it == "restart:app" } > before) times += clock.millis()
             clock.advance(everyMs)
         }
         return times
+    }
+
+    /**
+     * The pair every network-namespace test is about: an unhealthy [APP] and a healthy `sidecar` that
+     * shares its namespace. Restarting `app` tears that namespace down, so what happens to the sidecar
+     * afterwards is the whole question — and it is invisible from the sidecar's own state, which stays
+     * `Running` either way.
+     */
+    private fun FakeDockerClient.appWithSidecar(
+        appLabels: String = "",
+        sidecarName: String = "sidecar",
+        sidecarState: String = "running",
+        sidecarLabels: String = "",
+    ) {
+        listed += containerSummary(APP, "app", labels = appLabels)
+        listed += containerSummary(
+            SIDE, sidecarName,
+            state = sidecarState, networkMode = "$NETNS_PREFIX$APP", labels = sidecarLabels,
+        )
+        health[APP] = "unhealthy"
+        // A stopped container has no health at all, and claiming one would make it match a health filter.
+        if (sidecarState == "running") health[SIDE] = "healthy"
     }
 
     @Test
@@ -114,7 +93,7 @@ class AutohealTest {
         val docker = FakeDockerClient()
         docker.unhealthy("app")
 
-        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = true)).runOnce()
 
         assertEquals(listOf("restart:app"), docker.ops)
     }
@@ -124,7 +103,7 @@ class AutohealTest {
         val docker = FakeDockerClient()
         docker.unhealthy("app")
 
-        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = true)).runOnce()
 
         assertEquals(
             listOf<Int?>(null), docker.restartTimeouts,
@@ -137,7 +116,7 @@ class AutohealTest {
         val docker = FakeDockerClient()
         docker.unhealthy("app", labels = """{"kodkod.stop.timeout":"45"}""")
 
-        Autoheal(docker, config(monitorAll = true, stopTimeout = "25"), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = true, stopTimeout = "25")).runOnce()
 
         assertEquals(listOf<Int?>(45), docker.restartTimeouts, "the label beats the env default")
     }
@@ -147,7 +126,7 @@ class AutohealTest {
         val docker = FakeDockerClient()
         docker.unhealthy("app")
 
-        Autoheal(docker, config(monitorAll = true, stopTimeout = "25"), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = true, stopTimeout = "25")).runOnce()
 
         assertEquals(listOf<Int?>(25), docker.restartTimeouts, "an explicitly set KODKOD_STOP_TIMEOUT is an override")
     }
@@ -157,7 +136,7 @@ class AutohealTest {
         val docker = FakeDockerClient()
         docker.unhealthy("app", labels = """{"kodkod.autoheal.enable":"false"}""")
 
-        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = true)).runOnce()
 
         assertTrue(
             docker.ops.isEmpty(),
@@ -171,7 +150,7 @@ class AutohealTest {
         val docker = FakeDockerClient()
         docker.unhealthy("app", labels = """{"kodkod.stop.timeout":"45"}""")
 
-        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = true)).runOnce()
 
         assertEquals(
             listOf<Int?>(45), docker.restartExpected,
@@ -184,7 +163,7 @@ class AutohealTest {
         val docker = FakeDockerClient()
         docker.unhealthy("app", state = "restarting")
 
-        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = true)).runOnce()
 
         assertTrue(docker.ops.isEmpty(), "a container Docker is already restarting should be left alone: ${docker.ops}")
     }
@@ -194,7 +173,7 @@ class AutohealTest {
         val docker = FakeDockerClient()
         docker.unhealthy("self", labels = """{"$SELF_LABEL":"true"}""")
 
-        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = true)).runOnce()
 
         assertTrue(docker.ops.isEmpty(), "kodkod must never restart its own container: ${docker.ops}")
     }
@@ -202,15 +181,12 @@ class AutohealTest {
     @Test
     fun restarts_the_containers_sharing_the_unhealthy_container_s_network_namespace() {
         val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app", netnsOf = null)
-        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
-        docker.health["app000000000000"] = "unhealthy"
-        docker.health["side00000000000"] = "healthy"
+        docker.appWithSidecar()
 
-        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = true)).runOnce()
 
         assertEquals(
-            listOf("restart:app000000000000", "restart:side00000000000"), docker.ops,
+            listOf("restart:$APP", "restart:$SIDE"), docker.ops,
             "a plain restart leaves a netns consumer without eth0 while it still reports Running — " +
                 "it has to be restarted after its provider",
         )
@@ -219,15 +195,12 @@ class AutohealTest {
     @Test
     fun restarts_a_consumer_that_is_not_monitored_itself() {
         val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app", labels = """"kodkod.autoheal.enable":"true"""")
-        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
-        docker.health["app000000000000"] = "unhealthy"
-        docker.health["side00000000000"] = "healthy"
+        docker.appWithSidecar(appLabels = """"kodkod.autoheal.enable":"true"""")
 
-        Autoheal(docker, config(monitorAll = false), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = false)).runOnce()
 
         assertEquals(
-            listOf("restart:app000000000000", "restart:side00000000000"), docker.ops,
+            listOf("restart:$APP", "restart:$SIDE"), docker.ops,
             "an unlabelled sidecar is exactly the one nothing else will notice is broken",
         )
     }
@@ -235,51 +208,25 @@ class AutohealTest {
     @Test
     fun leaves_a_consumer_that_is_not_running_alone() {
         val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app")
-        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000", state = "exited")
-        docker.health["app000000000000"] = "unhealthy"
+        docker.appWithSidecar(sidecarState = "exited")
 
-        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = true)).runOnce()
 
         assertEquals(
-            listOf("restart:app000000000000"), docker.ops,
+            listOf("restart:$APP"), docker.ops,
             "a stopped consumer has no namespace to lose — starting it is not autoheal's call: ${docker.ops}",
-        )
-    }
-
-    @Test
-    fun does_not_restart_consumers_when_the_provider_itself_failed_to_restart() {
-        val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app")
-        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
-        docker.health["app000000000000"] = "unhealthy"
-        docker.health["side00000000000"] = "healthy"
-        docker.failRestart += "app000000000000"
-
-        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
-
-        assertEquals(
-            listOf("restart!:app000000000000"), docker.ops,
-            "restarting the consumer of a namespace that never came back only spreads the outage: ${docker.ops}",
         )
     }
 
     @Test
     fun never_restarts_itself_as_a_consumer() {
         val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app")
-        docker.listed += summary(
-            "self00000000000", "kodkod",
-            netnsOf = "app000000000000",
-            labels = """"$SELF_LABEL":"true"""",
-        )
-        docker.health["app000000000000"] = "unhealthy"
-        docker.health["self00000000000"] = "healthy"
+        docker.appWithSidecar(sidecarName = "kodkod", sidecarLabels = """"$SELF_LABEL":"true"""")
 
-        Autoheal(docker, config(monitorAll = true), selfId = null).runOnce()
+        autoheal(docker, config(monitorAll = true)).runOnce()
 
         assertEquals(
-            listOf("restart:app000000000000"), docker.ops,
+            listOf("restart:$APP"), docker.ops,
             "kodkod restarting itself mid-cycle would abandon the rest of the pass: ${docker.ops}",
         )
     }
@@ -294,19 +241,16 @@ class AutohealTest {
     @Test
     fun a_restart_whose_answer_never_arrived_still_refreshes_the_dependents() {
         val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app")
-        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
-        docker.health["app000000000000"] = "unhealthy"
-        docker.health["side00000000000"] = "healthy"
+        docker.appWithSidecar()
         // Up since well before the restart — and brought up again by it, which is the difference.
-        docker.containers["app000000000000"] = json("""{"Name":"/app","State":{"StartedAt":"$LONG_AGO"}}""")
+        docker.containers[APP] = jsonObj("""{"Name":"/app","State":{"StartedAt":"$LONG_AGO"}}""")
         val clock = FakeClock(now = NOW)
         docker.clock = clock
 
-        Autoheal(ReadTimeout(docker, "app000000000000"), config(monitorAll = true), null, clock, clock).runOnce()
+        Autoheal(ReadTimeout(docker, APP), config(monitorAll = true), null, clock, clock).runOnce()
 
         assertEquals(
-            listOf("restart:app000000000000", "restart:side00000000000"), docker.ops,
+            listOf("restart:$APP", "restart:$SIDE"), docker.ops,
             "the daemon restarted it; only the answer was lost, and the sidecar has no eth0 either way: ${docker.ops}",
         )
     }
@@ -322,20 +266,17 @@ class AutohealTest {
     @Test
     fun a_restart_still_inside_the_graceful_stop_is_not_read_as_one_that_landed() {
         val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app")
-        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
-        docker.health["app000000000000"] = "unhealthy"
-        docker.health["side00000000000"] = "healthy"
+        docker.appWithSidecar()
         // Still the run it was in before the restart was asked for: nothing has happened to it yet.
-        docker.containers["app000000000000"] = json("""{"Name":"/app","State":{"StartedAt":"$LONG_AGO"}}""")
+        docker.containers[APP] = jsonObj("""{"Name":"/app","State":{"StartedAt":"$LONG_AGO"}}""")
         val clock = FakeClock(now = NOW)
         docker.clock = clock
-        val stuck = ReadTimeout(docker, "app000000000000", carriedOut = false)
+        val stuck = ReadTimeout(docker, APP, carriedOut = false)
 
         Autoheal(stuck, config(monitorAll = true), null, clock, clock).runOnce()
 
         assertTrue(
-            docker.ops.none { it.contains("side00000000000") },
+            docker.ops.none { it.contains(SIDE) },
             "the provider's namespace is about to be torn down, so refreshing its consumers now is exactly " +
                 "what abandons them: ${docker.ops}",
         )
@@ -345,20 +286,17 @@ class AutohealTest {
     @Test
     fun a_restart_that_really_did_not_happen_leaves_the_dependents_alone() {
         val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app")
-        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
-        docker.health["app000000000000"] = "unhealthy"
-        docker.health["side00000000000"] = "healthy"
+        docker.appWithSidecar()
         // Registered as stopped, and it stays that way: the read-back finds nothing running.
-        docker.containers["app000000000000"] = json("""{"Name":"/app","State":{"Running":false}}""")
-        docker.failRestart += "app000000000000"
+        docker.containers[APP] = jsonObj("""{"Name":"/app","State":{"Running":false}}""")
+        docker.failRestart += APP
         val clock = FakeClock(now = NOW)
         docker.clock = clock
 
-        Autoheal(ReadTimeout(docker, "app000000000000"), config(monitorAll = true), null, clock, clock).runOnce()
+        Autoheal(ReadTimeout(docker, APP), config(monitorAll = true), null, clock, clock).runOnce()
 
         assertEquals(
-            listOf("restart!:app000000000000"), docker.ops,
+            listOf("restart!:$APP"), docker.ops,
             "restarting the consumers of a namespace that never came back only spreads the outage: ${docker.ops}",
         )
         assertTrue(clock.sleeps.isNotEmpty(), "the outcome has to have been waited for, not assumed: ${clock.sleeps}")
@@ -374,18 +312,15 @@ class AutohealTest {
     @Test
     fun a_restart_the_daemon_itself_refused_is_not_waited_out() {
         val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app")
-        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
-        docker.health["app000000000000"] = "unhealthy"
-        docker.health["side00000000000"] = "healthy"
-        docker.failRestart += "app000000000000" // a real HTTP status, not a lost answer
+        docker.appWithSidecar()
+        docker.failRestart += APP // a real HTTP status, not a lost answer
         val clock = FakeClock(now = NOW)
         docker.clock = clock
 
         val log = captureLog { Autoheal(docker, config(monitorAll = true), null, clock, clock).runOnce() }
 
         assertEquals(
-            listOf("restart!:app000000000000"), docker.ops,
+            listOf("restart!:$APP"), docker.ops,
             "the consumers of a namespace that never came back are left alone either way: ${docker.ops}",
         )
         assertTrue(
@@ -410,21 +345,18 @@ class AutohealTest {
     @Test
     fun a_restart_is_given_the_time_the_containers_own_stop_window_needs() {
         val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app")
-        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
-        docker.health["app000000000000"] = "unhealthy"
-        docker.health["side00000000000"] = "healthy"
-        docker.containers["app000000000000"] =
-            json("""{"Name":"/app","Config":{"StopTimeout":120},"State":{"StartedAt":"$LONG_AGO"}}""")
+        docker.appWithSidecar()
+        docker.containers[APP] =
+            jsonObj("""{"Name":"/app","Config":{"StopTimeout":120},"State":{"StartedAt":"$LONG_AGO"}}""")
         val clock = FakeClock(now = NOW)
         docker.clock = clock
         // 120s of graceful stop, then the start: the daemon answers at ~t=125s, the socket at t=60s.
-        val late = LateRestart(docker, "app000000000000", landsAfterMs = 125_000, clock = clock)
+        val late = LateRestart(docker, APP, landsAfterMs = 125_000, clock = clock)
 
         Autoheal(late, config(monitorAll = true), null, clock, clock).runOnce()
 
         assertEquals(
-            listOf("restart!:app000000000000", "restart:side00000000000"), docker.ops,
+            listOf("restart!:$APP", "restart:$SIDE"), docker.ops,
             "the restart landed, late — giving up on it strands the sidecar on a dead namespace: ${docker.ops}",
         )
     }
@@ -439,20 +371,17 @@ class AutohealTest {
     @Test
     fun a_stop_window_no_cycle_can_afford_is_capped() {
         val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app")
-        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
-        docker.health["app000000000000"] = "unhealthy"
-        docker.health["side00000000000"] = "healthy"
-        docker.containers["app000000000000"] =
-            json("""{"Name":"/app","Config":{"StopTimeout":3600},"State":{"StartedAt":"$LONG_AGO"}}""")
+        docker.appWithSidecar()
+        docker.containers[APP] =
+            jsonObj("""{"Name":"/app","Config":{"StopTimeout":3600},"State":{"StartedAt":"$LONG_AGO"}}""")
         val clock = FakeClock(now = NOW)
         docker.clock = clock
-        val late = LateRestart(docker, "app000000000000", landsAfterMs = 400_000, clock = clock)
+        val late = LateRestart(docker, APP, landsAfterMs = 400_000, clock = clock)
 
         val log = captureLog { Autoheal(late, config(monitorAll = true), null, clock, clock).runOnce() }
 
         assertEquals(
-            listOf("restart!:app000000000000"), docker.ops,
+            listOf("restart!:$APP"), docker.ops,
             "an hour of stop window is not an hour the rest of the host may be held for: ${docker.ops}",
         )
         assertTrue(
@@ -465,19 +394,16 @@ class AutohealTest {
     @Test
     fun a_restart_that_lands_past_every_budget_is_still_treated_as_lost() {
         val docker = FakeDockerClient()
-        docker.listed += summary("app000000000000", "app")
-        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
-        docker.health["app000000000000"] = "unhealthy"
-        docker.health["side00000000000"] = "healthy"
-        docker.containers["app000000000000"] = json("""{"Name":"/app","State":{"StartedAt":"$LONG_AGO"}}""")
+        docker.appWithSidecar()
+        docker.containers[APP] = jsonObj("""{"Name":"/app","State":{"StartedAt":"$LONG_AGO"}}""")
         val clock = FakeClock(now = NOW)
         docker.clock = clock
-        val late = LateRestart(docker, "app000000000000", landsAfterMs = 125_000, clock = clock)
+        val late = LateRestart(docker, APP, landsAfterMs = 125_000, clock = clock)
 
         Autoheal(late, config(monitorAll = true), null, clock, clock).runOnce()
 
         assertEquals(
-            listOf("restart!:app000000000000"), docker.ops,
+            listOf("restart!:$APP"), docker.ops,
             "nothing said this container needs longer, and waiting forever holds up every other one: ${docker.ops}",
         )
     }
@@ -746,3 +672,10 @@ private val NOW = Instant.parse("2026-07-01T12:00:00Z").toEpochMilli()
 
 /** `State.StartedAt` of a container that has been up since long before this cycle. */
 private const val LONG_AGO = "2026-07-01T10:00:00.000000000Z"
+
+/**
+ * Ids long enough for the daemon's own prefix matching to have something to work with — a `container:`
+ * reference may be spelled as a 12-character short id, and an id of five characters cannot be one.
+ */
+private const val APP = "app000000000000"
+private const val SIDE = "side00000000000"

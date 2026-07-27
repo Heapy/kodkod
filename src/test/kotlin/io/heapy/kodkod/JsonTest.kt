@@ -1,7 +1,5 @@
 package io.heapy.kodkod
 
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonObject
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
@@ -10,7 +8,6 @@ import org.junit.jupiter.api.Test
 import java.time.Instant
 
 class JsonTest {
-    private fun jsonObj(s: String) = Json.parseToJsonElement(s).jsonObject
 
     @Test
     fun accessors_read_or_return_null() {

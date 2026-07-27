@@ -110,7 +110,7 @@ internal class FixtureWriter(
     }
 
     /** `0001.GET.containers-json.bin` — ordered, and readable enough to diff a re-recording by eye. */
-    fun responseFileName(seq: Int, method: String, path: String): String {
+    private fun responseFileName(seq: Int, method: String, path: String): String {
         val hint = path.substringBefore('?').trim('/')
             .replace(Regex("[^A-Za-z0-9]+"), "-").trim('-').take(40).ifEmpty { "root" }
         return "%04d.%s.%s.bin".format(seq, method, hint)

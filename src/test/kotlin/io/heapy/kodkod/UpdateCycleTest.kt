@@ -1,9 +1,7 @@
 package io.heapy.kodkod
 
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonObject
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -18,7 +16,6 @@ import java.util.concurrent.locks.ReentrantLock
 class UpdateCycleTest {
     private val clock = FakeClock()
 
-    private fun json(s: String): JsonObject = Json.parseToJsonElement(s).jsonObject
 
     private fun config(): Config = Config.fromEnv(mapOf("KODKOD_UPDATE_MONITOR_ALL" to "true")::get)
 
@@ -26,13 +23,13 @@ class UpdateCycleTest {
 
     /** A stale `web`, the smallest cycle that both plans and mutates. */
     private fun staleWeb(docker: FakeDockerClient) {
-        docker.listed += json("""{"Id":"web","Names":["/web"],"State":"running","Labels":{}}""")
-        docker.containers["web"] = json(
+        docker.listed += jsonObj("""{"Id":"web","Names":["/web"],"State":"running","Labels":{}}""")
+        docker.containers["web"] = jsonObj(
             """{"Name":"/web","Image":"sha256:old","Config":{"Image":"nginx:1.27","Labels":{}},
                "HostConfig":{},"NetworkSettings":{"Networks":{}}}""",
         )
-        docker.images["sha256:old"] = json("""{"Id":"sha256:old","Config":{},"RepoDigests":[]}""")
-        docker.images["nginx:1.27"] = json("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
+        docker.images["sha256:old"] = jsonObj("""{"Id":"sha256:old","Config":{},"RepoDigests":[]}""")
+        docker.images["nginx:1.27"] = jsonObj("""{"Id":"sha256:new","Config":{},"RepoDigests":[]}""")
     }
 
     /**
@@ -75,8 +72,8 @@ class UpdateCycleTest {
     fun a_planning_failure_does_not_take_the_reconcile_with_it() {
         val lock = ReentrantLock()
         val docker = FakeDockerClient()
-        docker.listed += json("""{"Id":"web-old","Names":["/web_kodkod_old_web-old"],"State":"exited","Labels":{}}""")
-        docker.containers["web-old"] = json(
+        docker.listed += jsonObj("""{"Id":"web-old","Names":["/web_kodkod_old_web-old"],"State":"exited","Labels":{}}""")
+        docker.containers["web-old"] = jsonObj(
             """{"Name":"/web_kodkod_old_web-old","Config":{},"HostConfig":{},
                "NetworkSettings":{"Networks":{}},"State":{"Running":false}}""",
         )
@@ -92,17 +89,11 @@ class UpdateCycleTest {
     @Test
     fun a_planning_failure_is_reported_rather_than_cancelling_the_schedule() {
         val docker = FakeDockerClient()
-        val buffer = java.io.ByteArrayOutputStream()
-        val original = System.out
-        System.setOut(java.io.PrintStream(buffer, true))
-        try {
-            updateCycle(ReentrantLock(), updater(NoDiscovery(docker))).run()
-        } finally {
-            System.setOut(original)
-        }
+
+        val log = captureLog { updateCycle(ReentrantLock(), updater(NoDiscovery(docker))).run() }
 
         assertTrue(
-            buffer.toString().contains("planning failed"),
+            log.contains("planning failed"),
             "scheduleWithFixedDelay drops a task whose exception escapes — it has to be caught and named",
         )
     }

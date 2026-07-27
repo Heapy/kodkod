@@ -12,7 +12,6 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class ImageDefaultsTest {
-    private fun jsonObj(s: String): JsonObject = Json.parseToJsonElement(s).jsonObject
     private fun jsonArr(s: String): JsonArray = Json.parseToJsonElement(s) as JsonArray
 
     @Test

@@ -1,6 +1,5 @@
 package io.heapy.kodkod
 
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -78,9 +77,6 @@ class FakeDockerClient : DockerClient {
      */
     val platforms = mutableListOf<String?>()
 
-    /** Invoked from [pull]; lets a test mutate [images] to simulate a freshly-pulled (moved) tag. */
-    var onPull: (repo: String, tag: String) -> Unit = { _, _ -> }
-
     /** Container names for which [create] should throw — used to drive the recreate rollback path. */
     val failCreate = mutableSetOf<String>()
 
@@ -156,7 +152,7 @@ class FakeDockerClient : DockerClient {
         return result
     }
 
-    override fun version(): JsonObject = obj("""{"Version":"0.0.0-fake","ApiVersion":"1.45"}""")
+    override fun version(): JsonObject = jsonObj("""{"Version":"0.0.0-fake","ApiVersion":"1.45"}""")
 
     /** When set, [listContainers] throws — the daemon being unreachable mid-cycle. */
     var failList = false
@@ -463,14 +459,11 @@ class FakeDockerClient : DockerClient {
 
     override fun inspectDistribution(ref: String, registryAuth: String?): JsonObject {
         val digest = distribution[ref] ?: error("fake: no distribution registered for ref '$ref'")
-        return obj("""{"Descriptor":{"digest":"$digest"}}""")
+        return jsonObj("""{"Descriptor":{"digest":"$digest"}}""")
     }
 
     override fun pull(fromImage: String, tag: String, registryAuth: String?, platform: String?) {
-        op("pull", "$fromImage:$tag") {
-            platforms += platform
-            onPull(fromImage, tag)
-        }
+        op("pull", "$fromImage:$tag") { platforms += platform }
     }
 
     private companion object {
@@ -483,6 +476,5 @@ class FakeDockerClient : DockerClient {
         /** `State` fields this fake owns; anything else in a registered payload is passed through. */
         val COMPUTED_STATE_KEYS = setOf("Running", "ExitCode")
 
-        fun obj(json: String): JsonObject = Json.parseToJsonElement(json).jsonObject
     }
 }

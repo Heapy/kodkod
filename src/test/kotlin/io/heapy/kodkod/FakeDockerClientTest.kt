@@ -1,7 +1,5 @@
 package io.heapy.kodkod
 
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
@@ -19,13 +17,12 @@ import org.junit.jupiter.api.Test
  * mutation read as a successful one.
  */
 class FakeDockerClientTest {
-    private fun json(s: String): JsonObject = Json.parseToJsonElement(s).jsonObject
 
     private val docker = FakeDockerClient()
 
     private fun summary(id: String, state: String? = null, labels: String = "{}") {
         val stateField = state?.let { ""","State":"$it"""" }.orEmpty()
-        docker.listed += json("""{"Id":"$id","Names":["/$id"]$stateField,"Labels":$labels}""")
+        docker.listed += jsonObj("""{"Id":"$id","Names":["/$id"]$stateField,"Labels":$labels}""")
     }
 
     private fun ids(all: Boolean, filters: Map<String, List<String>> = emptyMap()): List<String> =
@@ -117,7 +114,7 @@ class FakeDockerClientTest {
     @Test
     fun a_removed_container_is_gone_from_every_listing_and_answers_404() {
         summary("web", state = "running")
-        docker.containers["web"] = json("""{"Name":"/web"}""")
+        docker.containers["web"] = jsonObj("""{"Name":"/web"}""")
 
         docker.remove("web", force = true)
 
@@ -134,7 +131,7 @@ class FakeDockerClientTest {
      */
     @Test
     fun an_inspect_resolves_a_reference_by_id_name_or_prefix() {
-        docker.containers["abcdef123456"] = json("""{"Name":"/web"}""")
+        docker.containers["abcdef123456"] = jsonObj("""{"Name":"/web"}""")
 
         assertEquals("/web", docker.inspectContainer("abcdef123456").str("Name"), "by full id")
         assertEquals("/web", docker.inspectContainer("web").str("Name"), "by the name it answers to")
@@ -151,7 +148,7 @@ class FakeDockerClientTest {
 
     @Test
     fun a_created_container_is_listed_as_created_and_becomes_running_when_started() {
-        val id = docker.create("web", json("""{"Image":"app:1","Labels":{"a":"b"}}"""), platform = null)
+        val id = docker.create("web", jsonObj("""{"Image":"app:1","Labels":{"a":"b"}}"""), platform = null)
 
         assertEquals(emptyList<String>(), ids(all = false), "a created container is not up yet")
         assertEquals(listOf(id), ids(all = true, filters = mapOf("label" to listOf("a=b"))))
@@ -170,7 +167,7 @@ class FakeDockerClientTest {
      */
     @Test
     fun a_listing_describes_containers_the_way_it_filtered_them() {
-        val id = docker.create("web", json("""{"Image":"app:1"}"""), platform = null)
+        val id = docker.create("web", jsonObj("""{"Image":"app:1"}"""), platform = null)
         docker.start(id)
         summary("db", state = "running")
         docker.stop("db", timeout = null, expectedStopSeconds = null)
@@ -223,7 +220,7 @@ class FakeDockerClientTest {
     fun a_failed_create_is_marked_and_records_no_body() {
         docker.failCreate += "web"
 
-        assertThrows(DockerException::class.java) { docker.create("web", json("""{"Image":"app:1"}"""), platform = null) }
+        assertThrows(DockerException::class.java) { docker.create("web", jsonObj("""{"Image":"app:1"}"""), platform = null) }
 
         assertEquals(listOf("create!:web"), docker.ops)
         assertTrue(docker.created.isEmpty(), "a create that threw produced no body")
@@ -245,7 +242,7 @@ class FakeDockerClientTest {
 
     @Test
     fun successful_mutations_are_recorded_without_a_marker() {
-        docker.create("web", json("{}"), platform = null)
+        docker.create("web", jsonObj("{}"), platform = null)
         docker.start("new-web-0")
         docker.rename("new-web-0", "web2")
         docker.remove("new-web-0", force = true)
@@ -270,7 +267,7 @@ class FakeDockerClientTest {
 
     @Test
     fun a_container_that_exits_right_after_start_inspects_as_dead() {
-        docker.containers["web"] = json("""{"Name":"/web"}""")
+        docker.containers["web"] = jsonObj("""{"Name":"/web"}""")
         docker.startedThenExits += "web"
 
         docker.start("web")
@@ -282,7 +279,7 @@ class FakeDockerClientTest {
 
     @Test
     fun start_and_stop_move_the_inspected_running_flag() {
-        docker.containers["web"] = json("""{"Name":"/web"}""")
+        docker.containers["web"] = jsonObj("""{"Name":"/web"}""")
 
         assertTrue(running("web"), "a registered container is running until told otherwise")
         docker.stop("web", timeout = 10)
@@ -293,7 +290,7 @@ class FakeDockerClientTest {
 
     @Test
     fun health_is_reported_through_inspect_and_other_state_fields_survive() {
-        docker.containers["web"] = json("""{"Name":"/web","State":{"Restarting":true,"Status":"running"}}""")
+        docker.containers["web"] = jsonObj("""{"Name":"/web","State":{"Restarting":true,"Status":"running"}}""")
         docker.health["web"] = "unhealthy"
 
         val state = docker.inspectContainer("web").obj("State")!!
@@ -310,7 +307,7 @@ class FakeDockerClientTest {
     fun a_start_stamps_the_moment_it_happened_at() {
         val clock = FakeClock(now = 1_700_000_000_000)
         docker.clock = clock
-        docker.containers["web"] = json("""{"Name":"/web","State":{"StartedAt":"2020-01-01T00:00:00Z"}}""")
+        docker.containers["web"] = jsonObj("""{"Name":"/web","State":{"StartedAt":"2020-01-01T00:00:00Z"}}""")
 
         assertEquals(
             "2020-01-01T00:00:00Z", docker.inspectContainer("web").obj("State")?.str("StartedAt"),
@@ -328,7 +325,7 @@ class FakeDockerClientTest {
     @Test
     fun a_restart_the_daemon_refused_leaves_the_start_time_where_it_was() {
         docker.clock = FakeClock(now = 1_700_000_000_000)
-        docker.containers["web"] = json("""{"Name":"/web","State":{"StartedAt":"2020-01-01T00:00:00Z"}}""")
+        docker.containers["web"] = jsonObj("""{"Name":"/web","State":{"StartedAt":"2020-01-01T00:00:00Z"}}""")
         docker.failRestart += "web"
 
         assertThrows(DockerException::class.java) { docker.restart("web", timeout = null) }
@@ -341,8 +338,8 @@ class FakeDockerClientTest {
 
     @Test
     fun a_name_a_live_container_holds_cannot_be_taken_from_it() {
-        docker.containers["web"] = json("""{"Name":"/web"}""")
-        docker.containers["old"] = json("""{"Name":"/web_old"}""")
+        docker.containers["web"] = jsonObj("""{"Name":"/web"}""")
+        docker.containers["old"] = jsonObj("""{"Name":"/web_old"}""")
 
         val conflict = assertThrows(DockerException::class.java) { docker.rename("old", "web") }
         assertEquals(409, conflict.status, "the daemon's name index refuses this, and so must the fake")
@@ -355,9 +352,9 @@ class FakeDockerClientTest {
 
     @Test
     fun a_created_container_becomes_inspectable_unless_the_test_described_it_first() {
-        val plain = docker.create("web", json("{}"), platform = null)
-        docker.containers["new-db-1"] = json("""{"Name":"/db","State":{"Restarting":true}}""")
-        val described = docker.create("db", json("{}"), platform = null)
+        val plain = docker.create("web", jsonObj("{}"), platform = null)
+        docker.containers["new-db-1"] = jsonObj("""{"Name":"/db","State":{"Restarting":true}}""")
+        val described = docker.create("db", jsonObj("{}"), platform = null)
 
         assertEquals("new-web-0", plain)
         assertEquals("/web", docker.inspectContainer(plain).str("Name"), "the daemon knows what it just created")
@@ -378,8 +375,8 @@ class FakeDockerClientTest {
      */
     @Test
     fun a_container_cannot_join_the_namespace_of_one_that_is_gone_or_down() {
-        docker.containers["app"] = json("""{"Name":"/app"}""")
-        docker.containers["side"] = json("""{"Name":"/side","HostConfig":{"NetworkMode":"container:app"}}""")
+        docker.containers["app"] = jsonObj("""{"Name":"/app"}""")
+        docker.containers["side"] = jsonObj("""{"Name":"/side","HostConfig":{"NetworkMode":"container:app"}}""")
 
         docker.start("side")
         assertTrue(running("side"), "the provider is up, so this is an ordinary start")
@@ -396,11 +393,11 @@ class FakeDockerClientTest {
     /** By name, id or short id — whichever spelling the reference uses, the daemon resolves it. */
     @Test
     fun a_namespace_reference_resolves_the_way_the_daemon_resolves_it() {
-        docker.containers["app1234567890abcdef"] = json("""{"Name":"/app"}""")
-        docker.containers["byName"] = json("""{"Name":"/a","HostConfig":{"NetworkMode":"container:app"}}""")
+        docker.containers["app1234567890abcdef"] = jsonObj("""{"Name":"/app"}""")
+        docker.containers["byName"] = jsonObj("""{"Name":"/a","HostConfig":{"NetworkMode":"container:app"}}""")
         docker.containers["byId"] =
-            json("""{"Name":"/b","HostConfig":{"NetworkMode":"container:app1234567890abcdef"}}""")
-        docker.containers["byShortId"] = json("""{"Name":"/c","HostConfig":{"NetworkMode":"container:app123456"}}""")
+            jsonObj("""{"Name":"/b","HostConfig":{"NetworkMode":"container:app1234567890abcdef"}}""")
+        docker.containers["byShortId"] = jsonObj("""{"Name":"/c","HostConfig":{"NetworkMode":"container:app123456"}}""")
 
         listOf("byName", "byId", "byShortId").forEach { docker.start(it) }
 
