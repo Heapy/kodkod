@@ -32,6 +32,13 @@ jobs:
         with:
           distribution: liberica
           java-version: "25"
+      # The half of the DockerClient contract that a real daemon has to answer. It cannot run against
+      # the suite's dind (DockerApi speaks only to a unix socket, dind is reachable over TCP), so it
+      # runs against the runner's own daemon — safe here because the runner is disposable and the
+      # contract only ever touches containers it named `kodkod-contract-*`. First because it is cheap
+      # and because "the fake invented this" is the most useful thing a failing e2e run can tell you.
+      - name: "Run the DockerClient contract against the runner's daemon"
+        run: ./gradlew --no-daemon e2eTest -Pkodkod.e2e.useCurrentDocker=true --tests '*DockerApiContractTest*'
       - name: "Run E2E tests"
         run: ./gradlew --no-daemon e2eTest
 

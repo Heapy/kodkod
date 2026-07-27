@@ -90,9 +90,8 @@ class is **skipped**, not run against the wrong daemon.
 It is safe to point at a working machine: every container it makes is named `kodkod-contract-*`,
 nothing else is listed, renamed or removed, and each test cleans up after itself.
 
-> **Note.** The CI job runs plain `./gradlew e2eTest`, so this class is skipped there. Until CI runs
-> it too (`TODO.md`), the daemon half of the contract is only checked when somebody runs the command
-> above — which is worth doing before trusting a change that taught the fake something new.
+CI runs exactly this command, against the runner's own daemon, before the dind suite — so the daemon
+half of the contract is checked on every push, not only when somebody remembers to.
 
 Useful dind overrides:
 

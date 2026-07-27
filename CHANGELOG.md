@@ -49,6 +49,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`src/test/resources/docker-fixtures/engine-<ver>_compose-<ver>`) by an opt-in e2e recorder and
   replayed through the real `DockerApi` in unit tests. See `E2E_TESTING.md`.
 - CI job running the Docker-backed e2e suite.
+- That CI job also runs the daemon half of the `DockerClient` contract, against the runner's own
+  daemon, before the dind suite. It cannot run against dind — `DockerApi` speaks only to a unix socket
+  — so without it the half that catches the fake inventing behaviour runs nowhere automatically, which
+  is how both inventions it has found so far were found by hand.
 
 ### Changed
 - The update cycle is split into a read-only `plan()` (list, inspect, registry probe, pull) and a

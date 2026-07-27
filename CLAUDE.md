@@ -82,7 +82,8 @@ recreate containers whose image tag moved (update). Kotlin, one runtime dependen
   brings a new compose file or `Dockerfile.<variant>`.
 - A changed request method/path/query → re-record the fixture corpus (see above).
 - Behaviour taught to `FakeDockerClient` → a case in `DockerClientContract`, so a real daemon has to
-  demonstrate it too, and a run of `DockerApiContractTest` before trusting it (see `E2E_TESTING.md`).
+  demonstrate it too. CI runs that half against the runner's daemon on every push; locally it is
+  `./gradlew e2eTest -Pkodkod.e2e.useCurrentDocker=true --tests '*DockerApiContractTest*'`.
 - A new rule about what the cycle may leave behind → an invariant in `UpdateCycleModelTest`, not only
   a hand-written scenario. That suite generates the stacks instead of listing them, which is the only
   thing here that reaches a four-event sequence nobody thought to write down. Prove a new invariant
