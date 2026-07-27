@@ -6,6 +6,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.io.ByteArrayOutputStream
@@ -361,6 +362,40 @@ class AutohealTest {
             "restarting the consumers of a namespace that never came back only spreads the outage: ${docker.ops}",
         )
         assertTrue(clock.sleeps.isNotEmpty(), "the outcome has to have been waited for, not assumed: ${clock.sleeps}")
+    }
+
+    /**
+     * The read-back is for an answer that never came, and only for that. A daemon that *did* answer —
+     * no such container, a conflict, an internal error — has given its verdict, and spending 60s per
+     * container waiting for it to change is 60s of the shared cycle lock: every other unhealthy
+     * container in this cycle, and the whole mutating half of the update cycle, wait behind it. The log
+     * would say the daemon "gave no usable answer" while quoting the answer it gave.
+     */
+    @Test
+    fun a_restart_the_daemon_itself_refused_is_not_waited_out() {
+        val docker = FakeDockerClient()
+        docker.listed += summary("app000000000000", "app")
+        docker.listed += summary("side00000000000", "sidecar", netnsOf = "app000000000000")
+        docker.health["app000000000000"] = "unhealthy"
+        docker.health["side00000000000"] = "healthy"
+        docker.failRestart += "app000000000000" // a real HTTP status, not a lost answer
+        val clock = FakeClock(now = NOW)
+        docker.clock = clock
+
+        val log = captureLog { Autoheal(docker, config(monitorAll = true), null, clock, clock).runOnce() }
+
+        assertEquals(
+            listOf("restart!:app000000000000"), docker.ops,
+            "the consumers of a namespace that never came back are left alone either way: ${docker.ops}",
+        )
+        assertTrue(
+            clock.sleeps.isEmpty(),
+            "and nothing may be waited out: the daemon already said what happened: ${clock.sleeps}",
+        )
+        assertFalse(
+            log.contains("gave no usable answer"),
+            "a 500 from the daemon is a usable answer, and reporting it as silence is a falsehood: $log",
+        )
     }
 
     /**

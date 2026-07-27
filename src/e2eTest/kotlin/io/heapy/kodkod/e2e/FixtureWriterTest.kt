@@ -54,23 +54,22 @@ class FixtureWriterTest {
 
     @Test
     fun a_recorded_scenario_lands_with_bodies_manifest_and_index_entry() {
-        val writer = FixtureWriter(root)
-
-        val dir = writer.writeScenario(
+        val dir = FixtureWriter(root).commitScenario(
             "engine-1_compose-2",
             "update-recreate",
             listOf(
                 exchange("GET", "/containers/json?all=false", "[]"),
                 exchange("POST", "/containers/abc/stop", ""),
             ),
+            META,
         )
-        writer.upsertIndex("engine-1_compose-2", "update-recreate")
 
         val manifest = json.decodeFromString(FixtureManifest.serializer(), Files.readString(dir.resolve("manifest.json")))
         assertEquals(listOf("0001.GET.containers-json.bin", "0002.POST.containers-abc-stop.bin"), manifest.exchanges.map { it.responseFile })
         assertEquals(listOf("/containers/json?all=false", "/containers/abc/stop"), manifest.exchanges.map { it.path })
         assertEquals("[]", Files.readString(dir.resolve("0001.GET.containers-json.bin")))
         assertEquals(listOf("update-recreate"), index().labels.single().scenarios)
+        assertTrue(Files.exists(root.resolve("engine-1_compose-2/meta.json")), "the engine the corpus came from")
     }
 
     @Test
@@ -140,6 +139,12 @@ class FixtureWriterTest {
         assertEquals(emptyList<Path>(), leftovers(label))
     }
 
+    /**
+     * Through the whole commit, which is the only way this claim can be tested: the index entry is the
+     * last thing written, so a body that never lands takes the index entry with it. Asserted against
+     * `FixtureWriter.writeScenario` alone it was a tautology — that method cannot reach `index.json` at
+     * all, and the ordering it was supposed to protect lived in the recorder, untested.
+     */
     @Test
     fun a_failed_recording_does_not_leave_a_stub_in_the_index() {
         val label = "engine-1_compose-2"
@@ -147,11 +152,14 @@ class FixtureWriterTest {
         val writer = FixtureWriter(root, failingOn("0001"))
 
         assertThrows(IOException::class.java) {
-            writer.writeScenario(label, "deps-ordered", listOf(exchange("GET", "/version", "{}")))
+            writer.commitScenario(label, "deps-ordered", listOf(exchange("GET", "/version", "{}")), META)
         }
-        // ...and again: `upsertIndex` is unreachable after the throw, which is what keeps the index honest.
 
-        assertEquals(listOf("update-recreate"), index().labels.single().scenarios)
+        assertEquals(
+            listOf("update-recreate"), index().labels.single().scenarios,
+            "the replay suite loads exactly what the index names, so a scenario named there and missing " +
+                "from disk fails every later run",
+        )
         assertTrue(Files.notExists(root.resolve(label).resolve("deps-ordered")))
         assertEquals(emptyList<Path>(), leftovers(label))
     }
@@ -205,5 +213,8 @@ class FixtureWriterTest {
 
     private companion object {
         const val SOCKET = "/var/run/docker.sock"
+
+        /** What the recorder stamps a label with; irrelevant to every assertion but required to commit. */
+        val META = FixtureMeta("29.5.2", "1.52", "5.1.4", "2026-07-27T00:00:00Z")
     }
 }

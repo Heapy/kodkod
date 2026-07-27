@@ -156,6 +156,24 @@ class DependentsTest {
         )
     }
 
+    /**
+     * The scan is two listings — the provider's own compose project, then the whole daemon — and losing
+     * the second one is not the same as losing the first. What the narrow listing already found are
+     * containers sharing a namespace that is about to be torn down; dropping them because a *wider*
+     * listing failed leaves exactly those containers `Running` with no interfaces, which is the failure
+     * this whole scan exists to prevent.
+     */
+    @Test
+    fun a_failed_daemon_wide_listing_keeps_the_dependents_the_project_listing_found() {
+        val docker = docker(container("side1", "sidecar", networkMode = "container:$providerId"))
+        docker.failListWhen = { filters -> filters.isEmpty() }
+
+        assertEquals(
+            listOf("side1"), findDependents(docker, provider()).map { it.id },
+            "the in-project sidecar was already found, and its namespace dies either way",
+        )
+    }
+
     @Test
     fun link_entries_are_read_in_both_spellings() {
         assertEquals("db", linkSource("/db:/web/db"), "inspect spells a link with leading slashes")

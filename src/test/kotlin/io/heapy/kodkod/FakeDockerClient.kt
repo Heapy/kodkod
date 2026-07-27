@@ -157,12 +157,19 @@ class FakeDockerClient : DockerClient {
     /** When set, [listContainers] throws — the daemon being unreachable mid-cycle. */
     var failList = false
 
+    /**
+     * Which *individual* listings throw, by the filters they were asked with. A single boolean cannot
+     * express a caller that makes two listings and has to survive losing one of them: with both gone,
+     * only the first failure is ever exercised. The whole-daemon listing is `emptyMap()`.
+     */
+    var failListWhen: (Map<String, List<String>>) -> Boolean = { false }
+
     /** Filter maps passed to [listContainers], in call order — proof of how wide a scan really was. */
     val listFilters = mutableListOf<Map<String, List<String>>>()
 
     override fun listContainers(all: Boolean, filters: Map<String, List<String>>): JsonArray {
         listFilters += filters
-        if (failList) throw DockerException(500, "fake: list failure")
+        if (failList || failListWhen(filters)) throw DockerException(500, "fake: list failure")
         return JsonArray(listed.filter { matches(it, all, filters) }.map(::asListedNow))
     }
 

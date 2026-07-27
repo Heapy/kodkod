@@ -1111,6 +1111,53 @@ class UpdaterTest {
     }
 
     /**
+     * A hold-back follows the create-time edges of the container it lands on, or it holds nothing back
+     * at all. `c` shares `b`'s namespace and `b` shares `a`'s; only `c` has an update pending, so `c`
+     * keeps `b` out of the cycle — and `b` has to keep `a` out for the same reason, since replacing `a`
+     * is what would drag `b` along.
+     *
+     * Stopping at the first link is not a smaller version of the same behaviour, it is the failure the
+     * hold-back exists to prevent: `a` is replaced, `b` is recreated by the daemon-wide pass to follow
+     * it, and the `c` this cycle has just built — which the pass counts as handled — is left joined to
+     * the namespace `b`'s recreate destroyed. `Running`, no interfaces, and not one line about it.
+     */
+    @Test
+    fun a_hold_back_follows_the_namespace_chain_past_the_container_it_lands_on() {
+        val docker = FakeDockerClient()
+        docker.container(
+            id = A_ID, name = "a", imageRef = "a:1", currentImageId = "sha256:a-old",
+            labels = """{"kodkod.update.enable":"true"}""",
+        )
+        docker.images["a:1"] = json("""{"Id":"sha256:a-new","Config":{},"RepoDigests":[]}""")
+        // Up to date, and joined to a's namespace: nothing but a's update can put it in motion.
+        docker.container(
+            id = B_ID, name = "b", imageRef = "b:1", currentImageId = "sha256:b-cur",
+            labels = """{"kodkod.update.enable":"true"}""",
+            hostConfig = """{"NetworkMode":"container:$A_ID"}""",
+        )
+        docker.images["b:1"] = json("""{"Id":"sha256:b-cur","Config":{},"RepoDigests":[]}""")
+        docker.container(
+            id = C_ID, name = "c", imageRef = "c:1", currentImageId = "sha256:c-old",
+            labels = """{"kodkod.update.enable":"true"}""",
+            hostConfig = """{"NetworkMode":"container:$B_ID"}""",
+        )
+        docker.images["c:1"] = json("""{"Id":"sha256:c-new","Config":{},"RepoDigests":[]}""")
+
+        updater(docker, config(monitorAll = false)).runOnce()
+
+        assertTrue(docker.ops.contains("create:c"), "c's own update is the one thing that is safe: ${docker.ops}")
+        assertTrue(
+            docker.ops.none { it == "create:a" || it == "stop:$A_ID" },
+            "a is two links away from the update that is happening, and replacing it takes b — and " +
+                "therefore c's brand-new container — down with it: ${docker.ops}",
+        )
+        assertTrue(
+            docker.ops.none { it == "create:b" || it == "restart:$B_ID" },
+            "and b, whose namespace c is joined to, must not be rebuilt behind c's back: ${docker.ops}",
+        )
+    }
+
+    /**
      * The memory is about the *image*, and only a replacement that was actually asked to run says
      * anything about it. A name conflict, a refused stop or a create the daemon rejected happen with
      * any image — remembering those would freeze a perfectly good update for six hours over a blip.
@@ -1902,6 +1949,56 @@ class UpdaterTest {
         assertTrue(running(docker, "web-old"), "the known-good container is the one that has to serve: ${docker.ops}")
     }
 
+    /**
+     * The window a replacement has to survive is configurable, down to and including `0` — and a
+     * verdict about a container that is *already stopped* cannot be read off a threshold of zero: every
+     * container that ever started would count as proven, including one that crash-looped for ten
+     * seconds and took the service down with it. So the comparison has its own floor, which is what
+     * decides everything between a second and a minute of uptime.
+     */
+    @Test
+    fun a_holder_that_ran_seconds_proves_nothing_however_short_the_verify_window_is() {
+        for (verifySeconds in listOf(null, "0")) {
+            val docker = FakeDockerClient()
+            docker.orphanedBackup(id = "web-old", name = "web")
+            docker.holder(
+                id = "new-web", name = "web", state = "exited",
+                startedAt = "2026-07-01T10:00:00.000000000Z", finishedAt = "2026-07-01T10:00:20.000000000Z",
+            )
+
+            updater(docker, config(verifySeconds = verifySeconds)).reconcileOrphanedBackups()
+
+            assertOrder(docker.ops, "remove:new-web", "rename:web-old->web", "start:web-old")
+            assertTrue(
+                running(docker, "web-old"),
+                "20s of uptime is a crash loop, not an update somebody stopped on purpose " +
+                    "(KODKOD_UPDATE_VERIFY_SECONDS=${verifySeconds ?: "default"}): ${docker.ops}",
+            )
+        }
+    }
+
+    /**
+     * `0001-01-01T00:00:00Z` is not a time, it is the daemon's way of writing "this never happened" —
+     * and it is what `FinishedAt` says for a container that is paused, or that has never stopped. Read
+     * as a timestamp it makes the container's run look infinitely long ago and *negative*, which turns
+     * "the daemon does not say" into "it never stayed up" — and this pass answers that by destroying
+     * the container holding the name.
+     */
+    @Test
+    fun a_holder_whose_timestamps_carry_the_never_happened_sentinel_is_left_alone() {
+        val docker = FakeDockerClient()
+        docker.orphanedBackup(id = "web-old", name = "web")
+        docker.holder(
+            id = "new-web", name = "web", state = "exited",
+            startedAt = "2026-07-01T10:00:00.000000000Z", finishedAt = "0001-01-01T00:00:00Z",
+        )
+
+        val log = captureLog { updater(docker).reconcileOrphanedBackups() }
+
+        assertTrue(docker.ops.isEmpty(), "a sentinel is not evidence, and this pass destroys containers: ${docker.ops}")
+        assertTrue(log.contains("does not say how long it ran"), "and the operator has to be told: $log")
+    }
+
     /** Neither verdict can be reached without the daemon's own timestamps, so nothing is done by force. */
     @Test
     fun a_stopped_holder_the_daemon_gives_no_timestamps_for_is_left_alone() {
@@ -2195,6 +2292,11 @@ private class CorrectedClock(private val delegate: FakeClock, private val stepMs
  * names could not tell the two cases apart.
  */
 private const val PROVIDER_ID = "app1234567890abcdef"
+
+/** Ids of a three-link namespace chain (`c` -> `b` -> `a`), spelled unlike their names for the same reason. */
+private const val A_ID = "a1234567890abcdef00"
+private const val B_ID = "b1234567890abcdef00"
+private const val C_ID = "c1234567890abcdef00"
 
 /**
  * Register a container the daemon knows under [name], with no kodkod labels of its own — the shape of

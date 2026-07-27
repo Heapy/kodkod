@@ -118,10 +118,11 @@ class DockerFixtureRecorder {
     }
 
     private fun writeScenario(scenario: String, exchanges: List<CapturedExchange>) {
-        // Order matters: the scenario is only visible in the index once it is complete on disk.
-        val dir = writer.writeScenario(label, scenario, exchanges)
-        writer.writeMeta(
+        // The order the corpus depends on lives in the writer, where a test can hold it to it.
+        val dir = writer.commitScenario(
             label,
+            scenario,
+            exchanges,
             FixtureMeta(
                 dockerVersion = versionInfo.str("Version").orEmpty(),
                 apiVersion = versionInfo.str("ApiVersion").orEmpty(),
@@ -129,7 +130,6 @@ class DockerFixtureRecorder {
                 recordedAt = Instant.now().toString(),
             ),
         )
-        writer.upsertIndex(label, scenario)
         println("[record] $label/$scenario — ${exchanges.size} exchanges -> $dir")
     }
 

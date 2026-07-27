@@ -32,6 +32,23 @@ internal class FixtureWriter(
     private val json = Json { prettyPrint = true; encodeDefaults = true }
 
     /**
+     * The whole commit of one recorded scenario, in the only order that leaves the corpus loadable:
+     * bodies and manifest first, the engine [meta] next, and the index entry **last**.
+     *
+     * The replay suite enumerates the corpus from `index.json` (classpath directories cannot be listed
+     * portably), so a name in there is a promise that the scenario is already complete on disk. Written
+     * first, it turns every failure below it — a full disk, a killed recorder — into an index pointing
+     * at a directory that does not exist, and the next replay run fails on a scenario nobody recorded.
+     * The order lives here rather than in the recorder's call sequence so that it can be tested at all.
+     */
+    fun commitScenario(label: String, scenario: String, exchanges: List<CapturedExchange>, meta: FixtureMeta): Path {
+        val dir = writeScenario(label, scenario, exchanges)
+        writeMeta(label, meta)
+        upsertIndex(label, scenario)
+        return dir
+    }
+
+    /**
      * Writes [exchanges] as `<root>/<label>/<scenario>/`, replacing any previously committed copy
      * only after every file is on disk. Returns the scenario directory.
      */
