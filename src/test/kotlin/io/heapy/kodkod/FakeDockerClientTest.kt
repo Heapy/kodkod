@@ -188,6 +188,20 @@ class FakeDockerClientTest {
     }
 
     @Test
+    fun a_name_a_live_container_holds_cannot_be_taken_from_it() {
+        docker.containers["web"] = json("""{"Name":"/web"}""")
+        docker.containers["old"] = json("""{"Name":"/web_old"}""")
+
+        val conflict = assertThrows(DockerException::class.java) { docker.rename("old", "web") }
+        assertEquals(409, conflict.status, "the daemon's name index refuses this, and so must the fake")
+
+        docker.remove("web", force = true)
+        docker.rename("old", "web")
+
+        assertEquals("/web", docker.inspectContainer("old").str("Name"), "a rename moves the name it took")
+    }
+
+    @Test
     fun a_created_container_becomes_inspectable_unless_the_test_described_it_first() {
         val plain = docker.create("web", json("{}"), platform = null)
         docker.containers["new-db-1"] = json("""{"Name":"/db","State":{"Restarting":true}}""")

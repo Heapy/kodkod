@@ -8,6 +8,8 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.io.ByteArrayOutputStream
+import java.io.PrintStream
 
 /**
  * Exercises [Updater.runOnce] end-to-end against a [FakeDockerClient]. These cover the staleness
@@ -24,8 +26,25 @@ class UpdaterTest {
 
     private fun json(s: String): JsonObject = Json.parseToJsonElement(s).jsonObject
 
-    private fun updater(docker: FakeDockerClient, config: Config = config()): Updater =
+    private fun updater(docker: DockerClient, config: Config = config()): Updater =
         Updater(docker, config, selfId = null, clock, clock)
+
+    /**
+     * [Log] writes to stdout, and a couple of behaviours here have no other output than the line they
+     * log — "the rollback did not restore the service" is exactly the state an operator only learns
+     * about from the log, so the log is what those tests assert on.
+     */
+    private fun captureLog(block: () -> Unit): String {
+        val buffer = ByteArrayOutputStream()
+        val original = System.out
+        System.setOut(PrintStream(buffer, true))
+        try {
+            block()
+        } finally {
+            System.setOut(original)
+        }
+        return buffer.toString()
+    }
 
     private fun config(
         monitorAll: Boolean = true,
@@ -47,6 +66,10 @@ class UpdaterTest {
     /** The endpoint config the create body asks for on [network]. */
     private fun JsonObject.endpoint(network: String): JsonObject =
         obj("NetworkingConfig")?.obj("EndpointsConfig")?.obj(network) ?: error("no endpoint for '$network' in $this")
+
+    /** Whether the daemon reports [id] as running right now. */
+    private fun running(docker: FakeDockerClient, id: String): Boolean =
+        docker.inspectContainer(id).obj("State")?.str("Running") == "true"
 
     /** Assert each op is present and that the listed ops occur in this relative order (first occurrence). */
     private fun assertOrder(ops: List<String>, vararg expected: String) {
@@ -465,6 +488,49 @@ class UpdaterTest {
         assertOrder(docker.ops, "create:web", "start!:new-web-0", "remove:new-web-0", "rename:web->web", "start:web")
         assertFalse(docker.ops.contains("start:new-web-0"), "the start failed and must not read as done: ${docker.ops}")
         assertFalse(docker.ops.contains("remove:web"), "the original container must survive a failed start: ${docker.ops}")
+        assertTrue(running(docker, "web"), "the service must be serving again after the rollback")
+    }
+
+    @Test
+    fun a_replacement_that_cannot_be_removed_is_moved_off_the_service_name() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.failStart += "new-web-0" // the replacement never comes up...
+        docker.failRemove += "new-web-0" // ...and cannot be deleted either, so it still holds "web"
+
+        updater(docker).runOnce()
+
+        assertOrder(
+            docker.ops,
+            "remove!:new-web-0",
+            "rename!:web->web", // 409: the corpse owns the name
+            "rename:new-web-0->web_kodkod_failed_new-web-0",
+            "rename:web->web",
+            "start:web",
+        )
+        assertEquals(
+            "/web", docker.inspectContainer("web").str("Name"),
+            "leaving the service under its _kodkod_old_ backup name while a dead container owns the real " +
+                "one is the outage this rollback exists to prevent: ${docker.ops}",
+        )
+        assertTrue(running(docker, "web"), "and it has to be running, not merely named right")
+    }
+
+    @Test
+    fun a_rollback_that_cannot_restore_the_name_says_so_instead_of_reporting_success() {
+        val docker = FakeDockerClient()
+        staleWeb(docker)
+        docker.failStart += "new-web-0"
+        docker.failRename += "web" // the daemon refuses the name no matter what is cleared out of the way
+
+        val log = captureLog { updater(docker).runOnce() }
+
+        assertTrue(
+            log.contains("[web] ROLLBACK INCOMPLETE"),
+            "a rollback whose rename never landed must be reported, not verified by hope: $log",
+        )
+        assertTrue(log.contains("web_kodkod_old_web"), "the log has to name where the container actually is: $log")
+        assertFalse(docker.ops.contains("remove:web"), "and it must still not destroy the old container: ${docker.ops}")
     }
 
     // --- liveness gate --------------------------------------------------------------------
@@ -584,6 +650,57 @@ class UpdaterTest {
         assertFalse(docker.ops.contains("create:web"), "web only depends on db; it is restarted, not recreated: ${docker.ops}")
     }
 
+    // --- bringing dependents back ---------------------------------------------------------
+
+    /** db's image moved; web is up to date but depends on db, so web is stopped and started again. */
+    private fun dependentWeb(docker: FakeDockerClient) {
+        docker.container(id = "db", imageRef = "db:1", currentImageId = "sha256:db-old")
+        docker.container(
+            id = "web", imageRef = "web:1", currentImageId = "sha256:web-old",
+            labels = """{"kodkod.depends-on":"db"}""",
+        )
+        docker.distribution["db:1"] = "sha256:db-remote"
+        docker.images["db:1"] = json("""{"Id":"sha256:db-new","Config":{},"RepoDigests":["db@sha256:db-remote"]}""")
+        docker.distribution["web:1"] = "sha256:web-remote"
+        docker.images["sha256:web-old"] = json("""{"Id":"sha256:web-old","Config":{},"RepoDigests":["web@sha256:web-remote"]}""")
+    }
+
+    @Test
+    fun a_dependent_whose_start_is_refused_is_retried_until_it_comes_up() {
+        val docker = FakeDockerClient()
+        dependentWeb(docker)
+        // The port the previous process held is not free yet — a state the daemon leaves behind briefly.
+        val flaky = FlakyStart(docker, target = "web", times = 2)
+
+        updater(flaky).runOnce()
+
+        assertEquals(
+            listOf("new-db-0", "web", "web", "web"), flaky.attempts,
+            "a transient refusal must be retried, not accepted as the verdict: ${flaky.attempts}",
+        )
+        assertTrue(docker.ops.contains("start:web"), "the third attempt has to actually start it: ${docker.ops}")
+        assertTrue(running(docker, "web"))
+        assertEquals(2, clock.sleeps.count { it == 1000L }, "with a pause before each retry: ${clock.sleeps}")
+    }
+
+    @Test
+    fun a_dependent_that_never_starts_is_reported_as_left_stopped() {
+        val docker = FakeDockerClient()
+        dependentWeb(docker)
+        docker.failStart += "web"
+
+        val log = captureLog { updater(docker).runOnce() }
+
+        assertEquals(3, docker.ops.count { it == "start!:web" }, "three attempts before giving up: ${docker.ops}")
+        assertEquals(2, clock.sleeps.count { it == 1000L }, "with a pause between them: ${clock.sleeps}")
+        assertTrue(
+            log.contains("[web] could not be started after 3 attempts") && log.contains("LEFT STOPPED"),
+            "discovery only lists running containers, so a container abandoned here is invisible to every " +
+                "later cycle — that has to be an ERROR, not a shrug: $log",
+        )
+        assertFalse(running(docker, "web"), "the test is worthless if the fake started it anyway")
+    }
+
     // --- stop timeout ---------------------------------------------------------------------
 
     /** Make `web` stale so a full stop -> recreate -> stop cycle runs and records its timeouts. */
@@ -629,6 +746,28 @@ class UpdaterTest {
             listOf<Int?>(25, 25), docker.stopTimeouts,
             "an explicitly set KODKOD_STOP_TIMEOUT is an override too: ${docker.stopTimeouts}",
         )
+    }
+}
+
+/**
+ * A [FakeDockerClient] whose [start] refuses [target] the first [times] calls and then behaves — the
+ * shape of a transient daemon state, which [FakeDockerClient.failStart] (a permanent verdict) cannot
+ * model. Every attempted id lands in [attempts], including the refused ones.
+ */
+private class FlakyStart(
+    private val delegate: FakeDockerClient,
+    private val target: String,
+    private var times: Int,
+) : DockerClient by delegate {
+    val attempts = mutableListOf<String>()
+
+    override fun start(id: String) {
+        attempts += id
+        if (id == target && times > 0) {
+            times--
+            throw DockerException(500, "fake: transient start failure for '$id'")
+        }
+        delegate.start(id)
     }
 }
 

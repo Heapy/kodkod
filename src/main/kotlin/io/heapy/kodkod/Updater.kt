@@ -65,16 +65,40 @@ class Updater(
         for (target in ordered) {
             if (!target.toRestart) continue
             try {
-                if (target.toRecreate) {
-                    recreate(target)
-                } else {
-                    api.start(target.id)
-                    Log.info("[${target.name}] restarted (a dependency was updated)")
-                }
+                if (target.toRecreate) recreate(target) else startDependent(target)
             } catch (e: Exception) {
                 Log.error("[${target.name}] ${if (target.toRecreate) "recreate" else "restart"} failed: ${e.message}")
             }
         }
+    }
+
+    /**
+     * Start a container this cycle stopped only because a dependency of its was updated, retrying a
+     * few times before giving up. Everything this pass touches was running a moment ago, so a refused
+     * `start` is far more likely to be a transient daemon state (a port the previous process has not
+     * released yet, a network being rewired) than a permanent verdict.
+     *
+     * Giving up is loud on purpose: discovery filters `status=running`, so a container left stopped
+     * here is invisible to every later cycle and would sit dead until a human noticed.
+     */
+    private fun startDependent(target: Target) {
+        var lastError: Exception? = null
+        for (attempt in 1..START_ATTEMPTS) {
+            try {
+                api.start(target.id)
+                Log.info("[${target.name}] restarted (a dependency was updated)")
+                return
+            } catch (e: Exception) {
+                lastError = e
+                Log.warn("[${target.name}] start failed (attempt $attempt/$START_ATTEMPTS): ${e.message}")
+                if (attempt < START_ATTEMPTS) sleeper.sleep(START_RETRY_INTERVAL_MS)
+            }
+        }
+        Log.error(
+            "[${target.name}] could not be started after $START_ATTEMPTS attempts — the container is LEFT " +
+                "STOPPED and later cycles will not see it (discovery only lists running containers): " +
+                "${lastError?.message}",
+        )
     }
 
     // --- Discovery ------------------------------------------------------------------------
@@ -245,6 +269,8 @@ class Updater(
             newComposeImageId = if (target.stale) target.newImageId else null,
         )
         val backupName = "${name}_kodkod_old_${target.id.take(12)}"
+        // A replacement we failed to delete still owns [name], which is what the rollback needs back.
+        var stranded: String? = null
 
         try {
             stopGracefully(target) // usually a no-op (already stopped in the reverse-order pass)
@@ -257,7 +283,7 @@ class Updater(
                 // replacement has to prove it is actually up first.
                 verifyStarted(name, newId)
             } catch (e: Exception) {
-                runCatching { api.remove(newId, force = true) }
+                stranded = discardReplacement(name, newId)
                 throw e
             }
             if (target.stale) {
@@ -276,14 +302,107 @@ class Updater(
         } catch (e: Exception) {
             // Any failure after we stopped the container must restore the original, running container.
             Log.error("[$name] recreate failed — rolling back: ${e.message}")
-            rollback(target.id, name)
+            rollback(target.id, name, stranded)
             throw e
         }
     }
 
-    private fun rollback(oldId: String, name: String) {
-        runCatching { api.rename(oldId, name) }
-        runCatching { api.start(oldId) }
+    /**
+     * Delete the replacement that just failed, returning its id when it is *still there* — a corpse we
+     * could not remove keeps holding the service name and would make the rollback's rename fail with a
+     * 409, so the rollback has to be told about it rather than discovering a name conflict blind.
+     */
+    private fun discardReplacement(name: String, newId: String): String? =
+        try {
+            api.remove(newId, force = true)
+            null
+        } catch (e: Exception) {
+            Log.error(
+                "[$name] could not remove the failed replacement ${newId.take(12)} — " +
+                    "it still holds the name '$name': ${e.message}",
+            )
+            newId
+        }
+
+    /**
+     * Put the original container back the way it was: under [name] and running. [blockingId] is a
+     * replacement that is known to still hold [name] (see [discardReplacement]) and is cleared out of
+     * the way before the rename is retried — without that the service would keep running under its
+     * `_kodkod_old_` backup name while a dead container owns the real one.
+     *
+     * Every step logs its own failure instead of being swallowed, and the end state is then verified
+     * against the daemon: this is the last line of defence for a service kodkod itself stopped, so
+     * "the rollback ran" and "the service is back" must not be the same claim.
+     */
+    private fun rollback(oldId: String, name: String, blockingId: String?) {
+        restoreName(oldId, name, blockingId)
+        try {
+            api.start(oldId)
+        } catch (e: Exception) {
+            Log.error("[$name] rollback: could not start the previous container ${oldId.take(12)}: ${e.message}")
+        }
+        verifyRolledBack(oldId, name)
+    }
+
+    private fun restoreName(oldId: String, name: String, blockingId: String?) {
+        if (renameBack(oldId, name)) return
+        if (blockingId == null) {
+            Log.error("[$name] rollback: the name is taken and kodkod did not create its holder — leaving it alone")
+            return
+        }
+        if (freeName(name, blockingId)) renameBack(oldId, name)
+    }
+
+    private fun renameBack(oldId: String, name: String): Boolean =
+        try {
+            api.rename(oldId, name)
+            true
+        } catch (e: Exception) {
+            Log.error("[$name] rollback: could not rename ${oldId.take(12)} back to '$name': ${e.message}")
+            false
+        }
+
+    /**
+     * Take [name] away from [blockingId] — by deleting it, or, if the daemon will not delete it either,
+     * by parking it under a name of its own so the original container can have its name back.
+     */
+    private fun freeName(name: String, blockingId: String): Boolean {
+        try {
+            api.remove(blockingId, force = true)
+            return true
+        } catch (e: Exception) {
+            Log.error("[$name] rollback: could not remove ${blockingId.take(12)}, which holds the name: ${e.message}")
+        }
+        val parkedName = "${name}_kodkod_failed_${blockingId.take(12)}"
+        return try {
+            api.rename(blockingId, parkedName)
+            Log.warn("[$name] rollback: parked the undeletable replacement as $parkedName")
+            true
+        } catch (e: Exception) {
+            Log.error("[$name] rollback: could not move ${blockingId.take(12)} off the name '$name': ${e.message}")
+            false
+        }
+    }
+
+    /** Ask the daemon what actually happened, so a rollback that did not land is reported as such. */
+    private fun verifyRolledBack(oldId: String, name: String) {
+        val inspect = try {
+            api.inspectContainer(oldId)
+        } catch (e: Exception) {
+            Log.error("[$name] rollback could not be verified — inspect of ${oldId.take(12)} failed: ${e.message}")
+            return
+        }
+        val actualName = inspect.str("Name")?.trimStart('/')
+        val running = inspect.obj("State")?.str("Running") == "true"
+        if (actualName == name && running) {
+            Log.info("[$name] rolled back to the previous container")
+            return
+        }
+        Log.error(
+            "[$name] ROLLBACK INCOMPLETE — the previous container ${oldId.take(12)} is " +
+                "${if (running) "running" else "stopped"} under the name '${actualName ?: "?"}': " +
+                "nothing is serving as '$name' and it needs a human",
+        )
     }
 
     /**
@@ -455,6 +574,12 @@ class Updater(
 
         /** Consecutive good probes that end the liveness wait early. */
         const val REQUIRED_GOOD_PROBES = 3
+
+        /** Attempts at starting a container this cycle stopped for a dependency of its own. */
+        const val START_ATTEMPTS = 3
+
+        /** Pause between those attempts — long enough for a port or a network to be released. */
+        const val START_RETRY_INTERVAL_MS = 1_000L
     }
 }
 

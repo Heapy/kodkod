@@ -73,7 +73,11 @@ class FakeDockerClient : DockerClient {
     /** Container ids for which [remove] should throw — used to strand a replacement during rollback. */
     val failRemove = mutableSetOf<String>()
 
-    /** New names for which [rename] should throw 409 — models "a container already holds that name". */
+    /**
+     * New names for which [rename] should throw 409 unconditionally. A name another *live* container
+     * already holds is refused with 409 anyway (see [rename]), so this set is only needed for a daemon
+     * that keeps refusing a name kodkod has already cleared.
+     */
     val failRename = mutableSetOf<String>()
 
     /**
@@ -87,6 +91,12 @@ class FakeDockerClient : DockerClient {
 
     /** id -> running, as tracked through [start]/[stop]/[restart]; absent means "as registered". */
     private val running = mutableMapOf<String, Boolean>()
+
+    /** id -> name given by [rename]; absent means the name in the registered payload still stands. */
+    private val renamed = mutableMapOf<String, String>()
+
+    /** Ids [remove] deleted — they hold no name any more, so a [rename] onto it is free to succeed. */
+    private val removed = mutableSetOf<String>()
 
     private var createSeq = 0
 
@@ -134,9 +144,10 @@ class FakeDockerClient : DockerClient {
     }
 
     /**
-     * The registered payload with `State` reflecting this fake's lifecycle model: containers are
-     * running until [stop] (or a [startedThenExits] start) says otherwise, and `State.Health.Status`
-     * comes from [health]. Any other `State` field the test registered is passed through.
+     * The registered payload with `Name` and `State` reflecting this fake's lifecycle model: containers
+     * answer to the name [rename] last gave them, are running until [stop] (or a [startedThenExits]
+     * start) says otherwise, and report `State.Health.Status` from [health]. Any other `State` field the
+     * test registered is passed through.
      */
     override fun inspectContainer(id: String): JsonObject {
         val stored = containers[id] ?: error("fake: no container registered for id '$id'")
@@ -144,7 +155,8 @@ class FakeDockerClient : DockerClient {
         val alive = running[id] ?: storedState["Running"]?.jsonPrimitive?.booleanOrNull ?: true
         val declaredHealth = health[id]
         return buildJsonObject {
-            stored.forEach { (key, value) -> if (key != "State") put(key, value) }
+            stored.forEach { (key, value) -> if (key != "State" && key != "Name") put(key, value) }
+            nameOf(id)?.let { put("Name", "/$it") }
             put(
                 "State",
                 buildJsonObject {
@@ -180,9 +192,19 @@ class FakeDockerClient : DockerClient {
         }
     }
 
+    /**
+     * Renaming is modelled with the daemon's name index: a name another live container holds is refused
+     * with 409, exactly as `POST /containers/{id}/rename` does. Without that a fake rollback could
+     * quietly take a name off a container that is still sitting on it, which is the whole failure mode
+     * the recreate path has to survive.
+     */
     override fun rename(id: String, name: String) {
         op("rename", "$id->$name") {
-            if (name in failRename) throw DockerException(409, "fake: name '$name' is already in use")
+            val holder = holderOf(name)
+            if (name in failRename || (holder != null && holder != id)) {
+                throw DockerException(409, "fake: name '$name' is already in use")
+            }
+            renamed[id] = name
         }
     }
 
@@ -190,8 +212,16 @@ class FakeDockerClient : DockerClient {
         op("remove", id) {
             if (id in failRemove) throw DockerException(500, "fake: remove failure for '$id'")
             running.remove(id)
+            removed += id
         }
     }
+
+    /** Name [id] answers to right now — what [rename] last set, else what its payload was registered with. */
+    private fun nameOf(id: String): String? = renamed[id] ?: containers[id]?.str("Name")?.trimStart('/')
+
+    /** The container currently holding [name], as the daemon's name index would answer. */
+    private fun holderOf(name: String): String? =
+        (containers.keys + renamed.keys).firstOrNull { it !in removed && nameOf(it) == name }
 
     override fun connectNetwork(network: String, containerId: String, endpoint: JsonObject) {
         op("connect", "$network:$containerId") {}
