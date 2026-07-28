@@ -30,8 +30,8 @@ class DockerReplayTest {
     /**
      * Fake time, so replaying a recreate does not really sleep through the liveness gate's probe
      * interval. The gate's window is pinned to the three probes the recording contains (see
-     * [updateConfig]). One per scenario: a shared clock accumulates the virtual time of every scenario
-     * before it, which would make each one's waiting budget depend on test order.
+     * [recordedUpdateConfig]). One per scenario: a shared clock accumulates the virtual time of every
+     * scenario before it, which would make each one's waiting budget depend on test order.
      */
     private fun clock() = FakeClock()
 
@@ -68,10 +68,10 @@ class DockerReplayTest {
         val client = OpLoggingClient(DockerApi(replay))
 
         if (scenario.startsWith("autoheal")) {
-            Autoheal(client, autohealConfig(), selfId = null).runOnce()
+            Autoheal(client, recordedAutohealConfig(), selfId = null).runOnce()
         } else {
             val clock = clock()
-            Updater(client, updateConfig(), selfId = null, clock, clock).runOnce()
+            Updater(client, recordedUpdateConfig(), selfId = null, clock, clock).runOnce()
         }
 
         // First, because a miss is the root cause of any op assertion that fails downstream.
@@ -186,7 +186,7 @@ class DockerReplayTest {
             SYNTHETIC_BODIES.getValue(file).toByteArray(StandardCharsets.UTF_8)
         }
         val clock = clock()
-        Updater(OpLoggingClient(DockerApi(replay)), updateConfig(), selfId = null, clock, clock).runOnce()
+        Updater(OpLoggingClient(DockerApi(replay)), recordedUpdateConfig(), selfId = null, clock, clock).runOnce()
         assertExhaustive("synthetic", replay)
     }
 
@@ -214,29 +214,13 @@ class DockerReplayTest {
         )
     }
 
-    // Must match the recorder's config so the listContainers filter (hence request paths) line up:
-    // monitorAll=false scopes to kodkod-labelled containers. The number of liveness probes — and
-    // therefore the number of recorded inspects of the replacement — is what
-    // KODKOD_UPDATE_VERIFY_SECONDS=1 pins: a window only the gate's own 500ms probe interval divides,
-    // so a recreate is three inspects here and three inspects on the daemon that produced the corpus.
-    // KODKOD_UPDATE_VERIFY_HEALTH=false keeps a healthcheck that fails a beat inside that window from
-    // turning a recorded update into a recorded rollback.
-    private fun updateConfig(): Config =
-        Config.fromEnv(
-            mapOf(
-                "KODKOD_UPDATE_CLEANUP" to "true",
-                "KODKOD_UPDATE_VERIFY_HEALTH" to "false",
-                "KODKOD_UPDATE_VERIFY_SECONDS" to "1",
-            )::get,
-        )
-
-    private fun autohealConfig(): Config =
-        Config.fromEnv(emptyMap<String, String>()::get)
-
     private companion object {
         const val SYNTHETIC_ID = "5ynthet1c0000000000000000000000000000000000000000000000000000000"
 
-        /** Exactly what [DockerApi.listContainers] builds for [updateConfig] — keys in insertion order. */
+        /**
+         * Exactly what [DockerApi.listContainers] builds for [recordedUpdateConfig] — keys in
+         * insertion order.
+         */
         val SYNTHETIC_LIST_PATH = "/containers/json?all=false&filters=" +
             URLEncoder.encode("""{"status":["running"],"label":["kodkod.update.enable"]}""", StandardCharsets.UTF_8)
 

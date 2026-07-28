@@ -55,6 +55,12 @@ recreate containers whose image tag moved (update). Kotlin, one runtime dependen
 
 - `DockerReplayTest` replays real recorded Docker responses through the real `DockerApi`. The replay
   key is `"<method> <path>"`.
+- **The `Config` a corpus is recorded under is one definition** — `recordedUpdateConfig` /
+  `recordedAutohealConfig` in `src/testFixtures` — reached by both the recorder (`e2eTest`) and
+  `DockerReplayTest` (`test`). It is not a per-suite preference: it decides the `listContainers`
+  filters, which are *part of the request path* replay matches on, and the length of the liveness
+  window, which is how many inspects of the replacement a recording contains. Neither side gets a local
+  copy; a change to it is a re-record.
 - **Changing a request's method, path or query obliges a re-record of the corpus in the same change.**
   Dropping a `?t=`, adding an inspect, adding `?platform=` — all of them break replay. Request bodies
   are *not* part of the key, so a change to a create body needs no re-record. Recording requires

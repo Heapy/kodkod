@@ -4,7 +4,8 @@ import kotlinx.serialization.Serializable
 import java.nio.charset.StandardCharsets
 
 /**
- * Record/replay support for [DockerTransport], plus the on-disk fixture model.
+ * Record/replay support for [DockerTransport], plus the on-disk fixture model and the [Config] a
+ * corpus is recorded under.
  *
  * [RecordingDockerTransport] wraps the real socket transport and captures the (decoded) response of
  * every exchange; the recorder ([io.heapy.kodkod] e2e `DockerFixtureRecorder`) writes those out as a
@@ -20,6 +21,44 @@ import java.nio.charset.StandardCharsets
  * Everything here is `public` for the same reason [DockerClientContract] is: a fixtures jar is a
  * separate module, so `internal` would hide it from the very source sets it exists for.
  */
+
+// --- The configuration a corpus is recorded under -----------------------------------------
+
+/**
+ * The [Config] the update scenarios of the fixture corpus are recorded with — and therefore the only
+ * one they can be replayed under. One definition, reached by both the recorder (`e2eTest`) and
+ * `DockerReplayTest` (`test`), because the two drifting apart is a failure with no symptom until the
+ * next re-record: the config decides the `listContainers` filters, which are *part of the request path*
+ * replay matches on, and the length of the liveness gate's window, which is how many inspects of the
+ * replacement a recording contains.
+ *
+ * `KODKOD_UPDATE_MONITOR_ALL` is left at its default of `false` on purpose — the recorder runs against a
+ * developer's real daemon, and with it on kodkod would treat every running container there as a target,
+ * not just the e2e compose services labelled for it.
+ *
+ * `KODKOD_UPDATE_VERIFY_SECONDS=1` is what keeps the probe count deterministic: the gate watches the
+ * whole window unless the replacement's own healthcheck reports `healthy`, so a one-second window is
+ * three inspects (probes at 0, 500 and 1000ms) instead of a number that depends on how fast that
+ * healthcheck passes — a recording a replay could only match by luck.
+ *
+ * `KODKOD_UPDATE_VERIFY_HEALTH=false` keeps a healthcheck that fails a beat inside that window from
+ * turning a recorded update into a recorded rollback. `KODKOD_UPDATE_CLEANUP=true` is already the
+ * default and is spelled out because the corpus contains the prune calls it makes.
+ */
+fun recordedUpdateConfig(): Config =
+    Config.fromEnv(
+        mapOf(
+            "KODKOD_UPDATE_CLEANUP" to "true",
+            "KODKOD_UPDATE_VERIFY_HEALTH" to "false",
+            "KODKOD_UPDATE_VERIFY_SECONDS" to "1",
+        )::get,
+    )
+
+/**
+ * The [Config] the autoheal scenarios are recorded with: stock defaults, which for autoheal already
+ * means `monitorAll` off — see [recordedUpdateConfig] for why that matters to a recorder.
+ */
+fun recordedAutohealConfig(): Config = Config.fromEnv { null }
 
 // --- On-disk fixture model ----------------------------------------------------------------
 

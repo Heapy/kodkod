@@ -19,10 +19,8 @@ import java.util.concurrent.locks.ReentrantLock
 class UpdateCycleTest {
     private val clock = FakeClock()
 
-
-    private fun config(): Config = Config.fromEnv(mapOf("KODKOD_UPDATE_MONITOR_ALL" to "true")::get)
-
-    private fun updater(docker: DockerClient) = Updater(docker, config(), selfId = null, clock, clock)
+    private fun updater(docker: DockerClient) =
+        Updater(docker, configOf("KODKOD_UPDATE_MONITOR_ALL" to "true"), selfId = null, clock, clock)
 
     /** A stale `web`, the smallest cycle that both plans and mutates. */
     private fun staleWeb(docker: FakeDockerClient) {

@@ -20,6 +20,23 @@ import java.io.PrintStream
 internal fun jsonObj(text: String): JsonObject = Json.parseToJsonElement(text).jsonObject
 
 /**
+ * A [Config] built from exactly these variables and nothing else. Every suite here needs one and
+ * [Config.fromEnv] reads a `(String) -> String?`, which is a lookup no test wants to spell out — and
+ * used to spell out three different ways, each with its own `buildMap` of conditional `put`s.
+ *
+ * A `null` value drops the variable rather than passing it as `""`, so the suites' optional knobs
+ * (`stopTimeout: String? = null` and friends) can be forwarded as they are. The two are worth telling
+ * apart even where `fromEnv` currently treats a blank value as unset anyway
+ * ([ConfigTest.an_empty_value_falls_back_to_the_default_rather_than_to_false] is what pins that): an
+ * unset variable is one `System.getenv` answers `null` for, and a helper should hand the code under
+ * test the input production actually produces rather than one that happens to be equivalent today.
+ */
+internal fun configOf(vararg env: Pair<String, String?>): Config {
+    val set = env.mapNotNull { (key, value) -> value?.let { key to it } }.toMap()
+    return Config.fromEnv(set::get)
+}
+
+/**
  * Run [block] with stdout captured, and return what it printed.
  *
  * [Log] writes to stdout, and several behaviours have no other output than the line they log — "the

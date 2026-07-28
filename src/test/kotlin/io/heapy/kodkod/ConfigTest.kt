@@ -8,11 +8,6 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class ConfigTest {
-    private fun env(vararg pairs: Pair<String, String>): (String) -> String? {
-        val map = pairs.toMap()
-        return { map[it] }
-    }
-
     @Test
     fun applies_defaults_when_unset() {
         val c = Config.fromEnv { null }
@@ -36,52 +31,52 @@ class ConfigTest {
 
     @Test
     fun reads_the_shutdown_grace_period() {
-        assertEquals(5, Config.fromEnv(env("KODKOD_SHUTDOWN_GRACE" to "5")).shutdownGrace)
+        assertEquals(5, configOf("KODKOD_SHUTDOWN_GRACE" to "5").shutdownGrace)
         assertEquals(
-            0, Config.fromEnv(env("KODKOD_SHUTDOWN_GRACE" to "0")).shutdownGrace,
+            0, configOf("KODKOD_SHUTDOWN_GRACE" to "0").shutdownGrace,
             "0 is a legal grace period: interrupt the cycle in flight immediately",
         )
         assertEquals(
-            0, Config.fromEnv(env("KODKOD_SHUTDOWN_GRACE" to "-1")).shutdownGrace,
+            0, configOf("KODKOD_SHUTDOWN_GRACE" to "-1").shutdownGrace,
             "a negative grace period cannot mean \"wait backwards\" — it degrades to no wait at all",
         )
         assertEquals(
-            30, Config.fromEnv(env("KODKOD_SHUTDOWN_GRACE" to "soon")).shutdownGrace,
+            30, configOf("KODKOD_SHUTDOWN_GRACE" to "soon").shutdownGrace,
             "an unparseable value falls back to the default rather than to no grace period at all",
         )
     }
 
     @Test
     fun reads_the_liveness_verification_window() {
-        assertEquals(45, Config.fromEnv(env("KODKOD_UPDATE_VERIFY_SECONDS" to "45")).updateVerifySeconds)
+        assertEquals(45, configOf("KODKOD_UPDATE_VERIFY_SECONDS" to "45").updateVerifySeconds)
         assertEquals(
-            0, Config.fromEnv(env("KODKOD_UPDATE_VERIFY_SECONDS" to "0")).updateVerifySeconds,
+            0, configOf("KODKOD_UPDATE_VERIFY_SECONDS" to "0").updateVerifySeconds,
             "0 is a legal window: probe the replacement once and move on",
         )
         assertEquals(
-            0, Config.fromEnv(env("KODKOD_UPDATE_VERIFY_SECONDS" to "-5")).updateVerifySeconds,
+            0, configOf("KODKOD_UPDATE_VERIFY_SECONDS" to "-5").updateVerifySeconds,
             "a negative window cannot mean \"wait backwards\" — it degrades to a single probe",
         )
         assertEquals(
-            15, Config.fromEnv(env("KODKOD_UPDATE_VERIFY_SECONDS" to "soon")).updateVerifySeconds,
+            15, configOf("KODKOD_UPDATE_VERIFY_SECONDS" to "soon").updateVerifySeconds,
             "unparseable values fall back to the default rather than disabling the gate",
         )
-        assertFalse(Config.fromEnv(env("KODKOD_UPDATE_VERIFY_HEALTH" to "false")).updateVerifyHealth)
+        assertFalse(configOf("KODKOD_UPDATE_VERIFY_HEALTH" to "false").updateVerifyHealth)
     }
 
     @Test
     fun reads_the_failed_update_cooldown() {
-        assertEquals(60, Config.fromEnv(env("KODKOD_UPDATE_FAILURE_COOLDOWN" to "60")).updateFailureCooldown)
+        assertEquals(60, configOf("KODKOD_UPDATE_FAILURE_COOLDOWN" to "60").updateFailureCooldown)
         assertEquals(
-            0, Config.fromEnv(env("KODKOD_UPDATE_FAILURE_COOLDOWN" to "0")).updateFailureCooldown,
+            0, configOf("KODKOD_UPDATE_FAILURE_COOLDOWN" to "0").updateFailureCooldown,
             "0 is the off switch: retry a known-bad image every cycle, as kodkod did before it remembered",
         )
         assertEquals(
-            0, Config.fromEnv(env("KODKOD_UPDATE_FAILURE_COOLDOWN" to "-1")).updateFailureCooldown,
+            0, configOf("KODKOD_UPDATE_FAILURE_COOLDOWN" to "-1").updateFailureCooldown,
             "a negative cooldown cannot mean \"wait backwards\" — it degrades to no memory at all",
         )
         assertEquals(
-            21600, Config.fromEnv(env("KODKOD_UPDATE_FAILURE_COOLDOWN" to "a while")).updateFailureCooldown,
+            21600, configOf("KODKOD_UPDATE_FAILURE_COOLDOWN" to "a while").updateFailureCooldown,
             "an unparseable value falls back to the default rather than to retrying an outage every cycle",
         )
     }
@@ -89,43 +84,43 @@ class ConfigTest {
     @Test
     fun reads_the_dependency_health_timeout() {
         assertEquals(
-            30, Config.fromEnv(env("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "30")).dependencyHealthTimeout,
+            30, configOf("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "30").dependencyHealthTimeout,
         )
         assertEquals(
-            0, Config.fromEnv(env("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "0")).dependencyHealthTimeout,
+            0, configOf("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "0").dependencyHealthTimeout,
             "0 is legal: check the dependency's health once and carry on",
         )
         assertEquals(
-            0, Config.fromEnv(env("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "-5")).dependencyHealthTimeout,
+            0, configOf("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "-5").dependencyHealthTimeout,
             "a negative bound cannot mean \"wait backwards\" — it degrades to a single check",
         )
         assertEquals(
-            120, Config.fromEnv(env("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "a while")).dependencyHealthTimeout,
+            120, configOf("KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to "a while").dependencyHealthTimeout,
             "an unparseable value falls back to the default rather than to an unbounded wait",
         )
     }
 
     @Test
     fun reads_whether_the_depends_on_restart_flag_is_respected() {
-        assertTrue(Config.fromEnv(env("KODKOD_RESPECT_DEPENDS_ON_RESTART" to "true")).respectDependsOnRestart)
+        assertTrue(configOf("KODKOD_RESPECT_DEPENDS_ON_RESTART" to "true").respectDependsOnRestart)
         assertFalse(
-            Config.fromEnv(env("KODKOD_RESPECT_DEPENDS_ON_RESTART" to "nonsense")).respectDependsOnRestart,
+            configOf("KODKOD_RESPECT_DEPENDS_ON_RESTART" to "nonsense").respectDependsOnRestart,
             "obeying compose's default (restart: false) would make the dependent restart a no-op",
         )
     }
 
     @Test
     fun keeps_an_explicitly_set_stop_timeout() {
-        assertEquals(25, Config.fromEnv(env("KODKOD_STOP_TIMEOUT" to "25")).defaultStopTimeout)
-        assertNull(Config.fromEnv(env("KODKOD_STOP_TIMEOUT" to "nonsense")).defaultStopTimeout)
+        assertEquals(25, configOf("KODKOD_STOP_TIMEOUT" to "25").defaultStopTimeout)
+        assertNull(configOf("KODKOD_STOP_TIMEOUT" to "nonsense").defaultStopTimeout)
     }
 
     @Test
     fun parses_truthy_and_falsey_values() {
-        assertFalse(Config.fromEnv(env("KODKOD_AUTOHEAL_ENABLED" to "false")).autohealEnabled)
-        assertTrue(Config.fromEnv(env("KODKOD_UPDATE_MONITOR_ALL" to "yes")).updateMonitorAll)
-        assertTrue(Config.fromEnv(env("KODKOD_UPDATE_MONITOR_ALL" to "1")).updateMonitorAll)
-        assertFalse(Config.fromEnv(env("KODKOD_UPDATE_MONITOR_ALL" to "nope")).updateMonitorAll)
+        assertFalse(configOf("KODKOD_AUTOHEAL_ENABLED" to "false").autohealEnabled)
+        assertTrue(configOf("KODKOD_UPDATE_MONITOR_ALL" to "yes").updateMonitorAll)
+        assertTrue(configOf("KODKOD_UPDATE_MONITOR_ALL" to "1").updateMonitorAll)
+        assertFalse(configOf("KODKOD_UPDATE_MONITOR_ALL" to "nope").updateMonitorAll)
     }
 
     /**
@@ -134,35 +129,35 @@ class ConfigTest {
      */
     @Test
     fun an_empty_value_falls_back_to_the_default_rather_than_to_false() {
-        assertTrue(Config.fromEnv(env("KODKOD_UPDATE_VERIFY_HEALTH" to "")).updateVerifyHealth)
-        assertTrue(Config.fromEnv(env("KODKOD_UPDATE_CLEANUP" to "   ")).updateCleanup)
+        assertTrue(configOf("KODKOD_UPDATE_VERIFY_HEALTH" to "").updateVerifyHealth)
+        assertTrue(configOf("KODKOD_UPDATE_CLEANUP" to "   ").updateCleanup)
         assertFalse(
-            Config.fromEnv(env("KODKOD_UPDATE_MONITOR_ALL" to "")).updateMonitorAll,
+            configOf("KODKOD_UPDATE_MONITOR_ALL" to "").updateMonitorAll,
             "and a default of false stays false — the point is that the default decides",
         )
     }
 
     @Test
     fun reads_the_autoheal_backoff_ceiling() {
-        assertEquals(300, Config.fromEnv(env("KODKOD_AUTOHEAL_MAX_INTERVAL" to "300")).autohealMaxInterval)
+        assertEquals(300, configOf("KODKOD_AUTOHEAL_MAX_INTERVAL" to "300").autohealMaxInterval)
         assertEquals(
-            30, Config.fromEnv(env("KODKOD_AUTOHEAL_MAX_INTERVAL" to "30")).autohealMaxInterval,
+            30, configOf("KODKOD_AUTOHEAL_MAX_INTERVAL" to "30").autohealMaxInterval,
             "a ceiling equal to the interval is legal: it disables the backoff",
         )
         assertEquals(
-            120, Config.fromEnv(env("KODKOD_AUTOHEAL_INTERVAL" to "120", "KODKOD_AUTOHEAL_MAX_INTERVAL" to "10"))
+            120, configOf("KODKOD_AUTOHEAL_INTERVAL" to "120", "KODKOD_AUTOHEAL_MAX_INTERVAL" to "10")
                 .autohealMaxInterval,
             "a ceiling below the loop's own period would throttle nothing — it is raised to the interval",
         )
         assertEquals(
-            3600, Config.fromEnv(env("KODKOD_AUTOHEAL_MAX_INTERVAL" to "nonsense")).autohealMaxInterval,
+            3600, configOf("KODKOD_AUTOHEAL_MAX_INTERVAL" to "nonsense").autohealMaxInterval,
             "an unparseable value falls back to the default rather than to no ceiling at all",
         )
     }
 
     @Test
     fun rejects_non_positive_intervals() {
-        assertThrows(IllegalArgumentException::class.java) { Config.fromEnv(env("KODKOD_AUTOHEAL_INTERVAL" to "0")) }
-        assertThrows(IllegalArgumentException::class.java) { Config.fromEnv(env("KODKOD_UPDATE_INTERVAL" to "-5")) }
+        assertThrows(IllegalArgumentException::class.java) { configOf("KODKOD_AUTOHEAL_INTERVAL" to "0") }
+        assertThrows(IllegalArgumentException::class.java) { configOf("KODKOD_UPDATE_INTERVAL" to "-5") }
     }
 }

@@ -141,16 +141,28 @@ class UpdateCycleModelTest {
         return World(docker, specs, seed)
     }
 
-    private fun run(world: World, cycles: Int): String {
+    /**
+     * The [Updater] a world is run through. `monitorAll` stays off so the monitored set is decided by
+     * the [ENABLE_LABEL] the generator hands out — with the flag on, every generated container would be
+     * managed and "a container kodkod does not manage is never touched" would have nothing to be true
+     * about. The [FakeClock] is both the updater's clock and the daemon's ([FakeDockerClient.clock]),
+     * so the liveness gate's waits and the `StartedAt` the fake stamps read the same time — and neither
+     * costs a real second across the hundreds of cycles this suite runs.
+     */
+    private fun updater(world: World): Updater {
         val clock = FakeClock()
         world.docker.clock = clock
-        val updater = Updater(
+        return Updater(
             world.docker,
-            Config.fromEnv(mapOf("KODKOD_UPDATE_MONITOR_ALL" to "false")::get),
+            configOf("KODKOD_UPDATE_MONITOR_ALL" to "false"),
             selfId = null,
             clock,
             clock,
         )
+    }
+
+    private fun run(world: World, cycles: Int): String {
+        val updater = updater(world)
         return captureLog { repeat(cycles) { updater.runOnce() } }
     }
 
@@ -264,15 +276,7 @@ class UpdateCycleModelTest {
     fun whatever_a_cycle_leaves_stopped_the_next_cycle_reaches_for_again() {
         for (seed in 0 until WORLDS) {
             val world = world(seed)
-            val clock = FakeClock()
-            world.docker.clock = clock
-            val updater = Updater(
-                world.docker,
-                Config.fromEnv(mapOf("KODKOD_UPDATE_MONITOR_ALL" to "false")::get),
-                selfId = null,
-                clock,
-                clock,
-            )
+            val updater = updater(world)
 
             captureLog { updater.runOnce() }
             val afterFirst = liveState(world.docker)

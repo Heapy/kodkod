@@ -48,17 +48,15 @@ class UpdaterTest {
         dependencyHealthTimeout: String? = null,
         respectDependsOnRestart: Boolean? = null,
     ): Config =
-        Config.fromEnv(
-            buildMap {
-                put("KODKOD_UPDATE_MONITOR_ALL", monitorAll.toString())
-                put("KODKOD_UPDATE_CLEANUP", cleanup.toString())
-                stopTimeout?.let { put("KODKOD_STOP_TIMEOUT", it) }
-                verifySeconds?.let { put("KODKOD_UPDATE_VERIFY_SECONDS", it) }
-                verifyHealth?.let { put("KODKOD_UPDATE_VERIFY_HEALTH", it.toString()) }
-                failureCooldown?.let { put("KODKOD_UPDATE_FAILURE_COOLDOWN", it) }
-                dependencyHealthTimeout?.let { put("KODKOD_DEPENDENCY_HEALTH_TIMEOUT", it) }
-                respectDependsOnRestart?.let { put("KODKOD_RESPECT_DEPENDS_ON_RESTART", it.toString()) }
-            }::get,
+        configOf(
+            "KODKOD_UPDATE_MONITOR_ALL" to monitorAll.toString(),
+            "KODKOD_UPDATE_CLEANUP" to cleanup.toString(),
+            "KODKOD_STOP_TIMEOUT" to stopTimeout,
+            "KODKOD_UPDATE_VERIFY_SECONDS" to verifySeconds,
+            "KODKOD_UPDATE_VERIFY_HEALTH" to verifyHealth?.toString(),
+            "KODKOD_UPDATE_FAILURE_COOLDOWN" to failureCooldown,
+            "KODKOD_DEPENDENCY_HEALTH_TIMEOUT" to dependencyHealthTimeout,
+            "KODKOD_RESPECT_DEPENDS_ON_RESTART" to respectDependsOnRestart?.toString(),
         )
 
     /** The endpoint config the create body asks for on [network]. */
@@ -1729,9 +1727,7 @@ class UpdaterTest {
     fun a_custom_label_namespace_drives_every_label_kodkod_reads() {
         val docker = FakeDockerClient()
         staleWeb(docker, labels = """{"acme.update.enable":"true","acme.stop.timeout":"45"}""")
-        val renamed = Config.fromEnv(
-            mapOf("KODKOD_LABEL_NAMESPACE" to "acme", "KODKOD_UPDATE_MONITOR_ALL" to "false")::get,
-        )
+        val renamed = configOf("KODKOD_LABEL_NAMESPACE" to "acme", "KODKOD_UPDATE_MONITOR_ALL" to "false")
 
         updater(docker, renamed).runOnce()
 
@@ -2438,7 +2434,7 @@ class UpdaterTest {
     fun reconcile_does_not_depend_on_the_updater_being_enabled() {
         val docker = FakeDockerClient()
         docker.orphanedBackup(id = "web-old", name = "web")
-        val disabled = Config.fromEnv(mapOf("KODKOD_UPDATE_ENABLED" to "false")::get)
+        val disabled = configOf("KODKOD_UPDATE_ENABLED" to "false")
         assertFalse(disabled.updateEnabled, "the test is worthless if the updater is on")
 
         updater(docker, disabled).reconcileOrphanedBackups()

@@ -32,12 +32,10 @@ class AutohealTest {
         stopTimeout: String? = null,
         maxInterval: String? = null,
     ): Config =
-        Config.fromEnv(
-            buildMap {
-                put("KODKOD_AUTOHEAL_MONITOR_ALL", monitorAll.toString())
-                stopTimeout?.let { put("KODKOD_STOP_TIMEOUT", it) }
-                maxInterval?.let { put("KODKOD_AUTOHEAL_MAX_INTERVAL", it) }
-            }::get,
+        configOf(
+            "KODKOD_AUTOHEAL_MONITOR_ALL" to monitorAll.toString(),
+            "KODKOD_STOP_TIMEOUT" to stopTimeout,
+            "KODKOD_AUTOHEAL_MAX_INTERVAL" to maxInterval,
         )
 
     /**

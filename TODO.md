@@ -34,4 +34,3 @@
 12. Grace-хук шатдауна в `Main.kt` (`awaitTermination` → `shutdownNow`) не покрыт тестом: `main()` не
     разбирается на тестируемые части. Из него проверен только `ConfigTest.reads_the_shutdown_grace_period`.
     Чтобы покрыть — выделить планировщик и хук в отдельную тестируемую функцию.
-14. Дублирование в тестах: хелперы `updateConfig`/`autohealConfig` рекордера и `config(...)` юнит-тестов.

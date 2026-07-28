@@ -2,12 +2,13 @@ package io.heapy.kodkod.e2e
 
 import io.heapy.kodkod.Autoheal
 import io.heapy.kodkod.CapturedExchange
-import io.heapy.kodkod.Config
 import io.heapy.kodkod.DockerApi
 import io.heapy.kodkod.FixtureMeta
 import io.heapy.kodkod.RecordingDockerTransport
 import io.heapy.kodkod.UnixSocketTransport
 import io.heapy.kodkod.Updater
+import io.heapy.kodkod.recordedAutohealConfig
+import io.heapy.kodkod.recordedUpdateConfig
 import io.heapy.kodkod.str
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
@@ -75,7 +76,7 @@ class DockerFixtureRecorder {
         e2e.compose("update", "up", "-d", "app")
         e2e.waitUntil(30, "app v1 up") { e2e.variant("e2e-update-app-1") == "v1" }
         e2e.publishVariant("v2") // overwrite :latest with v2 so the running container is stale
-        Updater(api, updateConfig(), selfId = null).runOnce()
+        Updater(api, recordedUpdateConfig(), selfId = null).runOnce()
     }
 
     @Test
@@ -84,7 +85,7 @@ class DockerFixtureRecorder {
         e2e.compose("update", "up", "-d", "app")
         e2e.waitUntil(30, "app v1 up") { e2e.variant("e2e-update-app-1") == "v1" }
         // No new image published — kodkod should find it up to date and do nothing.
-        Updater(api, updateConfig(), selfId = null).runOnce()
+        Updater(api, recordedUpdateConfig(), selfId = null).runOnce()
     }
 
     @Test
@@ -93,7 +94,7 @@ class DockerFixtureRecorder {
         e2e.waitUntil(40, "app healthy") { e2e.health("e2e-autoheal-app-1") == "healthy" }
         e2e.docker("exec", "e2e-autoheal-app-1", "rm", "-f", "/tmp/healthy")
         e2e.waitUntil(40, "app unhealthy") { e2e.health("e2e-autoheal-app-1") == "unhealthy" }
-        Autoheal(api, autohealConfig(), selfId = null).runOnce()
+        Autoheal(api, recordedAutohealConfig(), selfId = null).runOnce()
     }
 
     @Test
@@ -102,7 +103,7 @@ class DockerFixtureRecorder {
         e2e.compose("deps", "up", "-d", "db", "web")
         e2e.waitUntil(30, "db v1 up") { e2e.variant("e2e-deps-db-1") == "v1" }
         e2e.publishVariant("v2") // only db uses testapp; web (busybox) is an unchanged dependent
-        Updater(api, updateConfig(), selfId = null).runOnce()
+        Updater(api, recordedUpdateConfig(), selfId = null).runOnce()
     }
 
     /**
@@ -147,28 +148,6 @@ class DockerFixtureRecorder {
 
     private fun sanitize(version: String?): String =
         (version?.takeIf { it.isNotBlank() } ?: "unknown").replace(Regex("[^A-Za-z0-9.]+"), "-").trim('-')
-
-    // IMPORTANT: monitorAll stays FALSE so the recorder only ever acts on containers explicitly
-    // labelled for kodkod (the e2e compose services) — never the developer's own running containers.
-    // With monitorAll=true, kodkod would treat every running container on the daemon as a target.
-    //
-    // KODKOD_UPDATE_VERIFY_SECONDS=1 is what keeps the liveness gate's probe count deterministic: the
-    // gate watches the whole window unless the replacement's own healthcheck reports `healthy`, so a
-    // window of one second is three inspects of the replacement (probes at 0, 500 and 1000ms) instead of
-    // a number that depends on how fast that healthcheck passes — a recording replay could only match by
-    // luck. KODKOD_UPDATE_VERIFY_HEALTH=false keeps a healthcheck that fails a beat inside that window
-    // from turning a recorded update into a recorded rollback. DockerReplayTest sets both to the same.
-    private fun updateConfig(): Config =
-        Config.fromEnv(
-            mapOf(
-                "KODKOD_UPDATE_CLEANUP" to "true",
-                "KODKOD_UPDATE_VERIFY_HEALTH" to "false",
-                "KODKOD_UPDATE_VERIFY_SECONDS" to "1",
-            )::get,
-        )
-
-    private fun autohealConfig(): Config =
-        Config.fromEnv(emptyMap<String, String>()::get)
 }
 
 /**
