@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- The image's build stage is pinned to the *builder's* architecture (`--platform=$BUILDPLATFORM`), so a
+  multi-arch build compiles once instead of once per platform. `installDist` emits JVM bytecode and
+  shell scripts — nothing in it is architecture-specific — but without the pin the non-native leg of a
+  release ran the entire Kotlin compile again under QEMU emulation, which is several times slower on a
+  JVM workload and was most of the wall-clock of publishing a release. Only the runtime stage is still
+  per-architecture, because only the JRE is. `docker build .` stays self-contained: the e2e harness and
+  the README instructions build the image exactly as before.
+
 ## [0.4.0] - 2026-07-28
 
 ### Added

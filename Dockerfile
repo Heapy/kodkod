@@ -1,7 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # ---- build stage: full JDK to run Gradle ----
-FROM bellsoft/liberica-openjdk-alpine:25 AS build
+# Pinned to the *builder's* architecture rather than the target's. Everything this stage emits is JVM
+# bytecode and shell scripts — `installDist` produces `lib/*.jar` plus `bin/kodkod` — so one build
+# serves every target platform, and BuildKit runs it once instead of once per platform. Without the
+# pin, a multi-arch build runs the whole Kotlin compile under QEMU emulation for the non-native
+# architecture, which is 5-15x slower on JVM workloads and was most of the wall-clock of a release.
+# Only the runtime stage below is genuinely per-architecture, because only the JRE is.
+FROM --platform=$BUILDPLATFORM bellsoft/liberica-openjdk-alpine:25 AS build
 WORKDIR /app
 
 # Resolve dependencies first so this layer is cached across source-only changes.
