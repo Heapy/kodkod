@@ -82,7 +82,52 @@ All configuration is via environment variables:
 | `KODKOD_UPDATE_FAILURE_COOLDOWN` | `21600`                | Seconds an image that failed to come up on a container is left alone before that exact update is tried again — otherwise an unstartable `:latest` costs one self-inflicted outage per cycle, forever. A replacement that ran and did not stay up counts on the first failure; a `start` the daemon refused outright counts only on the second in a row, since that answer is a host problem (a port still in teardown, a resource limit) as often as an image one. `0` disables the memory. |
 | `KODKOD_DEPENDENCY_HEALTH_TIMEOUT` | `120`                | Seconds a container waits for a dependency marked `condition: service_healthy` to become healthy before starting anyway. `0` means check once and carry on. |
 | `KODKOD_RESPECT_DEPENDS_ON_RESTART` | `false`             | Obey compose's `depends_on[*].restart: false` when deciding whether to restart a dependent (see below).  |
-| `KODKOD_REGISTRY_AUTH`         | —                        | Base64 `X-Registry-Auth` value for pulling from private registries.    |
+| `KODKOD_REGISTRY_AUTHS`        | —                        | JSON object mapping registry hosts to credentials. Unset, blank or `{}`: anonymous access. See below. |
+
+### Registry credentials
+
+Set credentials per registry in your Compose `.env` file. The JSON is one line, **without outer
+single quotes**, so Compose substitutes the token variables:
+
+```dotenv
+GHCR_USERNAME=your_github_username
+GHCR_TOKEN='ghp_REPLACE_ME'
+DOCKERHUB_USERNAME=your_dockerhub_username
+DOCKERHUB_TOKEN='dckr_pat_REPLACE_ME'
+KODKOD_REGISTRY_AUTHS={"ghcr.io":{"username":"${GHCR_USERNAME:?GHCR_USERNAME must be set}","password":"${GHCR_TOKEN:?GHCR_TOKEN must be set}"},"docker.io":{"username":"${DOCKERHUB_USERNAME:?DOCKERHUB_USERNAME must be set}","password":"${DOCKERHUB_TOKEN:?DOCKERHUB_TOKEN must be set}"}}
+```
+
+Pass the resulting value into the existing kodkod service:
+
+```yaml
+environment:
+  KODKOD_REGISTRY_AUTHS: ${KODKOD_REGISTRY_AUTHS:?KODKOD_REGISTRY_AUTHS must be set}
+```
+
+Compose reads `.env` for interpolation; kodkod reads only the container's environment. `${VAR:?message}`
+stops Compose when a variable is unset or empty. Single-quoting the **whole JSON** disables interpolation.
+Compose substitution does not JSON-escape values: passwords containing quotes, backslashes or control
+characters need JSON escaping. Keep secrets in an ignored `.env`; Base64 is not required.
+
+For private GHCR images and **anonymous Docker Hub** access, omit the Docker Hub entry and variables:
+
+```dotenv
+KODKOD_REGISTRY_AUTHS={"ghcr.io":{"username":"${GHCR_USERNAME:?GHCR_USERNAME must be set}","password":"${GHCR_TOKEN:?GHCR_TOKEN must be set}"}}
+```
+
+- Keys are registry hosts, optionally with a port (`registry.example.com:5000`, `localhost:5000`,
+  `[::1]:5000`), without schemes or repository paths. Host matching is case-insensitive and ports
+  must match exactly. There are no wildcard or suffix matches.
+- `nginx` and `cloudflare/cloudflared` use Docker Hub. `docker.io`, `index.docker.io` and
+  `registry-1.docker.io` are aliases for that registry. Duplicate aliases are rejected.
+- Credentials are used for both manifest digest inspection and pull, including public images on
+  a configured registry. Unconfigured registries receive **no `X-Registry-Auth` header**.
+- Each value accepts string fields `username` + `password` (including PATs), or `identitytoken`,
+  or `registrytoken`. Kodkod encodes the Docker AuthConfig as Base64url for the Engine API.
+  It does not perform OAuth login or refresh tokens itself.
+- `serveraddress` is generated from the key. If supplied, it must match that key; Docker Hub also
+  accepts `https://index.docker.io/v1/`. Unknown fields, malformed JSON and invalid credentials
+  fail at startup without including credential values in the error.
 
 ## How updates work
 

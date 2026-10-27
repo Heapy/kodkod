@@ -84,7 +84,7 @@ data class Config(
      * always recreated, since leaving it be would leave it on a dead network namespace.
      */
     val respectDependsOnRestart: Boolean,
-    val registryAuth: String?,
+    val registryAuths: RegistryAuths,
     /**
      * `KODKOD_SHUTDOWN_GRACE` — how many seconds a stopping kodkod gives the cycle in flight to
      * finish before interrupting it. A recreate is at its most dangerous exactly here: between the
@@ -130,7 +130,7 @@ data class Config(
                 updateFailureCooldown = long("KODKOD_UPDATE_FAILURE_COOLDOWN", 21600).coerceAtLeast(0),
                 dependencyHealthTimeout = long("KODKOD_DEPENDENCY_HEALTH_TIMEOUT", 120).coerceAtLeast(0),
                 respectDependsOnRestart = bool("KODKOD_RESPECT_DEPENDS_ON_RESTART", false),
-                registryAuth = get("KODKOD_REGISTRY_AUTH")?.takeIf { it.isNotBlank() },
+                registryAuths = RegistryAuths.fromEnv(get),
                 shutdownGrace = long("KODKOD_SHUTDOWN_GRACE", 30).coerceAtLeast(0),
             ).also {
                 require(it.autohealInterval > 0) { "KODKOD_AUTOHEAL_INTERVAL must be > 0 (got ${it.autohealInterval})" }

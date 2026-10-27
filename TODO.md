@@ -5,7 +5,6 @@
 ## Функциональность
 
 1. Нотификации / метрики / lifecycle-хуки — единственная ось, где kodkod уступает watchtower и обоим autoheal'ам.
-2. Один глобальный `KODKOD_REGISTRY_AUTH` вместо per-registry auth (у watchtower — per-registry).
 3. Явно заданный MAC (`--mac-address` / compose `mac_address:`) не переносится на Docker ≥ 27: движок больше не
    отдаёт `Config.MacAddress` в inspect'е, а `NetworkSettings.Networks[*].MacAddress` заполнен всегда, поэтому
    отличить пользовательский MAC от сгенерированного нечем и kodkod осознанно не пинует ни один. Нужен другой

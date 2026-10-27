@@ -25,7 +25,7 @@ class ConfigTest {
         assertEquals(21600, c.updateFailureCooldown)
         assertEquals(120, c.dependencyHealthTimeout)
         assertFalse(c.respectDependsOnRestart)
-        assertNull(c.registryAuth)
+        assertNull(c.registryAuths.forImage("nginx:latest"))
         assertEquals(30, c.shutdownGrace)
     }
 

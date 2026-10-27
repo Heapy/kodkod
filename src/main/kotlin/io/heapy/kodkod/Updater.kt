@@ -1061,7 +1061,7 @@ class Updater(
                     }
                 }
 
-                api.pull(repo, tag, config.registryAuth, target.platform)
+                api.pull(repo, tag, config.registryAuths.forImage(imageRef), target.platform)
                 val newImageId = api.inspectImage(imageRef).str("Id")
                 when {
                     newImageId == null ->
@@ -1183,7 +1183,7 @@ class Updater(
 
     private fun remoteDigest(imageRef: String, target: Target): String? {
         val digest = runCatching {
-            api.inspectDistribution(imageRef, config.registryAuth).distributionDigest()
+            api.inspectDistribution(imageRef, config.registryAuths.forImage(imageRef)).distributionDigest()
         }.getOrElse {
             Log.warn("[${target.name}] could not read registry digest for $imageRef — falling back to pull: ${it.message}")
             return null
